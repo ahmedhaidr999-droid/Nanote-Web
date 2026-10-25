@@ -15,6 +15,7 @@ import { useApp, useT } from '@/lib/nanote/store';
 import { PdfTextItem, ShapeEl } from '@/lib/nanote/types';
 import { uid } from '@/lib/nanote/util';
 import { ensurePdfText } from '@/lib/nanote/pdftext';
+import { offlineTranslate } from '@/lib/nanote/offlineTranslate';
 import { cn } from '@/lib/utils';
 import { getVp, getViewportSize, pageAtWorldY, useVp, type PageLayout } from './viewport';
 
@@ -30,7 +31,7 @@ interface SelState {
   byPage: PageRects[];
   text: string;
 }
-interface TranslateState { status: 'loading' | 'ok'; text: string }
+interface TranslateState { status: 'loading' | 'ok'; text: string; offline?: boolean }
 
 // ---------------------------------------------------------------- rect merging
 /** Merge the selection's client rects into one band per text line
@@ -300,6 +301,10 @@ export function TextLayer({ layouts, pageW, notebookId }: {
     abortRef.current = ac;
     setTranslate({ status: 'loading', text: '' });
     const target = useApp.getState().settings.lang === 'ar' ? 'ar' : 'en';
+    // hard timeout — a hung request (e.g. captive network) must not freeze the card
+    const timer = setTimeout(() => {
+      if (abortRef.current === ac) ac.abort();
+    }, 8000);
     void fetch('/api/translate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -310,14 +315,23 @@ export function TextLayer({ layouts, pageW, notebookId }: {
         if (!r.ok) throw new Error(`translate http ${r.status}`);
         const j = (await r.json()) as { translation?: string };
         if (!j.translation) throw new Error('empty translation');
-        if (ac.signal.aborted) return;
+        if (abortRef.current !== ac) return; // superseded
+        clearTimeout(timer);
         setTranslate({ status: 'ok', text: j.translation });
       })
       .catch((e) => {
-        if (ac.signal.aborted) return;
-        console.warn('[nanote] translate failed', e);
-        setTranslate(null);
-        toast.error(t('pdftext.translate.error'));
+        clearTimeout(timer);
+        if (abortRef.current !== ac) return; // user cancelled / new request
+        console.warn('[nanote] translate api failed — offline fallback', e);
+        // offline engine — the APK has no server at all (static export), and the
+        // browser may be offline; rough dictionary translation beats an error.
+        const off = offlineTranslate(sel.text, target);
+        if (off) {
+          setTranslate({ status: 'ok', text: off.translation, offline: true });
+        } else {
+          setTranslate(null);
+          toast.error(t('pdftext.translate.error'));
+        }
       });
   }, [sel, t]);
 
@@ -451,6 +465,11 @@ export function TextLayer({ layouts, pageW, notebookId }: {
           <div className="mb-2 flex items-center gap-2">
             <Languages className="h-4 w-4 text-primary" />
             <span className="text-xs font-semibold text-muted-foreground">{t('pdftext.translated')}</span>
+            {translate.offline && (
+              <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                {t('pdftext.translate.offline')}
+              </span>
+            )}
             <button
               type="button"
               aria-label={t('common.close', 'Close', 'إغلاق')}

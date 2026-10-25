@@ -38,3 +38,6 @@ skills/
 .e2e/
 .zscripts/
 android/keystores/
+
+# e2e smoke-test screenshots (local only)
+.smoke/

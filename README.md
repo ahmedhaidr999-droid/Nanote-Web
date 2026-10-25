@@ -1,9 +1,11 @@
 # Nanote (Web) — the complete browser app as an offline Android APK
 
 Nanote is a local-first handwriting notes app: pressure-sensitive pens, highlighters,
-shapes, rulers, text, images, PDF import & annotation, synced audio notes, folders,
-tags, search, PDF/PNG export and `.nanote` backups. **100% free, 100% offline —
-no accounts, no analytics, and the app does not even declare the Internet permission.**
+shapes, rulers, text, images, PDF import & annotation, synced audio notes, edge tabs
+with nested folders, tags, search, laser pointer, PDF text selection with highlight /
+underline / copy, an offline translation engine, PDF/PNG export and `.nanote` backups.
+**100% free, 100% offline — no accounts, no analytics, and the app does not even
+declare the Internet permission.**
 
 This repository is the exact same app you use in the browser (Next.js + React +
 TypeScript + IndexedDB), packaged for Android with Capacitor: the WebView serves the

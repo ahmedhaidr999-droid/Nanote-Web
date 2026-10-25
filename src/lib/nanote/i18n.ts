@@ -138,7 +138,8 @@ const en: Dict = {
   'pdftext.highlight': 'Highlight', 'pdftext.underline': 'Underline',
   'pdftext.translate': 'Translate', 'pdftext.copy': 'Copy',
   'pdftext.translating': 'Translating…', 'pdftext.translated': 'Translation',
-  'pdftext.translate.error': 'Translation failed — check your connection.',
+  'pdftext.translate.offline': 'Rough · offline engine',
+  'pdftext.translate.error': 'Translation is not available for this text.',
   'pdftext.unavailable': 'This file has no selectable text (re-import it to enable selection).',
 
   'audio.record': 'Record', 'audio.stop': 'Stop', 'audio.rec': 'REC', 'audio.play': 'Play', 'audio.pause': 'Pause',
@@ -324,7 +325,8 @@ const ar: Dict = {
   'pdftext.highlight': 'تظليل', 'pdftext.underline': 'خط تحته',
   'pdftext.translate': 'ترجمة', 'pdftext.copy': 'نسخ',
   'pdftext.translating': 'جارٍ الترجمة…', 'pdftext.translated': 'الترجمة',
-  'pdftext.translate.error': 'فشلت الترجمة — تحقق من الاتصال بالإنترنت.',
+  'pdftext.translate.offline': 'تقريبية · بدون اتصال',
+  'pdftext.translate.error': 'الترجمة غير متاحة لهذا النص.',
   'pdftext.unavailable': 'لا يوجد نص قابل للتحديد في هذا الملف (أعد استيراده لتفعيل الميزة).',
 
   'audio.record': 'تسجيل', 'audio.stop': 'إيقاف', 'audio.rec': 'تسجيل', 'audio.play': 'تشغيل', 'audio.pause': 'إيقاف مؤقت',
