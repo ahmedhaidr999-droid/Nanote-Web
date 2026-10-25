@@ -32,6 +32,7 @@ export interface TextSel {
   text: string;
   anchor: CaretPoint;
   focus: CaretPoint;
+  picked?: boolean;  // fresh long-press/tap word pick → rects pop in once
 }
 
 // ---------------------------------------------------------------- registry (owned by TextLayer)
@@ -248,8 +249,9 @@ function rangeFromCarets(a: CaretPoint, b: CaretPoint): Range | null {
 
 /** Compute + publish the selection between two carets (the ONLY place state
  *  is written). Converts the range's client rects to world/page space using
- *  the mirror's transform. */
-export function setSelectionFromCarets(anchor: CaretPoint, focus: CaretPoint): TextSel | null {
+ *  the mirror's transform. `picked` marks a fresh long-press/tap word pick
+ *  (the rects play a short pop-in animation once). */
+export function setSelectionFromCarets(anchor: CaretPoint, focus: CaretPoint, picked = false): TextSel | null {
   const mirror = mirrorEl;
   if (!mirror) return null;
   const range = rangeFromCarets(anchor, focus);
@@ -284,7 +286,7 @@ export function setSelectionFromCarets(anchor: CaretPoint, focus: CaretPoint): T
   const next: TextSel = {
     top, bottom, cx: cxSum / merged.length,
     byPage: [...byPage.values()],
-    text, anchor, focus,
+    text, anchor, focus, picked,
   };
   state = next;
   notify();

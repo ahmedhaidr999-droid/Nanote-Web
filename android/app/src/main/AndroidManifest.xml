@@ -37,11 +37,17 @@
 
     <!-- Permissions.
 
-         Nanote is 100% offline: the INTERNET permission is deliberately NOT
-         declared — the app physically cannot make network requests. The only
-         runtime permissions are the microphone (voice notes; requested via
-         the WebView's own getUserMedia flow) — files are picked through the
-         system chooser and exports go through the share sheet. -->
+         Notes and all personal data stay 100% on-device. Since v1.3.0 the
+         INTERNET permission is declared for exactly one purpose: the
+         translation platform — online engines (Nanote's web engine and the
+         Google Translate popup window) plus downloading offline language
+         packs. Nothing else ever makes a network request. VIBRATE powers the
+         haptic tick when a long-press picks a word. The microphone (voice
+         notes) is requested via the WebView's own getUserMedia flow; files
+         are picked through the system chooser and exports go through the
+         share sheet. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 </manifest>

@@ -297,6 +297,10 @@ export const useApp = create<AppState>((set, get) => ({
     set({ settings });
     try { await migrateTabsV2() } catch (e) { console.warn('[nanote] migration failed', e) }
     try { await db.purgeTrash() } catch (e) { console.warn('[nanote] purge failed', e) }
+    // UNLIMITED STORAGE: ask the platform to mark our quota as persistent —
+    // the browser/WebView then treats the app's data as exempt from
+    // automatic eviction, with no size cap beyond the device's own disk.
+    try { void navigator.storage?.persist?.().catch(() => {}) } catch { /* best-effort */ }
     const [folders, tabs, notebooks, tags, pages] = await Promise.all([
       db.listFolders(), db.listTabs(), db.listNotebooks(), db.listTags(), db.listPages(),
     ]);

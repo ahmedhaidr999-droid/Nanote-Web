@@ -19,7 +19,7 @@ import { ShapeEl } from '@/lib/nanote/types';
 import { uid } from '@/lib/nanote/util';
 import { ensurePdfText } from '@/lib/nanote/pdftext';
 import { translateOffline } from '@/lib/nanote/offlineTranslate';
-import { googleTranslateUrl } from '@/lib/nanote/translate';
+import { googleTranslateUrl, resolveTranslateTarget, translateOnline } from '@/lib/nanote/translate';
 import { cn } from '@/lib/utils';
 import {
   clearTextSel, setMirror, setSelLayouts, useTextSel, type SelRect,
@@ -60,8 +60,8 @@ const PageText = memo(function PageText({ pageId, layoutY, pageH, pageW, items }
 });
 
 // ---------------------------------------------------------------- selection rect renderer (world-space → transforms with pan/zoom)
-const SelRects = memo(function SelRects({ byPage, layouts }: {
-  byPage: { pageId: string; rects: SelRect[] }[]; layouts: PageLayout[];
+const SelRects = memo(function SelRects({ byPage, layouts, picked }: {
+  byPage: { pageId: string; rects: SelRect[] }[]; layouts: PageLayout[]; picked?: boolean;
 }) {
   return (
     <>
@@ -72,6 +72,7 @@ const SelRects = memo(function SelRects({ byPage, layouts }: {
           <div
             key={`${pageId}-${i}`}
             aria-hidden
+            className={picked ? 'animate-wordpop' : undefined}
             style={{
               position: 'absolute',
               left: r.x, top: layout.y + r.y, width: r.w, height: r.h,
@@ -266,9 +267,7 @@ export function TextLayer({ layouts, pageW, notebookId }: {
   const doTranslate = useCallback(() => {
     if (!sel) return;
     const st = useApp.getState();
-    const target = st.settings.translateTarget === 'auto'
-      ? (st.settings.lang === 'ar' ? 'ar' : 'en')
-      : st.settings.translateTarget;
+    const target = resolveTranslateTarget(st.settings);
 
     // ---- Google engine: pop up the Google Translate window with the text
     if (st.settings.translateEngine === 'google') {
@@ -278,35 +277,43 @@ export function TextLayer({ layouts, pageW, notebookId }: {
       return;
     }
 
-    // ---- Nanote engine: online LLM first, offline pack fallback second
+    // ---- Nanote engine: INTERNET first (the LLM route, then the public web
+    // engine — real online MT inside the standalone APK), then the
+    // downloaded language pack, then the built-in dictionary last.
     abortRef.current?.abort();
     const ac = new AbortController();
     abortRef.current = ac;
     setTranslate({ status: 'loading', text: '' });
-    // hard timeout — a hung request (e.g. captive network) must not freeze the card
+    // hard timeout — a hung network must not freeze the card
     const timer = setTimeout(() => {
       if (abortRef.current === ac) ac.abort();
-    }, 8000);
-    void fetch('/api/translate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: sel.text, target }),
-      signal: ac.signal,
-    })
-      .then(async (r) => {
-        if (!r.ok) throw new Error(`translate http ${r.status}`);
-        const j = (await r.json()) as { translation?: string };
-        if (!j.translation) throw new Error('empty translation');
+    }, 12000);
+    void translateOnline(sel.text, target, ac.signal)
+      .then((r) => {
         if (abortRef.current !== ac) return; // superseded
         clearTimeout(timer);
-        setTranslate({ status: 'ok', text: j.translation });
+        if (ac.signal.aborted) return; // user cancelled / timed out
+        if (r) {
+          setTranslate({ status: 'ok', text: r.translation }); // online → no badge
+          return;
+        }
+        // both internet engines failed → downloaded pack / built-in dict
+        void translateOffline(sel.text, target).then((off) => {
+          if (abortRef.current !== ac) return;
+          if (off) {
+            setTranslate({ status: 'ok', text: off.translation, offline: off.via === 'builtin' ? 'builtin' : off.via });
+          } else {
+            setTranslate(null);
+            toast.error(t('pdftext.translate.error'));
+          }
+        });
       })
       .catch(async (e) => {
         clearTimeout(timer);
-        if (abortRef.current !== ac) return; // user cancelled / new request
-        console.warn('[nanote] translate api failed — offline pack fallback', e);
-        // downloaded language packs (Settings → Languages) + built-in AR↔EN
+        if (abortRef.current !== ac) return;
+        console.warn('[nanote] online translation failed — offline pack fallback', e);
         const off = await translateOffline(sel.text, target);
+        if (abortRef.current !== ac) return;
         if (off) {
           setTranslate({ status: 'ok', text: off.translation, offline: off.via === 'builtin' ? 'builtin' : off.via });
         } else {
@@ -397,7 +404,7 @@ export function TextLayer({ layouts, pageW, notebookId }: {
               <PageText key={p.id} pageId={p.id} layoutY={layout.y} pageH={p.height} pageW={pageW} items={its} />
             );
           })}
-          {sel && <SelRects byPage={sel.byPage} layouts={layouts} />}
+          {sel && <SelRects byPage={sel.byPage} layouts={layouts} picked={sel.picked} />}
         </div>
       )}
 

@@ -56,8 +56,9 @@ import {
 // the overlay via hiddenIds + a painter, committed through patchElements).
 const IMG_HOLD_MS = 330;         // press-and-hold window before an image tap becomes a move
 const IMG_SLOP_PX = 8;           // movement that cancels a pending image tap
-const TEXT_HOLD_MS = 480;        // long-press that selects the word under a finger/mouse
-const TEXT_SLOP_PX = 12;         // movement that cancels a pending text long-press
+const TEXT_HOLD_MS = 420;        // long-press that selects the word under a finger/mouse (Android-like)
+const TEXT_SLOP_TOUCH = 16;      // movement that cancels a pending touch long-press (fingers jitter)
+const TEXT_SLOP_MOUSE = 10;      // tighter for the mouse
 
 const AUTO_CONTINUE_PTS = 2400;   // very long strokes continue as a fresh stroke
 const PEN_IDLE_MS = 3000;         // pen "in range" window after last pen event
@@ -258,7 +259,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
   const downInfoRef = useRef<{ x: number; y: number; t: number } | null>(null);
   const scrollRafRef = useRef(0);   // momentum / settle rAF (one at a time)
   const holdTimerRef = useRef(0);  // image tool: pending long-press timer
-  const textHoldRef = useRef<{ timer: number; pointerId: number; x: number; y: number } | null>(null); // pending text long-press
+  const textHoldRef = useRef<{ timer: number; pointerId: number; x: number; y: number; pointerType: string } | null>(null); // pending text long-press
   const { t, lang } = useT();
   const langRef = useRef(lang);
   const tRef = useRef(t);
@@ -601,7 +602,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         type: 'textpick', pointerId: e.pointerId,
         wordStart: start, wordEnd: end, anchor: start, fromLongPress,
       };
-      setSelectionFromCarets(start, end);
+      setSelectionFromCarets(start, end, fromLongPress);
       return true;
     };
 
@@ -617,7 +618,8 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     };
 
     /** long-press timer: a finger/mouse held still over PDF text selects the
-     *  word under it (Notewise-style) from ANY tool except eraser/laser. */
+     *  word under it (Notewise-style) from ANY tool except eraser/laser —
+     *  the dedicated textselect tool is never needed. */
     const scheduleTextHold = (e: PointerEvent) => {
       clearTextHold();
       const timer = window.setTimeout(() => {
@@ -627,9 +629,11 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         if (held.type === 'imgmove' || held.type === 'imgtap') return;
         const caret = caretAtPoint(e.clientX, e.clientY);
         if (!caret) return; // held over empty page → nothing to select
-        beginTextPick(e, caret, true);
+        const picked = beginTextPick(e, caret, true);
+        // haptic confirmation — the Android text-selection feel
+        if (picked && e.pointerType === 'touch') navigator.vibrate?.(12);
       }, TEXT_HOLD_MS);
-      textHoldRef.current = { timer, pointerId: e.pointerId, x: e.clientX, y: e.clientY };
+      textHoldRef.current = { timer, pointerId: e.pointerId, x: e.clientX, y: e.clientY, pointerType: e.pointerType };
     };
 
     // ================================================ modern pan physics
@@ -913,6 +917,30 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         return;
       }
 
+      // ---- long-press text selection (finger/mouse; pens always draw).
+      // Runs BEFORE the pan gate: with finger-drawing off (the default) a
+      // touch always pans — but a finger/mouse held STILL over PDF text for
+      // 420ms must pick the word without the user ever switching to the
+      // textselect tool. Pan/zoom still win when the pointer MOVES: any
+      // travel beyond the slop cancels the pending hold. Not scheduled for
+      // eraser (intent: erase) / laser (live pointing) / textselect (taps
+      // already select).
+      if (
+        (e.pointerType === 'touch' || e.pointerType === 'mouse') &&
+        e.button === 0 && !spaceRef.current &&
+        tool !== 'eraser' && tool !== 'textselect' && tool !== 'laser'
+      ) {
+        const w0 = worldFromEvent(e);
+        const pg0 = pageForWorld(w0.y);
+        const pageRow0 = pg0 ? st.editor.pages.find((p) => p.id === pg0.id) : null;
+        // only pages with a PDF background whose notebook keeps the original
+        // file can host a hold (the text mirror must exist to hit carets)
+        if (pageRow0?.backgroundImageId != null) {
+          const nb0 = st.notebooks.find((n) => n.id === st.editor.notebookId);
+          if (nb0?.pdfOriginalId != null) scheduleTextHold(e);
+        }
+      }
+
       if (isPanGesture(e)) {
         startPan(e, localPt(e));
         return;
@@ -923,21 +951,6 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       if (!page) {
         startPan(e, localPt(e));
         return;
-      }
-
-      // ---- long-press text selection (finger/mouse; pens always draw):
-      // scheduled for PDF-background pages whose notebook keeps the original
-      // file (the text mirror must exist to hit carets). Not for eraser/laser.
-      if (
-        (e.pointerType === 'touch' || e.pointerType === 'mouse') &&
-        e.button === 0 && !spaceRef.current &&
-        tool !== 'eraser' && tool !== 'textselect' && tool !== 'laser'
-      ) {
-        const pageRow = st.editor.pages.find((p) => p.id === page.id);
-        if (pageRow?.backgroundImageId != null) {
-          const nb = st.notebooks.find((n) => n.id === st.editor.notebookId);
-          if (nb?.pdfOriginalId != null) scheduleTextHold(e);
-        }
       }
 
       const stEd = st.editor;
@@ -1030,7 +1043,10 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
 
       // movement cancels a pending text long-press (the user is gesturing)
       const th = textHoldRef.current;
-      if (th && e.pointerId === th.pointerId && Math.hypot(e.clientX - th.x, e.clientY - th.y) > TEXT_SLOP_PX) {
+      if (
+        th && e.pointerId === th.pointerId &&
+        Math.hypot(e.clientX - th.x, e.clientY - th.y) > (th.pointerType === 'touch' ? TEXT_SLOP_TOUCH : TEXT_SLOP_MOUSE)
+      ) {
         clearTextHold();
       }
 

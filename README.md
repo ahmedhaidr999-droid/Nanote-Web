@@ -1,20 +1,24 @@
-# Nanote (Web) — the complete browser app as an offline Android APK
+# Nanote (Web) — the complete browser app as an independent Android APK
 
 Nanote is a local-first handwriting notes app: pressure-sensitive pens, highlighters,
 shapes, rulers, text, images, PDF import & annotation, synced audio notes, edge tabs
-with nested folders, tags, search, laser pointer, PDF text selection with highlight /
-underline / copy, an offline translation engine, PDF/PNG export and `.nanote` backups.
-**100% free, 100% offline — no accounts, no analytics, and the app does not even
-declare the Internet permission.**
+with nested folders, tags, search, laser pointer (normal + timed), long-press PDF text
+selection with highlight / underline / copy, a full translation platform (online engines
++ downloadable offline language packs), PDF/PNG export and `.nanote` backups.
+**100% free — no accounts, no analytics. Notes never leave the device; the only
+internet use is translation, and only when the user asks for it.**
 
-This repository is the exact same app you use in the browser (Next.js + React +
-TypeScript + IndexedDB), packaged for Android with Capacitor: the WebView serves the
-static export from local assets (`https://localhost`), so ink, audio, PDF, exports and
-backups behave identically to the browser.
+The APK is an INDEPENDENT platform: the browser version of this repo is the
+feature-staging platform where features are tested before being ported to the app.
+The app itself is packaged with Capacitor: the WebView serves the static export from
+local assets (`https://localhost`), so ink, audio, PDF, exports and backups behave
+identically to the browser.
 
 - App ID: `com.nanote.web`
 - Min Android: 7.0 (API 24) · Target: 36
-- Permissions: microphone only (voice notes; requested on first use)
+- Permissions: microphone (voice notes; requested on first use), internet (translation
+  engines + language-pack downloads — nothing else ever goes online), vibrate
+  (haptic tick on long-press word selection). Storage is UNLIMITED on the device's disk.
 
 ## Install & updates · التثبيت والتحديث
 

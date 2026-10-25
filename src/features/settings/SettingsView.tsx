@@ -20,6 +20,7 @@ import {
   FileText,
   Globe,
   Image as ImageIcon,
+  Infinity as InfinityIcon,
   Languages,
   LayoutGrid,
   List,
@@ -51,7 +52,6 @@ import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { Label } from '@/components/ui/label';
-import { Progress } from '@/components/ui/progress';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Slider } from '@/components/ui/slider';
 import { Switch } from '@/components/ui/switch';
@@ -248,15 +248,31 @@ export default function SettingsView() {
     if (downloading.has(code)) return;
     setDownloading((s) => { const n = new Set(s); n.add(code); return n });
     const tid = toast.loading(t('settings.translate.downloading'));
+    const accept = (candidate: unknown): LangPack | null => {
+      const p = candidate as LangPack | null;
+      return p && p.code === code && p.entries && typeof p.wordCount === 'number' ? p : null;
+    };
     try {
-      const res = await fetch('/api/langpack', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ lang: code }),
-      });
-      if (!res.ok) throw new Error(`langpack http ${res.status}`);
-      const pack = (await res.json()) as LangPack;
-      if (!pack?.code || !pack.entries) throw new Error('bad pack payload');
+      // 1 — the language pack BUNDLED with the app (public/langpacks/*.json):
+      //     ships inside the standalone APK, so the download is instant and
+      //     needs NO server and no internet — the pack is already on device.
+      let pack: LangPack | null = null;
+      try {
+        const asset = await fetch(`/langpacks/${encodeURIComponent(code)}.json`);
+        if (asset.ok) pack = accept(await asset.json());
+      } catch { /* no bundled asset — next */ }
+      // 2 — the dev/staging API (LLM-generated on demand; only exists where
+      //     the server runs — the APK never reaches this branch).
+      if (!pack) {
+        const res = await fetch('/api/langpack', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ lang: code }),
+        });
+        if (!res.ok) throw new Error(`langpack http ${res.status}`);
+        pack = accept(await res.json());
+        if (!pack) throw new Error('bad pack payload');
+      }
       await db.putLangPack(pack);
       invalidatePackCache(); // the offline engine re-reads packs on next use
       await reloadPacks();
@@ -353,7 +369,6 @@ export default function SettingsView() {
   // ----- derived
 
   const autosaveActive = [0, 1000, 5000].includes(settings.autosaveMs) ? settings.autosaveMs : 1000;
-  const pct = stats && stats.quota > 0 ? Math.min(100, (stats.usage / stats.quota) * 100) : null;
 
   return (
     <main
@@ -621,19 +636,17 @@ export default function SettingsView() {
                 <div className="text-sm font-medium">{t('settings.storage')}</div>
                 {stats ? (
                   <div className="space-y-3">
-                    <div className="space-y-1.5">
-                      <Progress value={pct ?? 0} aria-label={t('settings.storage')} />
-                      <div className="flex items-center justify-between text-xs text-muted-foreground">
-                        <span>
-                          {fmtBytes(stats.usage, lang)}
-                          {pct !== null ? ` / ${fmtBytes(stats.quota, lang)}` : ''}
-                        </span>
-                        {pct !== null ? (
-                          <span>{Math.round(pct)}%</span>
-                        ) : (
-                          <span>{t('settings.storage.quotaUnknown', 'quota unknown', 'الحصة غير معروفة')}</span>
-                        )}
-                      </div>
+                    {/* UNLIMITED STORAGE: no quota bar / no cap — the app stores
+                        everything on the device's own disk (the platform's
+                        persistent-storage request runs at boot). */}
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-xs text-muted-foreground">
+                        {t('settings.storage.used', 'Used', 'المستخدم')}: {fmtBytes(stats.usage, lang)}
+                      </span>
+                      <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                        <InfinityIcon className="size-3.5" aria-hidden />
+                        {t('settings.storage.unlimited', 'Unlimited storage', 'تخزين غير محدود')}
+                      </span>
                     </div>
                     <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
                       {[
