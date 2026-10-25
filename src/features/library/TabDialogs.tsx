@@ -1,0 +1,157 @@
+'use client';
+// Create / rename tab dialog — name + emoji grid + color swatches (mirrors the
+// folder dialog's visual language). Tabs are the flat top-level grouping.
+import { useEffect, useState } from 'react';
+import { toast } from 'sonner';
+import { Button } from '@/components/ui/button';
+import {
+  Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle,
+} from '@/components/ui/dialog';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { useApp, useT } from '@/lib/nanote/store';
+import type { TabRow } from '@/lib/nanote/types';
+import { cn } from '@/lib/utils';
+import { FOLDER_COLORS, FOLDER_EMOJIS } from './constants';
+
+export type TabDialogState =
+  | { mode: 'create' }
+  | { mode: 'rename'; tab: TabRow }
+  | null;
+
+interface TabDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  state: TabDialogState;
+}
+
+export function TabDialog({ open, onOpenChange, state }: TabDialogProps) {
+  const { t } = useT();
+  const [name, setName] = useState('');
+  const [emoji, setEmoji] = useState<string>('📚');
+  const [color, setColor] = useState<string>(FOLDER_COLORS[0]);
+  const [busy, setBusy] = useState(false);
+
+  const mode = state?.mode ?? 'create';
+  const tab = state?.mode === 'rename' ? state.tab : null;
+
+  useEffect(() => {
+    if (open) {
+      setName(mode === 'rename' && tab ? tab.name : '');
+      setEmoji(mode === 'rename' && tab ? tab.emoji : '📚');
+      setColor(mode === 'rename' && tab ? tab.colorHex : FOLDER_COLORS[0]);
+      setBusy(false);
+    }
+  }, [open, mode, tab]);
+
+  const submit = async () => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setBusy(true);
+    try {
+      if (mode === 'create') {
+        await useApp.getState().createTab(trimmed, emoji, color);
+        toast.success(t('library.tabCreated', 'Tab created', 'تم إنشاء التبويب'));
+      } else if (tab) {
+        await useApp.getState().updateTab(tab.id, { name: trimmed, emoji, colorHex: color });
+      }
+      onOpenChange(false);
+    } catch {
+      toast.error(t('error.generic'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>{mode === 'create' ? t('library.newTab') : t('library.renameTab')}</DialogTitle>
+        </DialogHeader>
+        <form
+          className="flex flex-col gap-4"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void submit();
+          }}
+        >
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="nanote-tab-name">{t('common.name')}</Label>
+            <Input
+              id="nanote-tab-name"
+              autoFocus
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder={t('common.name')}
+              maxLength={60}
+            />
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <Label>{t('library.newFolder.emoji')}</Label>
+            <div className="grid grid-cols-8 gap-1 rounded-lg bg-surface-variant/70 p-2">
+              {FOLDER_EMOJIS.map((em) => (
+                <button
+                  key={em}
+                  type="button"
+                  aria-label={em}
+                  aria-pressed={emoji === em}
+                  onClick={() => setEmoji(em)}
+                  className={cn(
+                    'flex h-9 items-center justify-center rounded-lg text-lg transition-transform press-scale',
+                    emoji === em ? 'scale-110 bg-background shadow-ink-1' : 'hover:bg-background/60',
+                  )}
+                >
+                  {em}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <Label>{t('common.color')}</Label>
+            <div className="flex flex-wrap gap-2">
+              {FOLDER_COLORS.map((c) => (
+                <button
+                  key={c}
+                  type="button"
+                  aria-label={c}
+                  aria-pressed={color === c}
+                  onClick={() => setColor(c)}
+                  style={{ background: c }}
+                  className={cn(
+                    'flex h-8 w-8 items-center justify-center rounded-full transition-transform press-scale',
+                    color === c && 'scale-110 ring-2 ring-ring ring-offset-2 ring-offset-background',
+                  )}
+                >
+                  {color === c ? (
+                    <svg viewBox="0 0 24 24" className="h-4 w-4 text-white" aria-hidden>
+                      <path
+                        d="M20 6L9 17l-5-5"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="3"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  ) : null}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
+              {t('common.cancel')}
+            </Button>
+            <Button type="submit" disabled={!name.trim() || busy}>
+              {mode === 'create' ? t('common.create') : t('common.save')}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}

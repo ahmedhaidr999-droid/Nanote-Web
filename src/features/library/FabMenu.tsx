@@ -1,5 +1,7 @@
 'use client';
 // Floating action button (bottom-end) — new notebook / new folder / import PDF.
+// Actions carry the current tab/folder context; PDF imports are moved into the
+// current folder (or tab) right after import.
 import { useRef } from 'react';
 import { toast } from 'sonner';
 import { BookPlus, FileUp, FolderPlus, Plus } from 'lucide-react';
@@ -9,11 +11,14 @@ import {
 import { useApp, useT } from '@/lib/nanote/store';
 
 interface FabMenuProps {
-  selectedFolderId: string | null;
-  onNewFolder: (parentId: string | null) => void;
+  /** Tab context for new items (null = "All Notes", no folder creation). */
+  activeTabId: string | null;
+  /** Folder context for new items (null = the tab root). */
+  activeFolderId: string | null;
+  onNewFolder: (parentId: string | null, tabId: string | null) => void;
 }
 
-export function FabMenu({ selectedFolderId, onNewFolder }: FabMenuProps) {
+export function FabMenu({ activeTabId, activeFolderId, onNewFolder }: FabMenuProps) {
   const { t } = useT();
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -41,6 +46,13 @@ export function FabMenu({ selectedFolderId, onNewFolder }: FabMenuProps) {
           { id: tid },
         );
       });
+      // The importer creates the notebook at the library root — carry it into
+      // the current context with a move (existing store actions).
+      if (activeFolderId) {
+        await useApp.getState().moveNotebook(res.notebookId, activeFolderId);
+      } else if (activeTabId) {
+        await useApp.getState().moveNotebookToTab(res.notebookId, activeTabId);
+      }
       await useApp.getState().refreshLibrary();
       if (res.capped) {
         toast.warning(t('library.pdfImport.capped', 'Imported the first 200 pages.', 'تم استيراد أول ٢٠٠ صفحة.'));
@@ -89,13 +101,17 @@ export function FabMenu({ selectedFolderId, onNewFolder }: FabMenuProps) {
         </DropdownMenuTrigger>
         <DropdownMenuContent side="top" align="end" className="w-52">
           <DropdownMenuItem
-            onClick={() => useApp.getState().navigate({ name: 'create-notebook', folderId: selectedFolderId })}
+            onClick={() =>
+              useApp.getState().navigate({ name: 'create-notebook', folderId: activeFolderId, tabId: activeTabId })
+            }
           >
             <BookPlus aria-hidden /> {t('library.newNotebook')}
           </DropdownMenuItem>
-          <DropdownMenuItem onClick={() => onNewFolder(selectedFolderId)}>
-            <FolderPlus aria-hidden /> {t('library.newFolder')}
-          </DropdownMenuItem>
+          {activeTabId ? (
+            <DropdownMenuItem onClick={() => onNewFolder(activeFolderId, activeTabId)}>
+              <FolderPlus aria-hidden /> {t('library.newFolder')}
+            </DropdownMenuItem>
+          ) : null}
           <DropdownMenuItem onClick={() => fileRef.current?.click()}>
             <FileUp aria-hidden /> {t('library.importPdf')}
           </DropdownMenuItem>

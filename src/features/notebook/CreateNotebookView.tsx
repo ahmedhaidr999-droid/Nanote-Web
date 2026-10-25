@@ -72,7 +72,15 @@ export default function CreateNotebookView({ folderId }: { folderId: string | nu
   const goBack = useApp((s) => s.goBack);
   const createNotebook = useApp((s) => s.createNotebook);
   const openEditor = useApp((s) => s.openEditor);
+  const view = useApp((s) => s.view);
+  const allFolders = useApp((s) => s.folders);
   const { t } = useT();
+
+  // Tab context arrives via the view (create-notebook view carries tabId).
+  // If only a folder was passed, the folder's tab is used instead.
+  const viewTabId = view.name === 'create-notebook' ? view.tabId ?? null : null;
+  const tabId =
+    viewTabId ?? (folderId ? allFolders.find((f) => f.id === folderId)?.tabId ?? null : null);
 
   // ----- form state
   const [name, setName] = useState('');
@@ -205,6 +213,7 @@ export default function CreateNotebookView({ folderId }: { folderId: string | nu
       const id = await createNotebook({
         title: name.trim() || t('create.notebookName.default'),
         folderId,
+        tabId,
         coverId,
         coverCustomId: coverId === 'custom' ? coverIdRef.current : null,
         template: effTemplate,

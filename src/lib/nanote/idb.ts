@@ -3,14 +3,14 @@
 // IndexedDB is unavailable (e.g. storage blocked in an embedding context).
 import { openDB, IDBPDatabase } from 'idb';
 import {
-  DEFAULT_SETTINGS, PageDoc, PageRow, RecordingRow, FolderRow, NotebookRow, Settings, TagRow,
+  DEFAULT_SETTINGS, PageDoc, PageRow, PdfTextRec, RecordingRow, FolderRow, NotebookRow, Settings, TabRow, TagRow,
   TRASH_RETENTION_MS,
 } from './types';
 import { encodeDoc, decodeDoc } from './ink';
 import { uid } from './util';
 
 const DB_NAME = 'nanote';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 export interface ImageBlob { id: string; blob: Blob; w: number; h: number; name: string; createdAt: number }
 export interface DocRec { pageId: string; data: ArrayBuffer }
@@ -25,9 +25,11 @@ type Table = Map<string, unknown>;
 const mem = {
   meta: new Map<string, unknown>(),
   folders: new Map<string, FolderRow>(),
+  tabs: new Map<string, TabRow>(),
   notebooks: new Map<string, NotebookRow>(),
   pages: new Map<string, PageRow>(),
   pagedocs: new Map<string, DocRec>(),
+  pdftext: new Map<string, PdfTextRec>(),
   thumbs: new Map<string, ThumbRec>(),
   images: new Map<string, ImageBlob>(),
   audio: new Map<string, { id: string; blob: Blob }>(),
@@ -42,23 +44,34 @@ async function get(): Promise<IDBPDatabase | null> {
   if (memoryMode) return null;
   if (!dbp) {
     dbp = openDB(DB_NAME, DB_VERSION, {
-      upgrade(db) {
+      upgrade(db, oldVersion) {
         if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta');
-        const f = db.createObjectStore('folders', { keyPath: 'id' });
-        f.createIndex('deletedAt', 'deletedAt');
-        const nb = db.createObjectStore('notebooks', { keyPath: 'id' });
-        nb.createIndex('folderId', 'folderId');
-        nb.createIndex('deletedAt', 'deletedAt');
-        const pg = db.createObjectStore('pages', { keyPath: 'id' });
-        pg.createIndex('notebookId', 'notebookId');
-        db.createObjectStore('pagedocs', { keyPath: 'pageId' });
-        db.createObjectStore('thumbs', { keyPath: 'pageId' });
-        db.createObjectStore('images', { keyPath: 'id' });
-        db.createObjectStore('audio', { keyPath: 'id' });
-        const rc = db.createObjectStore('recordings', { keyPath: 'id' });
-        rc.createIndex('pageId', 'pageId');
-        db.createObjectStore('tags', { keyPath: 'id' });
-        db.createObjectStore('quarantined', { keyPath: 'id' });
+        if (oldVersion < 1) {
+          const f = db.createObjectStore('folders', { keyPath: 'id' });
+          f.createIndex('deletedAt', 'deletedAt');
+          const nb = db.createObjectStore('notebooks', { keyPath: 'id' });
+          nb.createIndex('folderId', 'folderId');
+          nb.createIndex('deletedAt', 'deletedAt');
+          const pg = db.createObjectStore('pages', { keyPath: 'id' });
+          pg.createIndex('notebookId', 'notebookId');
+          db.createObjectStore('pagedocs', { keyPath: 'pageId' });
+          db.createObjectStore('thumbs', { keyPath: 'pageId' });
+          db.createObjectStore('images', { keyPath: 'id' });
+          db.createObjectStore('audio', { keyPath: 'id' });
+          const rc = db.createObjectStore('recordings', { keyPath: 'id' });
+          rc.createIndex('pageId', 'pageId');
+          db.createObjectStore('tags', { keyPath: 'id' });
+          db.createObjectStore('quarantined', { keyPath: 'id' });
+        }
+        // v2: tabs (top-level library groupings) + cached PDF text layers.
+        // NOTE: runs for fresh (v0) installs too — skipping it left brand-new
+        // databases without 'tabs'/'pdftext', and boot()'s listTabs() then
+        // threw NotFoundError and the app never finished booting.
+        if (oldVersion < 2) {
+          const tb = db.createObjectStore('tabs', { keyPath: 'id' });
+          tb.createIndex('deletedAt', 'deletedAt');
+          db.createObjectStore('pdftext', { keyPath: 'pageId' });
+        }
       },
     }).catch((e) => { memoryMode = true; console.warn('[nanote] IndexedDB unavailable, using memory store', e); return null });
   }
@@ -115,10 +128,24 @@ export function readMirroredSettings(): { lang?: string; theme?: string } {
   try { return JSON.parse(localStorage.getItem(LS_KEY) || '{}') } catch { return {} }
 }
 
+/** small typed flags kept in the meta store (one-time migrations, feature marks) */
+export async function getMetaFlag(key: string): Promise<boolean> {
+  const rec = await getOne<{ id: string; value: boolean }>('meta', key);
+  return rec?.value === true;
+}
+export async function putMetaFlag(key: string, value: boolean) {
+  await put('meta', { id: key, value } as unknown as { id: string });
+}
+
 // ------------------------------------------------------------------ folders
 export const listFolders = () => getAll<FolderRow>('folders');
 export const putFolder = (f: FolderRow) => put('folders', f);
 export const deleteFolderRow = (id: string) => del('folders', id);
+
+// ------------------------------------------------------------------ tabs
+export const listTabs = () => getAll<TabRow>('tabs');
+export const putTab = (tb: TabRow) => put('tabs', tb);
+export const deleteTabRow = (id: string) => del('tabs', id);
 
 // ------------------------------------------------------------------ notebooks
 export const listNotebooks = () => getAll<NotebookRow>('notebooks');
@@ -157,6 +184,11 @@ export async function putPageDocRaw(pageId: string, data: ArrayBuffer) {
 export const getPageDocRaw = (pageId: string) => getOne<DocRec>('pagedocs', pageId);
 export const deletePageDoc = (pageId: string) => del('pagedocs', pageId);
 
+// ------------------------------------------------------------------ pdf text layers (cached, regenerable)
+export const getPdfText = (pageId: string) => getOne<PdfTextRec>('pdftext', pageId);
+export const putPdfText = (rec: PdfTextRec) => put('pdftext', rec);
+export const deletePdfText = (pageId: string) => del('pdftext', pageId);
+
 // ------------------------------------------------------------------ thumbnails
 export const getThumb = (pageId: string) => getOne<ThumbRec>('thumbs', pageId);
 export const putThumb = (t: ThumbRec) => put('thumbs', t);
@@ -167,8 +199,9 @@ export async function clearThumbs() {
   else mem.thumbs.clear();
 }
 
-// ------------------------------------------------------------------ images (covers, template customs, inserted images, pdf backgrounds)
+// ------------------------------------------------------------------ images (covers, template customs, inserted images, pdf backgrounds + originals)
 export const getImage = (id: string) => getOne<ImageBlob>('images', id);
+export const listImages = () => getAll<ImageBlob>('images');
 export const putImage = (img: ImageBlob) => put('images', img);
 export const deleteImage = (id: string) => del('images', id);
 

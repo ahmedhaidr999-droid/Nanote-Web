@@ -88,6 +88,24 @@ export function useNotebookActions() {
         }
       },
 
+      async restoreTab(id: string) {
+        try {
+          await useApp.getState().restoreTab(id);
+          toast.success(t('library.restored'));
+        } catch {
+          fail();
+        }
+      },
+
+      async purgeTab(id: string) {
+        try {
+          await useApp.getState().purgeTab(id);
+          toast.success(t('library.deletedForever'));
+        } catch {
+          fail();
+        }
+      },
+
       async exportPdf(id: string) {
         const tid = toast.loading(t('export.pdf.building'));
         try {

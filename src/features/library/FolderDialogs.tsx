@@ -14,7 +14,7 @@ import { cn } from '@/lib/utils';
 import { FOLDER_COLORS, FOLDER_EMOJIS } from './constants';
 
 export type FolderDialogState =
-  | { mode: 'create'; parentId: string | null }
+  | { mode: 'create'; parentId: string | null; tabId: string | null }
   | { mode: 'rename'; folder: FolderRow }
   | null;
 
@@ -34,6 +34,7 @@ export function FolderDialog({ open, onOpenChange, state }: FolderDialogProps) {
   const mode = state?.mode ?? 'create';
   const folder = state?.mode === 'rename' ? state.folder : null;
   const parentId = state?.mode === 'create' ? state.parentId : null;
+  const tabId = state?.mode === 'create' ? state.tabId : null;
 
   useEffect(() => {
     if (open) {
@@ -50,7 +51,8 @@ export function FolderDialog({ open, onOpenChange, state }: FolderDialogProps) {
     setBusy(true);
     try {
       if (mode === 'create') {
-        await useApp.getState().createFolder(trimmed, parentId, emoji, color);
+        // root folders land in the given tab; subfolders inherit their tab from the parent
+        await useApp.getState().createFolder(trimmed, parentId, emoji, color, tabId);
         toast.success(t('library.folderCreated', 'Folder created', 'تم إنشاء المجلد'));
       } else if (folder) {
         await useApp.getState().updateFolder(folder.id, { name: trimmed, emoji, colorHex: color });

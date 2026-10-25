@@ -1,27 +1,38 @@
 'use client';
-// ColorPopover — favorites (5 slots), recents (8), full palette, hex input.
+// ColorPopover — favorites (5 slots), custom colors (saved from the wheel,
+// max 12), recents (8), full palette, hex input. "Add color" swaps the
+// content to the ColorWheel spectrum circle; saving a wheel color prepends
+// it to settings.customColors and picks it.
 import { useEffect, useRef, useState } from 'react';
-import { Plus } from 'lucide-react';
+import { Plus, X } from 'lucide-react';
 import { useApp, useT } from '@/lib/nanote/store';
 import { INK_PALETTE } from '@/lib/nanote/types';
 import { isValidHex, normalizeHex } from '@/lib/nanote/util';
 import { cn } from '@/lib/utils';
+import { ColorWheel } from './ColorWheel';
+
+const MAX_CUSTOM = 12;
 
 export function ColorPopover({
   current,
   onPick,
   onClose,
   align = 'start',
+  palette,
 }: {
   current: string;
   onPick: (hex: string) => void;
   onClose?: () => void;
   align?: 'start' | 'end';
+  /** extra swatch row pinned at the top (e.g. the highlighter palette) */
+  palette?: string[];
 }) {
   const { t } = useT();
   const favorites = useApp((s) => s.settings.favoriteColors);
+  const custom = useApp((s) => s.settings.customColors);
   const recents = useApp((s) => s.editor.recentColors);
   const setSettings = useApp((s) => s.setSettings);
+  const [wheelOpen, setWheelOpen] = useState(false);
   const [hex, setHex] = useState(current.startsWith('#') ? current : `#${current}`);
   const boxRef = useRef<HTMLDivElement>(null);
 
@@ -45,6 +56,32 @@ export function ColorPopover({
     void setSettings({ favoriteColors: next });
   };
 
+  /** wheel "Save": prepend to custom colors (dedupe, max 12) and pick it */
+  const saveCustom = (c: string) => {
+    const next = [c, ...custom.filter((x) => x !== c)].slice(0, MAX_CUSTOM);
+    void setSettings({ customColors: next });
+    setWheelOpen(false);
+    pick(c);
+  };
+
+  const removeCustom = (c: string) => {
+    void setSettings({ customColors: custom.filter((x) => x !== c) });
+  };
+
+  if (wheelOpen) {
+    return (
+      <div
+        ref={boxRef}
+        className="w-64 rounded-xl border border-border bg-card p-3 shadow-ink-2"
+        style={{ pointerEvents: 'auto' }}
+        dir="ltr"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <ColorWheel initial={current} onPick={saveCustom} onCancel={() => setWheelOpen(false)} />
+      </div>
+    );
+  }
+
   return (
     <div
       ref={boxRef}
@@ -53,6 +90,49 @@ export function ColorPopover({
       dir="ltr"
       onClick={(e) => e.stopPropagation()}
     >
+      {palette && palette.length > 0 && (
+        <>
+          <div className="mb-1.5 flex gap-2">
+            {palette.map((c) => (
+              <Swatch key={c} color={c} active={c === current} onClick={() => pick(c)} />
+            ))}
+          </div>
+          <div className="mb-2 h-px w-full bg-border" />
+        </>
+      )}
+
+      <div className="mb-1.5 flex items-center justify-between">
+        <span className="text-xs font-semibold text-muted-foreground">{t('tool.color.custom')}</span>
+        {custom.length > 0 && (
+          <span className="text-[10px] tabular-nums text-muted-foreground/70">{custom.length}/{MAX_CUSTOM}</span>
+        )}
+      </div>
+      <div className="mb-2 flex flex-wrap gap-1.5">
+        {custom.map((c) => (
+          <span key={c} className="relative">
+            <Swatch color={c} small active={c === current} onClick={() => pick(c)} />
+            <button
+              type="button"
+              aria-label={`${t('tool.color.remove')} ${c}`}
+              title={t('tool.color.remove')}
+              onClick={(e) => { e.stopPropagation(); removeCustom(c) }}
+              className="absolute -end-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full border border-border bg-card text-foreground/80 shadow-ink-1 hover:bg-accent"
+            >
+              <X className="h-2.5 w-2.5" />
+            </button>
+          </span>
+        ))}
+        {custom.length === 0 && <span className="text-xs text-muted-foreground">—</span>}
+      </div>
+      <button
+        type="button"
+        onClick={() => setWheelOpen(true)}
+        className="mb-3 flex h-9 w-full items-center justify-center gap-2 rounded-lg bg-surface-variant text-xs font-medium press-scale"
+      >
+        <Plus className="h-4 w-4" />
+        {t('tool.color.add')}
+      </button>
+
       <div className="mb-1.5 flex items-center justify-between">
         <span className="text-xs font-semibold text-muted-foreground">{t('tool.color.favorites')}</span>
         <button

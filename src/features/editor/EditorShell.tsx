@@ -9,10 +9,8 @@ import {
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useApp, useT } from '@/lib/nanote/store';
-import { PAGE_SIZES, PageRow } from '@/lib/nanote/types';
+import { PAGE_SIZES } from '@/lib/nanote/types';
 import { uid } from '@/lib/nanote/util';
-import { renderPage } from '@/lib/nanote/render';
-import { preloadPageImages, resolveImage, imageNatural } from '@/lib/nanote/images';
 import * as db from '@/lib/nanote/idb';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
@@ -23,6 +21,8 @@ import { Input } from '@/components/ui/input';
 import PageCanvas from './PageCanvas';
 import InkSurface from './InkSurface';
 import LiveOverlay from './LiveOverlay';
+import { TextLayer } from './TextLayer';
+import { ensureThumb, refreshThumb } from './thumbs';
 import { SelectionLayer } from './SelectionLayer';
 import { TextEditorOverlay, TextSession } from './TextEditorOverlay';
 import { ToolRail } from './ToolRail';
@@ -129,32 +129,35 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
   }, [pageW, worldH]);
 
   // -------------------------------------------------- thumbnails (async, downsampled)
+  // Edits (docVersions bumps) re-render through the shared thumbs module; on
+  // editor open every page WITHOUT a cached thumbnail is primed — PDF pages the
+  // user never visited get real content in the Pages popup instead of blanks.
+  const pagesKey = useMemo(() => pages.map((p) => p.id).join(','), [pages]);
+  useEffect(() => {
+    if (!pagesKey) return;
+    let alive = true;
+    void (async () => {
+      for (const p of useApp.getState().editor.pages) {
+        if (!alive) return;
+        const rec = await db.getThumb(p.id);
+        if (rec) continue;
+        const url = await ensureThumb(p, pageW);
+        if (!alive) return;
+        if (url) setThumbVersion((v) => v + 1);
+      }
+    })();
+    return () => { alive = false };
+  }, [pagesKey, pageW]);
+
   useEffect(() => {
     let alive = true;
     const lastVersions = new Map<string, number>();
-    const renderThumb = async (page: PageRow) => {
-      const { doc } = await db.getPageDoc(page.id);
-      await preloadPageImages(page, doc);
-      const w = 132;
-      const scale = w / pageW;
-      const h = Math.max(40, Math.round(page.height * scale));
-      const c = document.createElement('canvas');
-      c.width = w; c.height = h;
-      const ctx = c.getContext('2d')!;
-      ctx.scale(scale, scale);
-      renderPage(ctx, page, doc, pageW, page.height, {
-        gamma: useApp.getState().settings.pressureCurve,
-        resolveImage, imageNatural,
-      });
-      await db.putThumb({ pageId: page.id, dataUrl: c.toDataURL('image/png'), updatedAt: Date.now() });
-      if (alive) setThumbVersion((v) => v + 1);
-    };
     const timer = setInterval(() => {
       const id = dirtyThumbsRef.current.values().next().value as string | undefined;
       if (!id) return;
       dirtyThumbsRef.current.delete(id);
       const page = useApp.getState().editor.pages.find((p) => p.id === id);
-      if (page) void renderThumb(page);
+      if (page) void refreshThumb(page, pageW).then(() => { if (alive) setThumbVersion((v) => v + 1) });
     }, 900);
     const unsub = useApp.subscribe((state) => {
       for (const p of state.editor.pages) {
@@ -377,6 +380,7 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
         <ToolRail pageW={pageW} />
 
         <InkSurface layouts={layouts} pageW={pageW} onTextTap={onTextTap} />
+        <TextLayer layouts={layouts} pageW={pageW} notebookId={notebookId} />
         <LiveOverlay />
         <SelectionLayer layouts={layouts} pageW={pageW} />
         <Ruler />

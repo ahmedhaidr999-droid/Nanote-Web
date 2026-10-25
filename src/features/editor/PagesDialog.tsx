@@ -15,6 +15,7 @@ import { toast } from 'sonner';
 import { useApp, useT } from '@/lib/nanote/store';
 import { cn } from '@/lib/utils';
 import * as db from '@/lib/nanote/idb';
+import { ensureThumb } from './thumbs';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
@@ -64,6 +65,26 @@ export function PagesDialog({
     })();
     return () => { alive = false };
   }, [open, layouts, thumbVersion]);
+
+  // backfill: render any page still missing a thumbnail on open (progressive)
+  // — pages the user never visited (fresh PDF imports) no longer show blanks.
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    void (async () => {
+      for (const l of ordered) {
+        if (!alive) return;
+        const page = pages.find((p) => p.id === l.id);
+        if (!page) continue;
+        const rec = await db.getThumb(l.id);
+        if (rec) continue;
+        const url = await ensureThumb(page, l.w);
+        if (!alive) return;
+        if (url) setThumbs((prev) => ({ ...prev, [l.id]: url }));
+      }
+    })();
+    return () => { alive = false };
+  }, [open]);
 
   useEffect(() => {
     if (!open) { setSelectMode(false); setSelected(new Set()) }

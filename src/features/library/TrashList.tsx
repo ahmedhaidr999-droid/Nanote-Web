@@ -1,13 +1,14 @@
 'use client';
-// Trash tab — trashed notebooks and top-most trashed folders with
+// Trash tab — trashed tabs, notebooks and top-most trashed folders with
 // restore / delete-permanently actions (confirm dialog for the latter).
+// Items inside a trashed tab are hidden — the tab row represents them.
 import { useMemo, useState } from 'react';
 import { Info, RotateCcw, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { EmptyState } from '@/components/nanote/EmptyState';
 import { NotebookCover } from '@/components/nanote/NotebookCover';
 import { useApp, useT } from '@/lib/nanote/store';
-import type { FolderRow, NotebookRow } from '@/lib/nanote/types';
+import type { FolderRow, NotebookRow, TabRow } from '@/lib/nanote/types';
 import { fmtDate } from '@/lib/nanote/util';
 import { ConfirmDialog } from './ConfirmDialog';
 import { useImageURL } from './useImageURL';
@@ -17,17 +18,37 @@ export function TrashList() {
   const { t, lang, fmt } = useT();
   const notebooks = useApp((s) => s.notebooks);
   const folders = useApp((s) => s.folders);
+  const tabs = useApp((s) => s.tabs);
   const actions = useNotebookActions();
 
   const [purgeNb, setPurgeNb] = useState<NotebookRow | null>(null);
   const [purgeFolder, setPurgeFolder] = useState<FolderRow | null>(null);
+  const [purgeTab, setPurgeTab] = useState<TabRow | null>(null);
+
+  const trashedTabIds = useMemo(
+    () => new Set(tabs.filter((tb) => tb.deletedAt != null).map((tb) => tb.id)),
+    [tabs],
+  );
+
+  const trashedTabs = useMemo(
+    () =>
+      tabs
+        .filter((tb) => tb.deletedAt != null)
+        .sort((a, b) => (b.deletedAt ?? 0) - (a.deletedAt ?? 0)),
+    [tabs],
+  );
 
   const trashedNotebooks = useMemo(
     () =>
       notebooks
-        .filter((n) => n.deletedAt != null)
+        .filter(
+          (n) =>
+            n.deletedAt != null &&
+            // notebooks inside a trashed tab are represented by the tab row
+            !(n.tabId && trashedTabIds.has(n.tabId)),
+        )
         .sort((a, b) => (b.deletedAt ?? 0) - (a.deletedAt ?? 0)),
-    [notebooks],
+    [notebooks, trashedTabIds],
   );
 
   // a whole folder subtree is trashed together — only surface top-most folders
@@ -37,13 +58,14 @@ export function TrashList() {
         .filter(
           (f) =>
             f.deletedAt != null &&
+            !(f.tabId && trashedTabIds.has(f.tabId)) &&
             (f.parentId == null || (folders.find((p) => p.id === f.parentId)?.deletedAt ?? null) == null),
         )
         .sort((a, b) => (b.deletedAt ?? 0) - (a.deletedAt ?? 0)),
-    [folders],
+    [folders, trashedTabIds],
   );
 
-  if (trashedNotebooks.length + trashedFolders.length === 0) {
+  if (trashedNotebooks.length + trashedFolders.length + trashedTabs.length === 0) {
     return <EmptyState icon={Trash2} title={t('library.empty.trash')} hint={t('library.trashHint')} />;
   }
 
@@ -54,37 +76,92 @@ export function TrashList() {
         {t('library.trashHint')}
       </div>
 
+      {trashedTabs.length > 0 ? (
+        <section aria-label={t('library.tabs')} className="mb-6">
+          <h2 className="mb-2 text-sm font-semibold text-muted-foreground">{t('library.tabs')}</h2>
+          <ul className="flex flex-col gap-2">
+            {trashedTabs.map((tb) => (
+              <TrashTabItem
+                key={tb.id}
+                tab={tb}
+                lang={lang}
+                onRestore={() => void actions.restoreTab(tb.id)}
+                onPurge={() => setPurgeTab(tb)}
+              />
+            ))}
+          </ul>
+        </section>
+      ) : null}
+
       <section aria-label={t('library.notebooks', 'Notebooks', 'الدفاتر')} className="mb-6">
         <h2 className="mb-2 text-sm font-semibold text-muted-foreground">
           {t('library.notebooks', 'Notebooks', 'الدفاتر')}
         </h2>
-        <ul className="flex flex-col gap-2">
-          {trashedNotebooks.map((nb) => (
-            <TrashNotebookItem
-              key={nb.id}
-              notebook={nb}
-              lang={lang}
-              onRestore={() => void actions.restoreNotebook(nb.id)}
-              onPurge={() => setPurgeNb(nb)}
-            />
-          ))}
-        </ul>
+        {trashedNotebooks.length === 0 ? (
+          <p className="px-1 text-sm text-muted-foreground">
+            {t('library.trash.noneOf', 'No trashed items here.', 'لا عناصر محذوفة هنا.')}
+          </p>
+        ) : (
+          <ul className="flex flex-col gap-2">
+            {trashedNotebooks.map((nb) => (
+              <TrashNotebookItem
+                key={nb.id}
+                notebook={nb}
+                lang={lang}
+                onRestore={() => void actions.restoreNotebook(nb.id)}
+                onPurge={() => setPurgeNb(nb)}
+              />
+            ))}
+          </ul>
+        )}
       </section>
 
       <section aria-label={t('library.folders')}>
         <h2 className="mb-2 text-sm font-semibold text-muted-foreground">{t('library.folders')}</h2>
-        <ul className="flex flex-col gap-2">
-          {trashedFolders.map((f) => (
-            <TrashFolderItem
-              key={f.id}
-              folder={f}
-              lang={lang}
-              onRestore={() => void actions.restoreFolder(f.id)}
-              onPurge={() => setPurgeFolder(f)}
-            />
-          ))}
-        </ul>
+        {trashedFolders.length === 0 ? (
+          <p className="px-1 text-sm text-muted-foreground">
+            {t('library.trash.noneOf', 'No trashed items here.', 'لا عناصر محذوفة هنا.')}
+          </p>
+        ) : (
+          <ul className="flex flex-col gap-2">
+            {trashedFolders.map((f) => (
+              <TrashFolderItem
+                key={f.id}
+                folder={f}
+                lang={lang}
+                onRestore={() => void actions.restoreFolder(f.id)}
+                onPurge={() => setPurgeFolder(f)}
+              />
+            ))}
+          </ul>
+        )}
       </section>
+
+      <ConfirmDialog
+        open={!!purgeTab}
+        onOpenChange={(o) => {
+          if (!o) setPurgeTab(null);
+        }}
+        title={t('common.deletePermanent')}
+        description={
+          purgeTab
+            ? fmt(
+                t(
+                  'library.purgeTab.confirm',
+                  '“{name}” and everything inside it will be deleted permanently.',
+                  'سيُحذف «{name}» وكل محتوياته نهائيًا.',
+                ),
+                { name: purgeTab.name },
+              )
+            : undefined
+        }
+        confirmLabel={t('common.deletePermanent')}
+        destructive
+        onConfirm={async () => {
+          if (!purgeTab) return;
+          await actions.purgeTab(purgeTab.id);
+        }}
+      />
 
       <ConfirmDialog
         open={!!purgeNb}
@@ -142,6 +219,50 @@ export function TrashList() {
 }
 
 // ---------------------------------------------------------------- items
+
+function TrashTabItem({
+  tab,
+  lang,
+  onRestore,
+  onPurge,
+}: {
+  tab: TabRow;
+  lang: 'en' | 'ar';
+  onRestore: () => void;
+  onPurge: () => void;
+}) {
+  const { t } = useT();
+  return (
+    <li className="flex items-center gap-3 rounded-xl border bg-card p-3 shadow-ink-1">
+      <div
+        aria-hidden
+        className="flex aspect-[3/4] w-12 shrink-0 items-center justify-center rounded-md bg-surface-variant text-lg"
+        style={{ boxShadow: `inset 0 -3px 0 ${tab.colorHex}` }}
+      >
+        {tab.emoji}
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-sm font-semibold">{tab.name}</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">{fmtDate(tab.deletedAt ?? 0, lang)}</div>
+      </div>
+      <div className="flex shrink-0 items-center gap-2">
+        <Button variant="outline" size="sm" onClick={onRestore} className="press-scale">
+          <RotateCcw className="h-3.5 w-3.5" aria-hidden />
+          <span className="hidden sm:inline">{t('common.restore')}</span>
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={onPurge}
+          className="press-scale border-destructive/40 text-destructive hover:bg-destructive/10 hover:text-destructive"
+        >
+          <Trash2 className="h-3.5 w-3.5" aria-hidden />
+          <span className="hidden sm:inline">{t('common.deletePermanent')}</span>
+        </Button>
+      </div>
+    </li>
+  );
+}
 
 function TrashNotebookItem({
   notebook,

@@ -137,6 +137,20 @@ export function drawImageEl(ctx: CanvasRenderingContext2D, el: ImageEl, opts: Re
   // cover-fit the source into the element box
   const s = Math.max(Math.abs(el.w) / nat.w, Math.abs(el.h) / nat.h);
   const dw = nat.w * s, dh = nat.h * s;
+  // rounded corners: clip the drawn box (page-space radius, clamped to half min side)
+  const r = el.cornerRadius ?? 0;
+  if (r > 0) {
+    const maxR = Math.min(Math.abs(el.w), Math.abs(el.h)) / 2;
+    const rr = Math.min(r, maxR);
+    ctx.beginPath();
+    // clip ellipse-ish capsule when the radius reaches the half-min side
+    if (rr >= maxR) {
+      ctx.ellipse(0, 0, Math.abs(el.w) / 2, Math.abs(el.h) / 2, 0, 0, Math.PI * 2);
+    } else {
+      ctx.roundRect(-Math.abs(el.w) / 2, -Math.abs(el.h) / 2, Math.abs(el.w), Math.abs(el.h), rr);
+    }
+    ctx.clip();
+  }
   try {
     ctx.drawImage(src, -dw / 2, -dh / 2, dw, dh);
   } catch { /* bad image */ }

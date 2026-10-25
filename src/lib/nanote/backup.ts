@@ -2,7 +2,7 @@
 // Format: JSON with a versioned header; binary ink payloads + blobs as base64.
 import * as db from './idb';
 import { decodeDoc, encodeDoc } from './ink';
-import { FolderRow, NotebookRow, PageRow, RecordingRow, TagRow, Settings } from './types';
+import { FolderRow, NotebookRow, PageRow, RecordingRow, TabRow, TagRow, Settings } from './types';
 
 const MAGIC = 'NANOTE-BACKUP';
 const BACKUP_VERSION = 1;
@@ -13,6 +13,7 @@ interface BackupFile {
   exportedAt: string;
   app: string;
   folders: FolderRow[];
+  tabs?: TabRow[]; // v2+ — absent in v1 backups
   notebooks: NotebookRow[];
   pages: PageRow[];
   tags: TagRow[];
@@ -61,13 +62,16 @@ function b64ToAb(b64: string): ArrayBuffer {
 
 // ---------------------------------------------------------------- build
 export async function buildNanoteBackup(includeAudio: boolean): Promise<Blob> {
-  const [folders, notebooks, pages, tags, recordings, settings] = await Promise.all([
-    db.listFolders(), db.listNotebooks(), db.listPages(), db.listTags(),
+  const [folders, tabs, notebooks, pages, tags, recordings, settings] = await Promise.all([
+    db.listFolders(), db.listTabs(), db.listNotebooks(), db.listPages(), db.listTags(),
     db.listRecordings(), db.loadSettings(),
   ]);
   // collect all images referenced anywhere (covers, templates, backgrounds, inserted images)
   const imageIds = new Set<string>();
-  for (const n of notebooks) if (n.coverCustomId) imageIds.add(n.coverCustomId);
+  for (const n of notebooks) {
+    if (n.coverCustomId) imageIds.add(n.coverCustomId);
+    if (n.pdfOriginalId) imageIds.add(n.pdfOriginalId);
+  }
   for (const p of pages) {
     if (p.backgroundImageId) imageIds.add(p.backgroundImageId);
     if (p.customTemplateImageId) imageIds.add(p.customTemplateImageId);
@@ -101,7 +105,7 @@ export async function buildNanoteBackup(includeAudio: boolean): Promise<Blob> {
     version: BACKUP_VERSION,
     exportedAt: new Date().toISOString(),
     app: 'Nanote 1.0.0',
-    folders, notebooks, pages, tags,
+    folders, notebooks, pages, tags, tabs,
     docs: allDocs,
     images: imagePayloads,
     recordings,
@@ -126,6 +130,7 @@ export async function restoreNanoteBackup(file: File): Promise<{ notebooks: numb
   await db.wipeAllData();
 
   for (const f of payload.folders ?? []) await db.putFolder(f);
+  for (const tb of payload.tabs ?? []) await db.putTab(tb);
   for (const n of payload.notebooks ?? []) await db.putNotebook(n);
   for (const t of payload.tags ?? []) await db.putTag(t);
   for (const p of payload.pages ?? []) await db.putPage(p);

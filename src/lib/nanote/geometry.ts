@@ -31,11 +31,34 @@ export function elementBBox(el: PageElement, pad = 0): BBox {
       return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
     }
     case 'image': {
-      const x0 = Math.min(el.x, el.x + el.w), x1 = Math.max(el.x, el.x + el.w);
-      const y0 = Math.min(el.y, el.y + el.h), y1 = Math.max(el.y, el.y + el.h);
-      return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+      if (!el.rotation) {
+        const x0 = Math.min(el.x, el.x + el.w), x1 = Math.max(el.x, el.x + el.w);
+        const y0 = Math.min(el.y, el.y + el.h), y1 = Math.max(el.y, el.y + el.h);
+        return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+      }
+      // rotated image: axis-aligned box around the rotated rect
+      const cx = el.x + el.w / 2, cy = el.y + el.h / 2;
+      const c = Math.abs(Math.cos(el.rotation)), s = Math.abs(Math.sin(el.rotation));
+      const hw = Math.abs(el.w) / 2, hh = Math.abs(el.h) / 2;
+      const ex = hw * c + hh * s, ey = hw * s + hh * c;
+      return { x0: cx - ex - pad, y0: cy - ey - pad, x1: cx + ex + pad, y1: cy + ey + pad };
     }
   }
+}
+
+/** Rotation-aware point hit-test for images: inverse-transform the point into
+ *  the image's local space (translate to center, rotate by -rotation) and
+ *  test it against the half-extents. `pad` grows the box in page units. */
+export function pointInImage(el: ImageEl, x: number, y: number, pad = 0): boolean {
+  let lx = x - (el.x + el.w / 2);
+  let ly = y - (el.y + el.h / 2);
+  if (el.rotation) {
+    const c = Math.cos(-el.rotation), s = Math.sin(-el.rotation);
+    const rx = lx * c - ly * s;
+    const ry = lx * s + ly * c;
+    lx = rx; ly = ry;
+  }
+  return Math.abs(lx) <= Math.abs(el.w) / 2 + pad && Math.abs(ly) <= Math.abs(el.h) / 2 + pad;
 }
 
 export function unionBBox(boxes: BBox[]): BBox | null {

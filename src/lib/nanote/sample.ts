@@ -75,6 +75,8 @@ export async function seedWelcomeNotebook(lang: 'en' | 'ar' = 'en'): Promise<str
   const notebook: NotebookRow = {
     id: uid(),
     folderId: null,
+    tabId: null,
+    pdfOriginalId: null,
     title,
     coverId: 'nanote-blue',
     coverCustomId: null,

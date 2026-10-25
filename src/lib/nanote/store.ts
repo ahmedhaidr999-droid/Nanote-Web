@@ -5,7 +5,7 @@ import { create } from 'zustand';
 import * as db from './idb';
 import {
   DEFAULT_SETTINGS, DEFAULT_TOOL_STATES, EditorTool, EraserMode, FolderRow, ImageEl, NotebookRow,
-  PageDoc, PageElement, PageRow, PageSizeId, RecordingRow, Settings, ShapeType, StrokeEl, TagRow,
+  PageDoc, PageElement, PageRow, PageSizeId, PdfTextRec, RecordingRow, Settings, ShapeType, StrokeEl, TabRow, TagRow,
   TemplateId, ToolId, ToolState, UNDO_LIMIT, emptyDoc,
 } from './types';
 import { uid } from './util';
@@ -18,7 +18,7 @@ export type View =
   | { name: 'boot' }
   | { name: 'onboarding' }
   | { name: 'library' }
-  | { name: 'create-notebook'; folderId: string | null }
+  | { name: 'create-notebook'; folderId: string | null; tabId?: string | null }
   | { name: 'editor'; notebookId: string }
   | { name: 'settings' };
 
@@ -31,6 +31,7 @@ export interface TextDefaults {
 export interface NewNotebookInput {
   title: string;
   folderId: string | null;
+  tabId?: string | null;
   coverId: string;
   coverCustomId: string | null;
   template: TemplateId;
@@ -49,6 +50,7 @@ interface AppState {
 
   // ----- library
   folders: FolderRow[];
+  tabs: TabRow[];
   notebooks: NotebookRow[];
   tags: TagRow[];
   pages: PageRow[]; // all pages (rows only; docs live in IDB)
@@ -95,7 +97,14 @@ interface AppState {
   setSort(s: 'recent' | 'title' | 'created'): void;
   setSearchQuery(q: string): void;
 
-  createFolder(name: string, parentId: string | null, emoji: string, colorHex: string): Promise<string>;
+  createTab(name: string, emoji: string, colorHex: string): Promise<string>;
+  updateTab(id: string, patch: Partial<TabRow>): Promise<void>;
+  renameTab(id: string, name: string): Promise<void>;
+  trashTab(id: string): Promise<void>;
+  restoreTab(id: string): Promise<void>;
+  purgeTab(id: string): Promise<void>;
+
+  createFolder(name: string, parentId: string | null, emoji: string, colorHex: string, tabId: string | null): Promise<string>;
   updateFolder(id: string, patch: Partial<FolderRow>): Promise<void>;
   renameFolder(id: string, name: string): Promise<void>;
   moveFolder(id: string, parentId: string | null): Promise<void>;
@@ -107,6 +116,7 @@ interface AppState {
   updateNotebook(id: string, patch: Partial<NotebookRow>): Promise<void>;
   renameNotebook(id: string, title: string): Promise<void>;
   moveNotebook(id: string, folderId: string | null): Promise<void>;
+  moveNotebookToTab(id: string, tabId: string | null): Promise<void>;
   toggleFavoriteNotebook(id: string): Promise<void>;
   duplicateNotebook(id: string): Promise<string>;
   trashNotebook(id: string): Promise<void>;
@@ -205,6 +215,39 @@ async function persistDoc(get: () => AppState, pageId: string) {
 
 const docClone = (doc: PageDoc): PageDoc => ({ version: 1, elements: [...doc.elements], sync: { ...doc.sync } });
 
+// ---------------------------------------------------------------- v2 migration (one-time)
+// Old model: flat top-level folders as the only grouping. New model: TABS are
+// the top-level edge chips; folders nest inside tabs (folder→folder→notebooks).
+// Migration: every existing folder becomes a tab; its notebooks move with it.
+// Also links pre-v2 PDF imports to their stored original file (same-createdAt
+// heuristic) so text selection can reach the text content later.
+async function migrateTabsV2(): Promise<void> {
+  const flag = await db.getMetaFlag('tabsV2');
+  if (flag) return;
+  const [folders, notebooks, pages, images] = await Promise.all([
+    db.listFolders(), db.listNotebooks(), db.listPages(), db.listImages(),
+  ]);
+  for (const f of folders) {
+    const tab: TabRow = {
+      id: f.id, name: f.name, colorHex: f.colorHex, emoji: f.emoji,
+      createdAt: f.createdAt, updatedAt: f.updatedAt, deletedAt: f.deletedAt,
+    };
+    await db.putTab(tab);
+    for (const n of notebooks) {
+      if (n.folderId === f.id) await db.putNotebook({ ...n, folderId: null, tabId: f.id });
+    }
+    await db.deleteFolderRow(f.id);
+  }
+  for (const nb of notebooks) {
+    if (nb.pdfOriginalId != null) continue;
+    const hasPdfPages = pages.some((p) => p.notebookId === nb.id && p.backgroundImageId);
+    if (!hasPdfPages) continue;
+    const orig = images.find((im) => im.createdAt === nb.createdAt && /\.pdf$/i.test(im.name));
+    if (orig) await db.putNotebook({ ...nb, pdfOriginalId: orig.id });
+  }
+  await db.putMetaFlag('tabsV2', true);
+}
+
 export const useApp = create<AppState>((set, get) => ({
 
   booted: false,
@@ -214,6 +257,7 @@ export const useApp = create<AppState>((set, get) => ({
   settings: { ...DEFAULT_SETTINGS },
 
   folders: [],
+  tabs: [],
   notebooks: [],
   tags: [],
   pages: [],
@@ -251,15 +295,17 @@ export const useApp = create<AppState>((set, get) => ({
   async boot() {
     const settings = await db.loadSettings();
     set({ settings });
+    try { await migrateTabsV2() } catch (e) { console.warn('[nanote] migration failed', e) }
     try { await db.purgeTrash() } catch (e) { console.warn('[nanote] purge failed', e) }
-    const [folders, notebooks, tags, pages] = await Promise.all([
-      db.listFolders(), db.listNotebooks(), db.listTags(), db.listPages(),
+    const [folders, tabs, notebooks, tags, pages] = await Promise.all([
+      db.listFolders(), db.listTabs(), db.listNotebooks(), db.listTags(), db.listPages(),
     ]);
     const pageCounts: Record<string, number> = {};
     for (const p of pages) if (!p.notebookId) continue; else pageCounts[p.notebookId] = (pageCounts[p.notebookId] ?? 0) + 1;
     set({
       booted: true,
       folders: folders.sort((a, b) => a.name.localeCompare(b.name)),
+      tabs: tabs.sort((a, b) => a.name.localeCompare(b.name)),
       notebooks: notebooks.sort((a, b) => b.lastOpenedAt - a.lastOpenedAt),
       tags,
       pages,
@@ -303,13 +349,14 @@ export const useApp = create<AppState>((set, get) => ({
 
   // ------------------------------------------------------------ library
   async refreshLibrary() {
-    const [folders, notebooks, tags, pages] = await Promise.all([
-      db.listFolders(), db.listNotebooks(), db.listTags(), db.listPages(),
+    const [folders, tabs, notebooks, tags, pages] = await Promise.all([
+      db.listFolders(), db.listTabs(), db.listNotebooks(), db.listTags(), db.listPages(),
     ]);
     const pageCounts: Record<string, number> = {};
     for (const p of pages) pageCounts[p.notebookId] = (pageCounts[p.notebookId] ?? 0) + 1;
     set({
       folders: folders.sort((a, b) => a.name.localeCompare(b.name)),
+      tabs: tabs.sort((a, b) => a.name.localeCompare(b.name)),
       notebooks: notebooks.sort((a, b) => b.lastOpenedAt - a.lastOpenedAt),
       tags, pages, pageCounts,
     });
@@ -319,9 +366,75 @@ export const useApp = create<AppState>((set, get) => ({
   setSort(s) { set({ sort: s }) },
   setSearchQuery(q) { set({ searchQuery: q }) },
 
-  async createFolder(name, parentId, emoji, colorHex) {
+  // ------------------------------------------------------------ tabs
+  async createTab(name, emoji, colorHex) {
     const now = Date.now();
-    const folder: FolderRow = { id: uid(), name, parentId, colorHex, emoji, createdAt: now, updatedAt: now, isFavorite: false, deletedAt: null };
+    const tab: TabRow = { id: uid(), name, colorHex, emoji, createdAt: now, updatedAt: now, deletedAt: null };
+    await db.putTab(tab);
+    await get().refreshLibrary();
+    return tab.id;
+  },
+
+  async updateTab(id, patch) {
+    const tb = get().tabs.find((x) => x.id === id);
+    if (!tb) return;
+    await db.putTab({ ...tb, ...patch, updatedAt: Date.now() });
+    await get().refreshLibrary();
+  },
+
+  async renameTab(id, name) { await get().updateTab(id, { name }) },
+
+  async trashTab(id) {
+    const now = Date.now();
+    const { folders, notebooks } = get();
+    const tb = get().tabs.find((x) => x.id === id);
+    if (!tb) return;
+    await db.putTab({ ...tb, deletedAt: now, updatedAt: now });
+    // the whole subtree goes with it: folders of this tab + notebooks of this tab
+    for (const f of folders) {
+      if (f.tabId === id && f.deletedAt == null) await db.putFolder({ ...f, deletedAt: now, updatedAt: now });
+    }
+    for (const n of notebooks) {
+      if (n.tabId === id && n.deletedAt == null) await db.putNotebook({ ...n, deletedAt: now, updatedAt: now });
+    }
+    await get().refreshLibrary();
+  },
+
+  async restoreTab(id) {
+    const { folders, notebooks } = get();
+    const now = Date.now();
+    const tb = get().tabs.find((x) => x.id === id);
+    if (!tb) return;
+    if (tb.deletedAt != null) await db.putTab({ ...tb, deletedAt: null, updatedAt: now });
+    for (const f of folders) {
+      if (f.tabId === id && f.deletedAt != null) await db.putFolder({ ...f, deletedAt: null, updatedAt: now });
+    }
+    for (const n of notebooks) {
+      if (n.tabId === id && n.deletedAt != null) await db.putNotebook({ ...n, deletedAt: null, updatedAt: now });
+    }
+    await get().refreshLibrary();
+  },
+
+  async purgeTab(id) {
+    const { folders, notebooks } = get();
+    for (const n of notebooks) {
+      if (n.tabId === id) await get().purgeNotebook(n.id);
+    }
+    for (const f of folders) {
+      if (f.tabId === id) await db.deleteFolderRow(f.id);
+    }
+    await db.deleteTabRow(id);
+    await get().refreshLibrary();
+  },
+
+  async createFolder(name, parentId, emoji, colorHex, tabId) {
+    const now = Date.now();
+    // nested folders inherit their tab from the parent folder
+    const parent = parentId ? get().folders.find((f) => f.id === parentId) : undefined;
+    const folder: FolderRow = {
+      id: uid(), name, parentId, tabId: parent ? parent.tabId : tabId,
+      colorHex, emoji, createdAt: now, updatedAt: now, isFavorite: false, deletedAt: null,
+    };
     await db.putFolder(folder);
     await get().refreshLibrary();
     return folder.id;
@@ -336,7 +449,19 @@ export const useApp = create<AppState>((set, get) => ({
   },
 
   async renameFolder(id, name) { await get().updateFolder(id, { name }) },
-  async moveFolder(id, parentId) { await get().updateFolder(id, { parentId }) },
+  async moveFolder(id, parentId) {
+    // never allow cycles: a folder cannot be moved into its own subtree
+    const { folders } = get();
+    let cur: string | null = parentId;
+    while (cur) {
+      if (cur === id) return; // would create a cycle
+      cur = folders.find((f) => f.id === cur)?.parentId ?? null;
+    }
+    const target = parentId ? folders.find((f) => f.id === parentId) : undefined;
+    // moving into a folder of another tab carries the subtree into that tab
+    const own = folders.find((f) => f.id === id);
+    await get().updateFolder(id, { parentId, tabId: target ? target.tabId : own?.tabId ?? null });
+  },
 
   async trashFolder(id) {
     const now = Date.now();
@@ -400,6 +525,8 @@ export const useApp = create<AppState>((set, get) => ({
     const notebook: NotebookRow = {
       id: uid(),
       folderId: input.folderId,
+      tabId: input.tabId ?? null,
+      pdfOriginalId: null,
       title: input.title,
       coverId: input.coverId,
       coverCustomId: input.coverCustomId,
@@ -441,7 +568,21 @@ export const useApp = create<AppState>((set, get) => ({
   },
 
   async renameNotebook(id, title) { await get().updateNotebook(id, { title }) },
-  async moveNotebook(id, folderId) { await get().updateNotebook(id, { folderId }) },
+
+  async moveNotebook(id, folderId) {
+    // moving into a folder also moves the notebook into that folder's tab
+    const { folders } = get();
+    const target = folderId ? folders.find((f) => f.id === folderId) : undefined;
+    await get().updateNotebook(id, {
+      folderId,
+      tabId: target ? target.tabId : get().notebooks.find((n) => n.id === id)?.tabId ?? null,
+    });
+  },
+
+  async moveNotebookToTab(id, tabId) {
+    // moving to a tab lands at that tab's root (no folder)
+    await get().updateNotebook(id, { tabId, folderId: null });
+  },
 
   async toggleFavoriteNotebook(id) {
     const n = get().notebooks.find((x) => x.id === id);
@@ -483,14 +624,21 @@ export const useApp = create<AppState>((set, get) => ({
     const n = get().notebooks.find((x) => x.id === id);
     if (!n) return;
     await db.putNotebook({ ...n, deletedAt: null, updatedAt: Date.now() });
-    // restore parent folder chain if trashed
-    const { folders } = get();
+    // restore the parent chain: folders, then the tab the notebook belongs to
+    const { folders, tabs } = get();
     let pid = n.folderId;
     while (pid) {
       const f = folders.find((x) => x.id === pid);
       if (!f || f.deletedAt == null) break;
       await db.putFolder({ ...f, deletedAt: null, updatedAt: Date.now() });
       pid = f.parentId;
+    }
+    const tb = tabs.find((x) => x.id === n.tabId);
+    if (tb && tb.deletedAt != null) {
+      await db.putTab({ ...tb, deletedAt: null, updatedAt: Date.now() });
+      for (const f of folders) {
+        if (f.tabId === tb.id && f.deletedAt != null) await db.putFolder({ ...f, deletedAt: null, updatedAt: Date.now() });
+      }
     }
     await get().refreshLibrary();
   },
@@ -502,11 +650,13 @@ export const useApp = create<AppState>((set, get) => ({
       if (p.backgroundImageId) await db.deleteImage(p.backgroundImageId);
       if (p.customTemplateImageId) await db.deleteImage(p.customTemplateImageId);
       await db.deletePageDoc(p.id);
+      await db.deletePdfText(p.id);
       await db.deleteThumb(p.id);
       await db.deletePageRow(p.id);
     }
     const nb = get().notebooks.find((x) => x.id === id);
     if (nb?.coverCustomId) await db.deleteImage(nb.coverCustomId);
+    if (nb?.pdfOriginalId) await db.deleteImage(nb.pdfOriginalId);
     for (const r of recs) {
       if (r.notebookId === id) {
         await db.deleteAudio(r.id);
@@ -943,6 +1093,7 @@ export const useApp = create<AppState>((set, get) => ({
     }
     await db.deletePageRow(pageId);
     await db.deletePageDoc(pageId);
+    await db.deletePdfText(pageId);
     await db.deleteThumb(pageId);
     const remaining = pages.filter((p) => p.id !== pageId).map((p, i) => ({ ...p, pageIndex: i }));
     for (let i = 0; i < remaining.length; i++) {

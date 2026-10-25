@@ -3,14 +3,15 @@
 // lasso selection. Drags (move/scale/rotate) preview on the live overlay and
 // commit as a single undoable command.
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Copy, Scissors, ClipboardPaste, Trash2, CopyPlus, Palette, X, RotateCw } from 'lucide-react';
+import { Copy, Scissors, ClipboardPaste, Trash2, CopyPlus, Palette, X, RotateCw, Squircle } from 'lucide-react';
 import { toast } from 'sonner';
 import { useApp, useT } from '@/lib/nanote/store';
-import { PageElement, TextEl } from '@/lib/nanote/types';
+import { PageElement, TextEl, ImageEl } from '@/lib/nanote/types';
 import { drawStroke, drawText, drawShape, drawImageEl } from '@/lib/nanote/render';
 import { resolveImage, imageNatural } from '@/lib/nanote/images';
 import { elementBBox, transformElement, unionBBox } from '@/lib/nanote/geometry';
 import { cn } from '@/lib/utils';
+import { Slider } from '@/components/ui/slider';
 import {
   Painter, addPainter, getVp, useVp, worldToScreen, setHiddenIds,
   requestOverlayRepaint, requestRepaint, type PageLayout,
@@ -39,6 +40,10 @@ export function SelectionLayer({
   const { t } = useT();
   const dragRef = useRef<Drag>(null);
   const [recolorOpen, setRecolorOpen] = useState(false);
+  const [cornersOpen, setCornersOpen] = useState(false);
+  const cornerPreviewRef = useRef<number | null>(null); // live slider preview radius
+  const cornerPageRef = useRef<string | null>(null);   // page whose ids are hidden for the preview
+  const cornersAnchorRef = useRef<HTMLDivElement>(null); // toggle button wrapper (outside-click ignore)
 
   const activePageLayout = useMemo(
     () => layouts.find((l) => l.id === selection?.pageId) ?? null,
@@ -55,39 +60,72 @@ export function SelectionLayer({
     return unionBBox(selectedEls.map((e) => elementBBox(e, 6)));
   }, [selectedEls]);
 
-  // hide originals + paint moved copies while dragging
+  // hide originals + paint moved copies while dragging; live-preview the
+  // corner-radius slider on a selected image (same hidden-ids mechanism)
   useEffect(() => {
     const painter: Painter = (ctx, v) => {
       const drag = dragRef.current;
-      if (!drag || !selection || !doc) return;
+      const preview = cornerPreviewRef.current;
+      if ((!drag && preview == null) || !selection || !doc) return;
       const layout = layouts.find((l) => l.id === selection.pageId);
       if (!layout) return;
       ctx.save();
       ctx.translate(v.tx, layout.y * v.scale + v.ty);
       ctx.scale(v.scale, v.scale);
       const els = doc.elements.filter((e) => selection.ids.includes(e.id));
-      for (const el of els) {
-        if (drag.kind === 'move') {
-          const moved = transformElement(el, { dx: drag.dx, dy: drag.dy });
-          drawTransformed(ctx, moved, gamma);
-        } else if (drag.kind === 'resize') {
-          const moved = transformElement(el, {
-            sx: drag.sx, sy: drag.sy,
-            ox: drag.startBBox.x0, oy: drag.startBBox.y0,
-          });
-          drawTransformed(ctx, moved, gamma);
-        } else if (drag.kind === 'rotate') {
-          if (el.kind === 'image' && selectedEls.length === 1) {
-            drawTransformed(ctx, { ...el, rotation: drag.rotation }, gamma);
-          } else {
-            drawTransformed(ctx, el, gamma);
+      if (drag) {
+        for (const el of els) {
+          if (drag.kind === 'move') {
+            const moved = transformElement(el, { dx: drag.dx, dy: drag.dy });
+            drawTransformed(ctx, moved, gamma);
+          } else if (drag.kind === 'resize') {
+            const moved = transformElement(el, {
+              sx: drag.sx, sy: drag.sy,
+              ox: drag.startBBox.x0, oy: drag.startBBox.y0,
+            });
+            drawTransformed(ctx, moved, gamma);
+          } else if (drag.kind === 'rotate') {
+            if (el.kind === 'image' && selectedEls.length === 1) {
+              drawTransformed(ctx, { ...el, rotation: drag.rotation }, gamma);
+            } else {
+              drawTransformed(ctx, el, gamma);
+            }
           }
         }
+      } else if (preview != null && els.length === 1 && els[0].kind === 'image') {
+        drawTransformed(ctx, { ...(els[0] as ImageEl), cornerRadius: preview }, gamma);
       }
       ctx.restore();
     };
     return addPainter(painter);
   }, [selection, doc, gamma, layouts, selectedEls]);
+
+  /** live-preview a corner radius: hide the committed image, paint the preview */
+  const previewCorners = (radius: number | null) => {
+    if (radius != null) {
+      const sel = useApp.getState().editor.selection;
+      if (!sel) return;
+      cornerPreviewRef.current = radius;
+      cornerPageRef.current = sel.pageId;
+      setHiddenIds(sel.pageId, new Set(sel.ids));
+    } else {
+      cornerPreviewRef.current = null;
+      const pg = cornerPageRef.current;
+      cornerPageRef.current = null;
+      if (pg) setHiddenIds(pg, null);
+    }
+  };
+
+  /** commit a corner-radius change as ONE undoable command (before/after) */
+  const commitCorners = (radius: number) => {
+    const sel = useApp.getState().editor.selection;
+    if (!sel) return;
+    const st = useApp.getState();
+    const doc = st.editor.docs[sel.pageId];
+    const el = doc?.elements.find((x) => x.id === sel.ids[0]);
+    if (!el || el.kind !== 'image' || (el.cornerRadius ?? 0) === radius) return;
+    st.patchElements(sel.pageId, [{ id: el.id, before: el, after: { ...el, cornerRadius: radius } }], 'corners');
+  };
 
   const isImageOnly = selectedEls.length === 1 && selectedEls[0].kind === 'image';
   const interactive = tool === 'lasso' || tool === 'image';
@@ -208,6 +246,23 @@ export function SelectionLayer({
             </div>
           )}
         </div>
+        {singleImage && (
+          <div className="relative" ref={cornersAnchorRef}>
+            <SBtn label={t('tool.image.corners')} onClick={() => setCornersOpen((v) => !v)}><Squircle className="h-4 w-4" /></SBtn>
+            {cornersOpen && imgEl && (
+              <div className="absolute start-0 top-10 z-40" style={{ pointerEvents: 'auto' }}>
+                <CornersPopover
+                  key={imgEl.id}
+                  imgEl={imgEl}
+                  anchorRef={cornersAnchorRef}
+                  onPreview={previewCorners}
+                  onCommit={commitCorners}
+                  onClose={() => { previewCorners(null); setCornersOpen(false) }}
+                />
+              </div>
+            )}
+          </div>
+        )}
         <SBtn label={t('lasso.delete')} onClick={() => useApp.getState().deleteSelection()}><Trash2 className="h-4 w-4 text-destructive" /></SBtn>
         <SBtn label={t('lasso.clear')} onClick={() => useApp.getState().setSelection(null)}><X className="h-4 w-4" /></SBtn>
       </div>
@@ -263,6 +318,134 @@ function drawTransformed(ctx: CanvasRenderingContext2D, el: PageElement, gamma: 
     case 'shape': drawShape(ctx, el); break;
     case 'image': drawImageEl(ctx, el, opts); break;
   }
+}
+
+/** Corners popover (single selected image): Sharp/Rounded segmented toggle +
+ *  a radius slider (0 … min(w,h)/2). Slider drags preview live on the overlay
+ *  (original hidden) and commit as ONE undoable command on release. */
+function CornersPopover({
+  imgEl, anchorRef, onPreview, onCommit, onClose,
+}: {
+  imgEl: ImageEl;
+  anchorRef: React.RefObject<HTMLDivElement | null>;
+  onPreview: (radius: number | null) => void;
+  onCommit: (radius: number) => void;
+  onClose: () => void;
+}) {
+  const { t } = useT();
+  const committed = imgEl.cornerRadius ?? 0;
+  const maxR = Math.max(1, Math.floor(Math.min(Math.abs(imgEl.w), Math.abs(imgEl.h)) / 2));
+  const [radius, setRadius] = useState(committed);
+  const pendingRef = useRef<number | null>(null); // previewed-but-not-yet-committed radius
+  const boxRef = useRef<HTMLDivElement>(null);
+
+  // stable flush so the unmount cleanup always commits a pending preview
+  const flushRef = useRef<() => void>(() => {});
+  useEffect(() => {
+    flushRef.current = () => {
+      const p = pendingRef.current;
+      pendingRef.current = null;
+      if (p != null) { onCommit(p); onPreview(null) }
+    };
+  }, [onCommit, onPreview]);
+
+  useEffect(() => {
+    const onDown = (e: PointerEvent) => {
+      const target = e.target as Node;
+      // the anchor wrapper (toggle button) owns open/close via its own click
+      if (boxRef.current?.contains(target) || anchorRef.current?.contains(target)) return;
+      flushRef.current();
+      onClose();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { flushRef.current(); onClose() }
+    };
+    window.addEventListener('pointerdown', onDown, { capture: true });
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('pointerdown', onDown, { capture: true });
+      window.removeEventListener('keydown', onKey);
+      flushRef.current(); // e.g. selection deleted while a preview was live
+      onPreview(null);
+    };
+  }, []);
+
+  const applySharp = () => {
+    pendingRef.current = null;
+    setRadius(0);
+    onPreview(null);
+    onCommit(0);
+  };
+
+  const applyRound = () => {
+    const target = radius > 0 ? radius : Math.min(40, maxR);
+    pendingRef.current = null;
+    setRadius(target);
+    onPreview(null);
+    onCommit(target);
+  };
+
+  const sharpActive = radius === 0;
+
+  return (
+    <div
+      ref={boxRef}
+      className="w-56 rounded-xl border border-border bg-card p-3 shadow-ink-2"
+      style={{ pointerEvents: 'auto' }}
+      dir="ltr"
+      onClick={(e) => e.stopPropagation()}
+      role="group"
+      aria-label={t('tool.image.corners')}
+    >
+      <div className="mb-2 grid grid-cols-2 gap-1 rounded-lg bg-muted p-1">
+        <button
+          type="button"
+          aria-pressed={sharpActive}
+          onClick={applySharp}
+          className={cn(
+            'h-7 rounded-md text-xs font-medium transition-colors press-scale',
+            sharpActive ? 'bg-card text-foreground shadow-ink-1' : 'text-muted-foreground hover:text-foreground',
+          )}
+        >
+          {t('tool.image.corners.sharp')}
+        </button>
+        <button
+          type="button"
+          aria-pressed={!sharpActive}
+          onClick={applyRound}
+          className={cn(
+            'h-7 rounded-md text-xs font-medium transition-colors press-scale',
+            !sharpActive ? 'bg-card text-foreground shadow-ink-1' : 'text-muted-foreground hover:text-foreground',
+          )}
+        >
+          {t('tool.image.corners.round')}
+        </button>
+      </div>
+      <div className="mb-1.5 flex items-center justify-between">
+        <span className="text-xs font-semibold text-muted-foreground">{t('tool.image.radius')}</span>
+        <span className="text-[10px] tabular-nums text-muted-foreground/70">{radius}</span>
+      </div>
+      <Slider
+        value={[radius]}
+        min={0}
+        max={maxR}
+        step={1}
+        aria-label={t('tool.image.radius')}
+        onValueChange={(vals) => {
+          const v = vals[0] ?? 0;
+          setRadius(v);
+          pendingRef.current = v;
+          onPreview(v);
+        }}
+        onValueCommit={(vals) => {
+          const v = vals[0] ?? 0;
+          pendingRef.current = null;
+          onCommit(v);
+          onPreview(null);
+        }}
+      />
+    </div>
+  );
 }
 
 function SBtn({ children, label, onClick, disabled }: { children: React.ReactNode; label: string; onClick?: () => void; disabled?: boolean }) {

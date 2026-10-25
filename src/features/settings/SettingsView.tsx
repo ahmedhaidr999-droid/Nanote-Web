@@ -25,6 +25,10 @@ import {
   Mic,
   Monitor,
   Moon,
+  PanelBottom,
+  PanelLeft,
+  PanelRight,
+  PanelTop,
   RefreshCw,
   Sun,
   TriangleAlert,
@@ -392,6 +396,20 @@ export default function SettingsView() {
                 checked={settings.leftHanded}
                 onCheckedChange={(leftHanded) => void setSettings({ leftHanded })}
               />
+              <div className="space-y-2">
+                <div className="text-sm font-medium">{t('settings.toolPosition')}</div>
+                <Segmented
+                  label={t('settings.toolPosition')}
+                  value={settings.toolRailPosition}
+                  onChange={(toolRailPosition) => void setSettings({ toolRailPosition })}
+                  options={[
+                    { value: 'top', label: t('settings.toolPosition.top'), icon: <PanelTop className="size-4 shrink-0" /> },
+                    { value: 'bottom', label: t('settings.toolPosition.bottom'), icon: <PanelBottom className="size-4 shrink-0" /> },
+                    { value: 'left', label: t('settings.toolPosition.left'), icon: <PanelLeft className="size-4 shrink-0" /> },
+                    { value: 'right', label: t('settings.toolPosition.right'), icon: <PanelRight className="size-4 shrink-0" /> },
+                  ]}
+                />
+              </div>
             </div>
           </Section>
 

@@ -13,13 +13,15 @@ import { useImageURL } from './useImageURL';
 interface SearchOverlayProps {
   onClose: () => void;
   onSelectFolder: (folderId: string) => void;
+  onSelectTab: (tabId: string) => void;
   onSelectTag: (tagId: string) => void;
 }
 
-export function SearchOverlay({ onClose, onSelectFolder, onSelectTag }: SearchOverlayProps) {
+export function SearchOverlay({ onClose, onSelectFolder, onSelectTab, onSelectTag }: SearchOverlayProps) {
   const { t, fmt } = useT();
   const notebooks = useApp((s) => s.notebooks);
   const folders = useApp((s) => s.folders);
+  const tabs = useApp((s) => s.tabs);
   const tags = useApp((s) => s.tags);
   const pages = useApp((s) => s.pages);
 
@@ -58,6 +60,9 @@ export function SearchOverlay({ onClose, onSelectFolder, onSelectTag }: SearchOv
     const nbHits = notebooks
       .filter((n) => n.deletedAt == null && n.title.toLowerCase().includes(needle))
       .slice(0, 12);
+    const tabHits = tabs
+      .filter((tb) => tb.deletedAt == null && tb.name.toLowerCase().includes(needle))
+      .slice(0, 6);
     const folderHits = folders
       .filter((f) => f.deletedAt == null && f.name.toLowerCase().includes(needle))
       .slice(0, 8);
@@ -73,8 +78,8 @@ export function SearchOverlay({ onClose, onSelectFolder, onSelectTag }: SearchOv
         if (pageHits.length >= 20) break;
       }
     }
-    return { nbHits, folderHits, tagHits, pageHits };
-  }, [debouncedQ, notebooks, folders, tags, pages, liveIds]);
+    return { nbHits, tabHits, folderHits, tagHits, pageHits };
+  }, [debouncedQ, notebooks, folders, tabs, tags, pages, liveIds]);
 
   const openNotebook = (id: string) => {
     onClose();
@@ -84,6 +89,7 @@ export function SearchOverlay({ onClose, onSelectFolder, onSelectTag }: SearchOv
   const isEmpty =
     results !== null &&
     results.nbHits.length === 0 &&
+    results.tabHits.length === 0 &&
     results.folderHits.length === 0 &&
     results.tagHits.length === 0 &&
     results.pageHits.length === 0;
@@ -144,6 +150,36 @@ export function SearchOverlay({ onClose, onSelectFolder, onSelectTag }: SearchOv
               </Group>
             ) : null}
 
+            {results && results.tabHits.length > 0 ? (
+              <Group label={t('library.tabs')}>
+                {results.tabHits.map((tb) => (
+                  <button
+                    key={tb.id}
+                    type="button"
+                    onClick={() => {
+                      onSelectTab(tb.id);
+                      onClose();
+                    }}
+                    className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-start text-sm transition-colors press-scale hover:bg-accent/60"
+                  >
+                    <span
+                      className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-base"
+                      style={{ background: `${tb.colorHex}1F` }}
+                      aria-hidden
+                    >
+                      {tb.emoji}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate font-medium">{tb.name}</span>
+                    <span className="shrink-0 rounded-full bg-surface-variant px-2 py-0.5 text-xs text-muted-foreground">
+                      {fmt(t('library.insideTab'), {
+                        count: notebooks.filter((n) => n.deletedAt == null && n.tabId === tb.id).length,
+                      })}
+                    </span>
+                  </button>
+                ))}
+              </Group>
+            ) : null}
+
             {results && results.folderHits.length > 0 ? (
               <Group label={t('library.folders')}>
                 {results.folderHits.map((f) => (
@@ -160,6 +196,11 @@ export function SearchOverlay({ onClose, onSelectFolder, onSelectTag }: SearchOv
                       {f.emoji}
                     </span>
                     <span className="min-w-0 flex-1 truncate font-medium">{f.name}</span>
+                    {f.tabId != null ? (
+                      <span className="shrink-0 truncate text-xs text-muted-foreground">
+                        {tabs.find((tb) => tb.id === f.tabId)?.name ?? ''}
+                      </span>
+                    ) : null}
                     <Folder className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
                   </button>
                 ))}

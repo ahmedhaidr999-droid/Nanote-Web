@@ -85,6 +85,8 @@ export async function importPdfAsNotebook(
   const notebook: NotebookRow = {
     id: uid(),
     folderId: null,
+    tabId: null,
+    pdfOriginalId: originalImageId, // the untouched source file — powers the text layer
     title,
     coverId: 'paper-white',
     coverCustomId: null,

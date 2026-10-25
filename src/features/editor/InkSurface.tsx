@@ -16,22 +16,36 @@
 // zoom-adaptive input decimation, two-tier live outline (cached Path2D head +
 // cheap recomputed tail), committed strokes linger on the overlay until the
 // page raster catches up (no vanish-frame), smooth animated double-tap zoom.
+//
+// Laser pointer mode: a presentation tool. Strokes glow on the overlay and
+// fade away (LASER_MS); they NEVER enter the page doc — no undo, no save.
 import { useEffect, useRef } from 'react';
 import { toast } from 'sonner';
 import { useApp, useT } from '@/lib/nanote/store';
-import { StrokeEl, ToolId, TextEl } from '@/lib/nanote/types';
+import { StrokeEl, ToolId, TextEl, ImageEl } from '@/lib/nanote/types';
 import { uid, clamp } from '@/lib/nanote/util';
 import { computeOutline, OP } from '@/lib/nanote/outline';
+import { drawImageEl } from '@/lib/nanote/render';
+import { resolveImage, imageNatural } from '@/lib/nanote/images';
 import {
   elementInLasso, strokeIntersectsCircle, elementIntersectsCircle, strokeErasedByArea,
-  snapAngle, shapePath,
+  snapAngle, shapePath, pointInImage, transformElement,
 } from '@/lib/nanote/geometry';
 import {
   Painter, addPainter, getVp, screenToWorld, worldToScreen, zoomAt, animateZoomTo, cancelZoomAnim,
-  panBy, setVp, clampScale, requestOverlayRepaint, setHiddenIds, snapToRuler,
+  panBy, setVp, clampScale, requestOverlayRepaint, requestRepaint, setHiddenIds, snapToRuler,
   type PageLayout, pageAtWorldY, axisBounds, VIEWPORT_PAD,
   beginVpGesture, endVpGesture, vpAnimGen, animateVpTo,
 } from './viewport';
+
+// Laser pointer mode: a presentation tool. Strokes glow on the overlay and
+// fade away (LASER_MS); they NEVER enter the page doc — no undo, no save.
+//
+// Image tool mode: taps select the topmost image under the pointer
+// (rotation-aware hit-test); a ~330ms hold-and-drag moves it (previewed on
+// the overlay via hiddenIds + a painter, committed through patchElements).
+const IMG_HOLD_MS = 330;         // press-and-hold window before an image tap becomes a move
+const IMG_SLOP_PX = 8;           // movement that cancels a pending image tap
 
 const AUTO_CONTINUE_PTS = 2400;   // very long strokes continue as a fresh stroke
 const PEN_IDLE_MS = 3000;         // pen "in range" window after last pen event
@@ -51,6 +65,7 @@ const HOLD_STILL_MS = 120;        // release after this much stillness ⇒ no fl
 type Mode =
   | { type: 'none' }
   | { type: 'stroke'; pointerId: number; pageId: string; pageY: number; points: OP[]; tool: ToolId; color: string; width: number; startAbs: number; lastAbs: number; lastTs: number; minDist: number; pSmooth: number; straight: boolean; cached: Path2D | null; cachedUpTo: number }
+  | { type: 'laser'; pointerId: number; pageId: string; pageY: number; points: { x: number; y: number }[]; color: string; width: number; minDist: number }
   | { type: 'erase'; pointerId: number; pageId: string; pageY: number; path: { x: number; y: number }[]; removed: Set<string>; lastScreen: { x: number; y: number } }
   | { type: 'lasso'; pointerId: number; pageId: string; pageY: number; poly: { x: number; y: number }[] }
   | { type: 'shape'; pointerId: number; pageId: string; pageY: number; ax: number; ay: number; bx: number; by: number }
@@ -58,12 +73,108 @@ type Mode =
       lockX: boolean; lockY: boolean; minX: number; maxX: number; minY: number; maxY: number;
       samples: { t: number; x: number; y: number }[]; lastMoveT: number }
   | { type: 'pinch'; ids: [number, number]; d0: number; scale0: number; mid0: { x: number; y: number }; tx0: number; ty0: number }
+  | { type: 'imgtap'; pointerId: number; pageId: string; pageY: number; imgId: string; startWorld: { x: number; y: number }; startScreen: { x: number; y: number }; pointerType: string }
+  | { type: 'imgmove'; pointerId: number; pageId: string; pageY: number; imgId: string; startWorld: { x: number; y: number }; dx: number; dy: number }
 
 type PanMode = Extract<Mode, { type: 'pan' }>;
 
 interface LingerItem { pageY: number; path: Path2D; color: string; hi: boolean; darkPaper: boolean; elId: string }
 
-const HOVER_TOOLS: Set<string> = new Set(['fountain', 'ballpoint', 'brush', 'fineliner', 'highlighter', 'shape']);
+const HOVER_TOOLS: Set<string> = new Set(['fountain', 'ballpoint', 'brush', 'fineliner', 'highlighter', 'shape', 'laser']);
+
+// -------------------------------------------------- laser pointer trail
+// Finished laser polylines live here (module-level) and fade out on the
+// overlay canvas. They are purely transient: never committed to the page
+// doc, never undoable, never saved.
+const LASER_MS = 1100;        // total trail lifetime
+const LASER_MAX_TRAIL = 12;   // cap — oldest dropped
+interface LaserTrailItem {
+  path: Path2D | null;        // null → single-point dot
+  x: number; y: number;       // dot center (page-space) when path is null
+  pageY: number;
+  color: string;
+  width: number;
+  born: number;               // performance.now()
+}
+let laserTrail: LaserTrailItem[] = [];
+let laserRaf = 0;
+let laserLoopOn = false;
+
+/** repaint loop that runs while any trail item is alive */
+const laserLoop = () => {
+  laserRaf = 0;
+  const now = performance.now();
+  laserTrail = laserTrail.filter((tr) => now - tr.born < LASER_MS);
+  requestOverlayRepaint();
+  if (laserTrail.length) laserRaf = requestAnimationFrame(laserLoop);
+  else laserLoopOn = false;
+};
+
+const wakeLaserLoop = () => {
+  if (laserLoopOn) return;
+  laserLoopOn = true;
+  laserRaf = requestAnimationFrame(laserLoop);
+};
+
+const stopLaserLoop = () => {
+  if (laserRaf) cancelAnimationFrame(laserRaf);
+  laserRaf = 0;
+  laserLoopOn = false;
+  laserTrail = [];
+};
+
+/** smooth polyline through the points (quadratic midpoint smoothing) */
+function laserSmoothPath(pts: { x: number; y: number }[]): Path2D {
+  const p = new Path2D();
+  if (!pts.length) return p;
+  p.moveTo(pts[0].x, pts[0].y);
+  if (pts.length === 1) return p;
+  if (pts.length === 2) { p.lineTo(pts[1].x, pts[1].y); return p }
+  for (let i = 1; i < pts.length - 1; i++) {
+    p.quadraticCurveTo(pts[i].x, pts[i].y, (pts[i].x + pts[i + 1].x) / 2, (pts[i].y + pts[i + 1].y) / 2);
+  }
+  const last = pts[pts.length - 1];
+  p.lineTo(last.x, last.y);
+  return p;
+}
+
+/** glowing round-capped stroke — the laser look (shadow ignores the CTM) */
+function strokeLaser(ctx: CanvasRenderingContext2D, path: Path2D, color: string, width: number, alpha: number) {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 12;
+  ctx.globalAlpha = alpha;
+  ctx.stroke(path);
+  ctx.restore();
+}
+
+function dotLaser(ctx: CanvasRenderingContext2D, x: number, y: number, color: string, width: number, alpha: number) {
+  ctx.save();
+  ctx.fillStyle = color;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 12;
+  ctx.globalAlpha = alpha;
+  ctx.beginPath();
+  ctx.arc(x, y, width / 2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+/** push a finished laser stroke into the fading trail */
+function trailLaser(pts: { x: number; y: number }[], pageY: number, color: string, width: number) {
+  if (!pts.length) return;
+  laserTrail.push({
+    path: pts.length >= 2 ? laserSmoothPath(pts) : null,
+    x: pts[0].x, y: pts[0].y,
+    pageY, color, width, born: performance.now(),
+  });
+  if (laserTrail.length > LASER_MAX_TRAIL) laserTrail.shift();
+  wakeLaserLoop();
+}
 
 const isDarkPaper = (hex: string | undefined): boolean => {
   if (!hex) return false;
@@ -107,6 +218,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
   const lastTapRef = useRef<{ t: number; x: number; y: number } | null>(null);
   const downInfoRef = useRef<{ x: number; y: number; t: number } | null>(null);
   const scrollRafRef = useRef(0);   // momentum / settle rAF (one at a time)
+  const holdTimerRef = useRef(0);  // image tool: pending long-press timer
   const { t, lang } = useT();
   const langRef = useRef(lang);
   const tRef = useRef(t);
@@ -176,9 +288,29 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     const st = useApp.getState();
     if (e.pointerType !== 'touch') return false;
     if (Math.max(e.width || 0, e.height || 0) > PALM_DRAW_PX) return false;
+    // the laser pointer is used live with the finger even when "finger
+    // drawing" is off — it never persists anything (palm-size is still refused)
+    if (st.editor.tool === 'laser') return true;
     if (!st.settings.fingerDrawing) return false;
     if (st.settings.stylusOnly && penSeenRef.current > 0) return false; // pen-only mode
     return true;
+  };
+
+  // ================================================ image tool helpers
+  const clearImgHold = () => {
+    if (holdTimerRef.current) { clearTimeout(holdTimerRef.current); holdTimerRef.current = 0 }
+  };
+
+  /** topmost image under a page-space point (rotation-aware hit-test) */
+  const hitImageAt = (pageId: string, px: number, py: number): ImageEl | null => {
+    const doc = useApp.getState().editor.docs[pageId];
+    if (!doc) return null;
+    let best: ImageEl | null = null;
+    for (const el of doc.elements) {
+      if (el.kind !== 'image' || !pointInImage(el, px, py, 2)) continue;
+      if (!best || el.z > best.z) best = el;
+    }
+    return best;
   };
 
   // -------------------------------------------------- live overlay painter
@@ -198,6 +330,19 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         }
         ctx.fillStyle = lg.color;
         ctx.fill(lg.path);
+        ctx.restore();
+      }
+
+      // laser trails — age-based fade, purely transient (never in the page doc)
+      const nowMs = performance.now();
+      for (const tr of laserTrail) {
+        const alpha = 0.9 * (1 - (nowMs - tr.born) / LASER_MS);
+        if (alpha <= 0) continue;
+        ctx.save();
+        ctx.translate(vp.tx, tr.pageY * vp.scale + vp.ty);
+        ctx.scale(vp.scale, vp.scale);
+        if (tr.path) strokeLaser(ctx, tr.path, tr.color, tr.width, alpha);
+        else dotLaser(ctx, tr.x, tr.y, tr.color, tr.width, alpha);
         ctx.restore();
       }
 
@@ -241,6 +386,15 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
             ctx.fill(p);
           }
         }
+      } else if (m.type === 'laser') {
+        // in-progress laser stroke: same translate/scale as stroke mode
+        ctx.translate(vp.tx, m.pageY * vp.scale + vp.ty);
+        ctx.scale(vp.scale, vp.scale);
+        if (m.points.length === 1) {
+          dotLaser(ctx, m.points[0].x, m.points[0].y, m.color, m.width, 0.9);
+        } else {
+          strokeLaser(ctx, laserSmoothPath(m.points), m.color, m.width, 0.9);
+        }
       } else if (m.type === 'lasso') {
         ctx.strokeStyle = '#1E6FF2';
         ctx.lineWidth = 1.6;
@@ -273,12 +427,26 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         ctx.stroke();
         ctx.fillStyle = 'rgba(229,72,77,0.10)';
         ctx.fill();
+      } else if (m.type === 'imgmove') {
+        // image tool long-press drag: the original is hidden on the page
+        // raster (setHiddenIds) — paint the moved copy here
+        const st = useApp.getState();
+        const el = st.editor.docs[m.pageId]?.elements.find((e2) => e2.id === m.imgId);
+        if (el && el.kind === 'image') {
+          ctx.save();
+          ctx.translate(vp.tx, m.pageY * vp.scale + vp.ty);
+          ctx.scale(vp.scale, vp.scale);
+          drawImageEl(ctx, transformElement(el, { dx: m.dx, dy: m.dy }), {
+            gamma: st.settings.pressureCurve, resolveImage, imageNatural,
+          });
+          ctx.restore();
+        }
       } else if (m.type === 'none') {
         // pen hover cursor ring (Apple Pencil hover / stylus tracking)
         const hover = hoverRef.current;
         if (hover && HOVER_TOOLS.has(useApp.getState().editor.tool)) {
           const st = useApp.getState();
-          const ts = st.editor.toolStates[st.editor.lastPen];
+          const ts = st.editor.toolStates[st.editor.tool === 'laser' ? 'laser' : st.editor.lastPen];
           const r = ts ? clamp(ts.width * vp.scale / 2, 2.5, 18) : 3;
           ctx.beginPath();
           ctx.arc(hover.x, hover.y, r, 0, Math.PI * 2);
@@ -518,6 +686,19 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       }
     };
 
+    /** laser points: same page-space conversion + zoom-adaptive decimation
+     *  as strokes (no ruler snap, no pressure — it's a pointer, not ink) */
+    const addLaserPoint = (m: Extract<Mode, { type: 'laser' }>, ev: PointerEvent, page: PageLayout) => {
+      const vp = getVp();
+      m.minDist = clamp(0.7 / vp.scale, 0.25, 2.5);
+      const l = localPt(ev);
+      const world = screenToWorld(l.x, l.y);
+      const px = clamp(world.x, -200, pageW + 200);
+      const py = world.y - page.y;
+      const last = m.points[m.points.length - 1];
+      if (Math.hypot(px - last.x, py - last.y) >= m.minDist) m.points.push({ x: px, y: py });
+    };
+
     const onPointerDown = (e: PointerEvent) => {
       if (e.pointerType === 'pen') penSeenRef.current = performance.now(); // pen contact
 
@@ -537,7 +718,19 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
           if (meaningful) void commitStroke(m, true);
           modeRef.current = { type: 'none' };
         }
+        if (m.type === 'laser') {
+          // trail what was drawn, then hand the gesture to the pinch
+          trailLaser(m.points, m.pageY, m.color, m.width);
+          modeRef.current = { type: 'none' };
+          requestOverlayRepaint();
+        }
         if (m.type === 'pan') { modeRef.current = { type: 'none' }; endVpGesture() }
+        if (m.type === 'imgtap' || m.type === 'imgmove') {
+          // a pinch takes over: cancel any pending image select / drag
+          clearImgHold();
+          if (m.type === 'imgmove') setHiddenIds(m.pageId, null);
+          modeRef.current = { type: 'none' };
+        }
         const [a, b] = [...pointers.entries()].map(([id, p]) => ({ id, ...p }));
         const d0 = Math.hypot(a.x - b.x, a.y - b.y);
         if (d0 > 10) {
@@ -562,6 +755,43 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       downInfoRef.current = { x: e.clientX, y: e.clientY, t: performance.now() };
       try { host.setPointerCapture(e.pointerId) } catch { /* pointer already gone */ }
       activeTypeRef.current = e.pointerType;
+
+      // ---- image tool: tap = select, hold ≳330ms = move-drag, empty space pans
+      // (runs before the pan gate so touch taps on images can select too)
+      if (tool === 'image' && e.button === 0 && !spaceRef.current) {
+        const world = worldFromEvent(e);
+        const page = pageForWorld(world.y);
+        const hit = page ? hitImageAt(page.id, world.x, world.y - page.y) : null;
+        if (hit && page) {
+          void st.ensureDoc(page.id);
+          st.setActivePage(page.id);
+          modeRef.current = {
+            type: 'imgtap', pointerId: e.pointerId, pageId: page.id, pageY: page.y,
+            imgId: hit.id, startWorld: { x: world.x, y: world.y },
+            startScreen: localPt(e), pointerType: e.pointerType,
+          };
+          holdTimerRef.current = window.setTimeout(() => {
+            holdTimerRef.current = 0;
+            const m = modeRef.current;
+            if (m.type !== 'imgtap' || m.pointerId !== e.pointerId) return;
+            // hold confirmed → select + start the move-drag (the original is
+            // hidden on the page raster; the overlay painter draws the copy)
+            useApp.getState().setSelection({ pageId: m.pageId, ids: [m.imgId] });
+            modeRef.current = {
+              type: 'imgmove', pointerId: m.pointerId, pageId: m.pageId, pageY: m.pageY,
+              imgId: m.imgId, startWorld: m.startWorld, dx: 0, dy: 0,
+            };
+            setHiddenIds(m.pageId, new Set([m.imgId]));
+          }, IMG_HOLD_MS);
+          return;
+        }
+        // no image hit: mouse/pen drags on empty space navigate (pan like the
+        // pan tool); touch keeps its own routing below (isPanGesture gate)
+        if (e.pointerType === 'mouse' || e.pointerType === 'pen') {
+          startPan(e, localPt(e));
+          return;
+        }
+      }
 
       if (isPanGesture(e)) {
         startPan(e, localPt(e));
@@ -609,6 +839,27 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
           ax: pagePt.x, ay: pagePt.y, bx: pagePt.x, by: pagePt.y,
         };
         requestOverlayRepaint();
+        return;
+      }
+
+      if (tool === 'laser') {
+        // presentation pointer: transient overlay ink, nothing persists
+        const ts = stEd.toolStates.laser;
+        modeRef.current = {
+          type: 'laser', pointerId: e.pointerId, pageId: page.id, pageY: page.y,
+          points: [{ x: pagePt.x, y: pagePt.y }],
+          color: ts.color, width: ts.width,
+          minDist: clamp(0.7 / getVp().scale, 0.25, 2.5),
+        };
+        requestOverlayRepaint();
+        return;
+      }
+
+      // non-inking tools: text selection runs in the DOM text layer above this
+      // surface (empty-area drags still pan through here); the image tool
+      // resolves taps/long-presses on pointerup (selection + move).
+      if (tool === 'textselect' || tool === 'image') {
+        modeRef.current = { type: 'none' };
         return;
       }
 
@@ -685,6 +936,14 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         return;
       }
 
+      if (m.type === 'laser' && e.pointerId === m.pointerId) {
+        const page = layouts.find((p) => p.id === m.pageId);
+        if (!page) return;
+        for (const ev of coalescedOf(e)) addLaserPoint(m, ev, page);
+        requestOverlayRepaint();
+        return;
+      }
+
       if (m.type === 'erase' && e.pointerId === m.pointerId) {
         const st = useApp.getState();
         const vp = getVp();
@@ -754,6 +1013,25 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         requestOverlayRepaint();
         return;
       }
+
+      if (m.type === 'imgtap' && e.pointerId === m.pointerId) {
+        // moved before the hold fired → not a tap, no select: the same
+        // gesture falls through to navigation and becomes a pan (mouse and
+        // pen pan like the pan tool, same as drags on empty space)
+        if (Math.hypot(l.x - m.startScreen.x, l.y - m.startScreen.y) > IMG_SLOP_PX) {
+          clearImgHold();
+          startPan(e, l);
+        }
+        return;
+      }
+
+      if (m.type === 'imgmove' && e.pointerId === m.pointerId) {
+        const world = screenToWorld(l.x, l.y);
+        m.dx = world.x - m.startWorld.x;
+        m.dy = world.y - m.startWorld.y;
+        requestOverlayRepaint();
+        return;
+      }
     };
 
     const tryDoubleTap = (e: PointerEvent) => {
@@ -788,11 +1066,46 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         activeTypeRef.current = null;
         // a clean finger tap while navigating = double-tap zoom candidate
         if (known && quick && e.pointerType === 'touch') tryDoubleTap(e);
+        // image tool: a quick tap that panned nothing = empty area → clear selection
+        if (known && quick && st.editor.tool === 'image') st.setSelection(null);
         releasePanScroll(m, e.pointerType);
+        return;
+      }
+      if (m.type === 'imgtap' && e.pointerId === m.pointerId) {
+        // released before the hold fired = quick tap on an image → select it
+        // (handles + rotate arrow appear in the SelectionLayer)
+        clearImgHold();
+        modeRef.current = { type: 'none' };
+        activeTypeRef.current = null;
+        st.setSelection({ pageId: m.pageId, ids: [m.imgId] });
+        return;
+      }
+      if (m.type === 'imgmove' && e.pointerId === m.pointerId) {
+        modeRef.current = { type: 'none' };
+        activeTypeRef.current = null;
+        setHiddenIds(m.pageId, null);
+        if (Math.abs(m.dx) > 0.5 || Math.abs(m.dy) > 0.5) {
+          const doc = st.editor.docs[m.pageId];
+          const el = doc?.elements.find((x) => x.id === m.imgId);
+          if (el && el.kind === 'image') {
+            st.patchElements(m.pageId, [{ id: el.id, before: el, after: transformElement(el, { dx: m.dx, dy: m.dy }) }], 'imgmove');
+          }
+        } else {
+          requestRepaint(); // hold without a move: restore the hidden original
+        }
+        // selection stays active so the handles remain for further editing
         return;
       }
       if (m.type === 'stroke' && e.pointerId === m.pointerId) {
         void commitStroke(m, true);
+        modeRef.current = { type: 'none' };
+        activeTypeRef.current = null;
+        requestOverlayRepaint();
+        return;
+      }
+      if (m.type === 'laser' && e.pointerId === m.pointerId) {
+        // trail it — never committed to the page doc (no undo, no save)
+        trailLaser(m.points, m.pageY, m.color, m.width);
         modeRef.current = { type: 'none' };
         activeTypeRef.current = null;
         requestOverlayRepaint();
@@ -868,6 +1181,11 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         }
         return;
       }
+      // image tool: quick tap on empty space (mode was 'none') clears selection
+      if (known && quick && tool === 'image') {
+        st.setSelection(null);
+        return;
+      }
       if (known && quick && e.pointerType === 'touch') tryDoubleTap(e);
     };
 
@@ -875,6 +1193,13 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     const onPointerCancel = (e: PointerEvent) => {
       const m = modeRef.current;
       if (m.type === 'stroke' && e.pointerId === m.pointerId) { modeRef.current = { type: 'none' }; activeTypeRef.current = null; requestOverlayRepaint() }
+      if (m.type === 'laser' && e.pointerId === m.pointerId) {
+        // cancel behaves like up: trail what was drawn, fade it away
+        trailLaser(m.points, m.pageY, m.color, m.width);
+        modeRef.current = { type: 'none' };
+        activeTypeRef.current = null;
+        requestOverlayRepaint();
+      }
       if (m.type === 'erase' && e.pointerId === m.pointerId) { setHiddenIds(m.pageId, null); modeRef.current = { type: 'none' }; activeTypeRef.current = null }
       if (m.type === 'lasso' && e.pointerId === m.pointerId) { modeRef.current = { type: 'none' }; activeTypeRef.current = null }
       if (m.type === 'shape' && e.pointerId === m.pointerId) { modeRef.current = { type: 'none' }; activeTypeRef.current = null }
@@ -885,6 +1210,17 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         const out = (!m.lockX && (cur.tx < m.minX - 0.5 || cur.tx > m.maxX + 0.5)) ||
                     (!m.lockY && (cur.ty < m.minY - 0.5 || cur.ty > m.maxY + 0.5));
         if (out) settleScroll(m, cur.tx, cur.ty, false); else endVpGesture();
+      }
+      if (m.type === 'imgtap' && e.pointerId === m.pointerId) {
+        clearImgHold();
+        modeRef.current = { type: 'none' };
+        activeTypeRef.current = null;
+      }
+      if (m.type === 'imgmove' && e.pointerId === m.pointerId) {
+        // cancelled mid-drag: restore the original, no commit
+        setHiddenIds(m.pageId, null);
+        modeRef.current = { type: 'none' };
+        activeTypeRef.current = null;
       }
       if (m.type === 'pinch') modeRef.current = { type: 'none' };
       pointers.delete(e.pointerId);
@@ -935,6 +1271,10 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     window.addEventListener('blur', onBlurWin);
     return () => {
       cancelLocalScroll();
+      clearImgHold();
+      const mEnd = modeRef.current;
+      if (mEnd.type === 'imgmove') setHiddenIds(mEnd.pageId, null);
+      stopLaserLoop(); // fade loop + trail die with the surface
       host.removeEventListener('pointerdown', onPointerDown);
       host.removeEventListener('pointermove', onPointerMove);
       host.removeEventListener('pointerup', onPointerUp);
@@ -948,11 +1288,12 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     };
   }, [layouts, pageW, onTextTap]);
 
+  const cursor = useApp((s) => (s.editor.tool === 'pan' ? 'grab' : s.editor.tool === 'image' ? 'default' : 'crosshair'));
   return (
     <div
       ref={hostRef}
       className="absolute inset-0 z-10 touch-none select-none"
-      style={{ cursor: useApp((s) => s.editor.tool) === 'pan' ? 'grab' : 'crosshair' }}
+      style={{ cursor }}
       role="application"
       aria-label={t('app.name')}
     />

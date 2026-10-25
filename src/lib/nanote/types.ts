@@ -4,8 +4,8 @@ export type Lang = 'en' | 'ar';
 export type ThemeMode = 'light' | 'dark' | 'system';
 
 // ---------------------------------------------------------------- tools
-export type ToolId = 'fountain' | 'ballpoint' | 'brush' | 'fineliner' | 'highlighter';
-export type EditorTool = ToolId | 'eraser' | 'lasso' | 'text' | 'shape' | 'image' | 'pan';
+export type ToolId = 'fountain' | 'ballpoint' | 'brush' | 'fineliner' | 'highlighter' | 'laser';
+export type EditorTool = ToolId | 'eraser' | 'lasso' | 'text' | 'shape' | 'image' | 'pan' | 'textselect';
 export type ShapeType = 'line' | 'arrow' | 'rect' | 'rrect' | 'ellipse' | 'triangle' | 'star';
 export type EraserMode = 'stroke' | 'area';
 
@@ -30,7 +30,8 @@ export interface PageLabel { id: string; title: string }
 export interface FolderRow {
   id: string;
   name: string;
-  parentId: string | null;
+  parentId: string | null; // nested folders — null = directly inside its tab
+  tabId: string | null;     // which tab this folder tree lives in
   colorHex: string;
   emoji: string;
   createdAt: number;
@@ -39,9 +40,23 @@ export interface FolderRow {
   deletedAt: number | null;
 }
 
+/** A Tab is the top-level grouping shown on the library's screen edge;
+ *  folders (nestable) and notebooks live inside it. */
+export interface TabRow {
+  id: string;
+  name: string;
+  colorHex: string;
+  emoji: string;
+  createdAt: number;
+  updatedAt: number;
+  deletedAt: number | null;
+}
+
 export interface NotebookRow {
   id: string;
-  folderId: string | null;
+  folderId: string | null;   // null = directly inside its tab (or untabbed)
+  tabId: string | null;      // which tab this notebook lives in
+  pdfOriginalId: string | null; // stored original PDF file (enables the text layer)
   title: string;
   coverId: string;             // built-in cover style id ('custom' when coverCustomId set)
   coverCustomId: string | null; // images-store id
@@ -96,6 +111,8 @@ export interface Settings {
   fingerDrawing: boolean;
   stylusOnly: boolean;
   leftHanded: boolean;
+  toolRailPosition: 'top' | 'bottom' | 'left' | 'right';
+  customColors: string[];    // colors saved from the wheel (shared by pens/highlighter/laser)
   autosaveMs: number;         // 0 immediate, 1000, 5000
   onboarded: boolean;
   favoriteColors: string[];   // up to 5 saved slots
@@ -112,6 +129,8 @@ export const DEFAULT_SETTINGS: Settings = {
   fingerDrawing: false,
   stylusOnly: false,
   leftHanded: false,
+  toolRailPosition: 'left',
+  customColors: [],
   autosaveMs: 1000, // UI options: 0 (immediate) / 1000 / 5000
   onboarded: false,
   favoriteColors: ['#1E6FF2', '#16233A', '#E5484D', '#22A06B', '#FF9F1C'],
@@ -163,6 +182,7 @@ export interface ImageEl {
   x: number; y: number; w: number; h: number;
   imageId: string;
   rotation: number; // radians
+  cornerRadius?: number; // px in page-space; 0/undefined = sharp corners
   z: number;
 }
 
@@ -179,6 +199,11 @@ export interface PageDoc {
 }
 
 export function emptyDoc(): PageDoc { return { version: 1, elements: [], sync: {} } }
+
+// ---------------------------------------------------------------- pdf text layer (cached, regenerable from the stored original)
+/** One pdf.js text item positioned in ink-space (page units, y-down from page top). */
+export interface PdfTextItem { str: string; x: number; y: number; w: number; h: number }
+export interface PdfTextRec { pageId: string; items: PdfTextItem[]; updatedAt: number }
 
 // ---------------------------------------------------------------- palettes
 export const HIGHLIGHTER_PALETTE = ['#FFD84D', '#6FE38B', '#FF7EB6', '#7CC4FF', '#C9A6FF'];
@@ -217,6 +242,7 @@ export const DEFAULT_TOOL_STATES: Record<ToolId, ToolState> = {
   brush: { color: '#16233A', width: 9 },
   fineliner: { color: '#16233A', width: 1.8 },
   highlighter: { color: '#FFD84D', width: 18 },
+  laser: { color: '#E5484D', width: 6 },
 };
 
 export const ERASER_DEFAULT = { mode: 'stroke' as EraserMode, size: 24 };
