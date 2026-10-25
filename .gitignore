@@ -37,3 +37,4 @@ android/app/src/main/assets/public/
 skills/
 .e2e/
 .zscripts/
+android/keystores/
