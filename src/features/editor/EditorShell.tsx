@@ -351,6 +351,10 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
         </div>
 
         <FilmstripRail layouts={layouts} thumbVersion={thumbVersion} />
+        {/* rail lives INSIDE the viewport container so its absolute
+            positioning is relative to the area BELOW the top bar — a
+            vertically-centred rail can never end up behind the header. */}
+        <ToolRail pageW={pageW} />
 
         <InkSurface layouts={layouts} pageW={pageW} onTextTap={onTextTap} />
         <LiveOverlay />
@@ -475,7 +479,6 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
       {/* rename dialog */}
       <RenameDialog key={renameOpen ? 'open' : 'closed'} open={renameOpen} onOpenChange={setRenameOpen} initial={notebook.title} onConfirm={(title) => void useApp.getState().renameNotebook(notebookId, title)} />
 
-      <ToolRail pageW={pageW} />
     </main>
   );
 }

@@ -117,8 +117,9 @@ export function ToolRail({ pageW }: { pageW: number }) {
           // mobile: bottom pill
           'bottom-3 left-1/2 max-w-[94vw] -translate-x-1/2 overflow-x-auto no-scrollbar',
           'lg:bottom-auto lg:left-auto lg:max-w-none lg:translate-x-0 lg:flex-col lg:overflow-visible',
-          railOnRight ? 'lg:right-3' : 'lg:left-3',
+          // vertically centred within the (relative) viewport container
           'lg:top-1/2 lg:-translate-y-1/2',
+          railOnRight ? 'lg:right-3' : 'lg:left-3',
         )}
         role="toolbar"
         aria-label={t('app.name')}

@@ -45,11 +45,15 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install SDK components
-        run: yes | sdkmanager --install "platforms;android-36" "build-tools;35.0.0" > /dev/null
+      # ubuntu-latest ships the Android SDK at ANDROID_HOME — accept every
+      # license so AGP can auto-install any missing platform/build-tools.
+      - name: Accept Android SDK licenses
+        run: |
+          SDKM=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)
+          echo "using $SDKM"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          yes | "$SDKM" --install "platforms;android-36" "build-tools;35.0.0" > /dev/null 2>&1 || true
+          ls "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools" || true
 
       # ------------------------------------------------------------ versioning
       - name: Derive version from tag
