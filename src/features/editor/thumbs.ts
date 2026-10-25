@@ -26,6 +26,7 @@ async function renderToDataUrl(page: PageRow, pageW: number): Promise<string> {
   ctx.scale(scale, scale);
   renderPage(ctx, page, doc, pageW, page.height, {
     gamma: useApp.getState().settings.pressureCurve,
+    highlighterOpacity: useApp.getState().settings.highlighterOpacity,
     resolveImage,
     imageNatural,
   });

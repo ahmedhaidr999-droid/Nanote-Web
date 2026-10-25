@@ -657,6 +657,8 @@ export const useApp = create<AppState>((set, get) => ({
       await db.deletePdfText(p.id);
       await db.deleteThumb(p.id);
       await db.deletePageRow(p.id);
+      const { evictCachedRasters } = await import('./rastercache');
+      void evictCachedRasters(p.id);
     }
     const nb = get().notebooks.find((x) => x.id === id);
     if (nb?.coverCustomId) await db.deleteImage(nb.coverCustomId);
@@ -1099,6 +1101,8 @@ export const useApp = create<AppState>((set, get) => ({
     await db.deletePageDoc(pageId);
     await db.deletePdfText(pageId);
     await db.deleteThumb(pageId);
+    const { evictCachedRasters } = await import('./rastercache');
+    void evictCachedRasters(pageId);
     const remaining = pages.filter((p) => p.id !== pageId).map((p, i) => ({ ...p, pageIndex: i }));
     for (let i = 0; i < remaining.length; i++) {
       if (remaining[i].pageIndex !== pages[i].pageIndex || remaining[i].id !== pages[i].id) await db.putPage(remaining[i]);

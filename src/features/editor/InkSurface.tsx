@@ -31,8 +31,9 @@ import { useApp, useT } from '@/lib/nanote/store';
 import { StrokeEl, ToolId, TextEl, ImageEl } from '@/lib/nanote/types';
 import { uid, clamp } from '@/lib/nanote/util';
 import { computeOutline, OP } from '@/lib/nanote/outline';
-import { drawImageEl } from '@/lib/nanote/render';
+import { drawImageEl, hiAlphaOf } from '@/lib/nanote/render';
 import { resolveImage, imageNatural } from '@/lib/nanote/images';
+import { recognizeShape, type RecognizedShape } from '@/lib/nanote/shapedetect';
 import {
   elementInLasso, strokeIntersectsCircle, elementIntersectsCircle, strokeErasedByArea,
   snapAngle, shapePath, pointInImage, transformElement,
@@ -44,6 +45,7 @@ import {
 import {
   Painter, addPainter, getVp, screenToWorld, worldToScreen, zoomAt, animateZoomTo, cancelZoomAnim,
   panBy, setVp, clampScale, requestOverlayRepaint, requestRepaint, setHiddenIds, snapToRuler,
+  markInteraction, markWheel,
   type PageLayout, pageAtWorldY, axisBounds, VIEWPORT_PAD,
   beginVpGesture, endVpGesture, vpAnimGen, animateVpTo,
 } from './viewport';
@@ -58,7 +60,9 @@ const IMG_HOLD_MS = 330;         // press-and-hold window before an image tap be
 const IMG_SLOP_PX = 8;           // movement that cancels a pending image tap
 const TEXT_HOLD_MS = 420;        // long-press that selects the word under a finger/mouse (Android-like)
 const TEXT_SLOP_TOUCH = 16;      // movement that cancels a pending touch long-press (fingers jitter)
-const TEXT_SLOP_MOUSE = 10;      // tighter for the mouse
+const TEXT_SLOP_MOUSE = 10;     // tighter for the mouse
+const SHAPE_DWELL_MS = 600;     // pen held still at stroke end → recognize a shape (Notewise draw & hold)
+const SHAPE_UNLOCK_PX = 18;     // movement after a shape snap that resumes freehand
 
 const AUTO_CONTINUE_PTS = 2400;   // very long strokes continue as a fresh stroke
 const PEN_IDLE_MS = 3000;         // pen "in range" window after last pen event
@@ -77,7 +81,7 @@ const HOLD_STILL_MS = 120;        // release after this much stillness ⇒ no fl
 
 type Mode =
   | { type: 'none' }
-  | { type: 'stroke'; pointerId: number; pageId: string; pageY: number; points: OP[]; tool: ToolId; color: string; width: number; startAbs: number; lastAbs: number; lastTs: number; minDist: number; pSmooth: number; straight: boolean; cached: Path2D | null; cachedUpTo: number }
+  | { type: 'stroke'; pointerId: number; pageId: string; pageY: number; points: OP[]; tool: ToolId; color: string; width: number; startAbs: number; lastAbs: number; lastTs: number; minDist: number; pSmooth: number; straight: boolean; cached: Path2D | null; cachedUpTo: number; lockedShape: RecognizedShape | null; lastMoveAbs: number }
   | { type: 'laser'; pointerId: number; pageId: string; pageY: number; points: { x: number; y: number }[]; color: string; width: number; minDist: number }
   | { type: 'textpick'; pointerId: number; wordStart: CaretPoint | null; wordEnd: CaretPoint | null; anchor: CaretPoint; fromLongPress: boolean }
   | { type: 'erase'; pointerId: number; pageId: string; pageY: number; path: { x: number; y: number }[]; removed: Set<string>; lastScreen: { x: number; y: number } }
@@ -259,6 +263,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
   const downInfoRef = useRef<{ x: number; y: number; t: number } | null>(null);
   const scrollRafRef = useRef(0);   // momentum / settle rAF (one at a time)
   const holdTimerRef = useRef(0);  // image tool: pending long-press timer
+  const dwellTimerRef = useRef<ReturnType<typeof setInterval> | null>(null); // shape detect dwell watcher
   const textHoldRef = useRef<{ timer: number; pointerId: number; x: number; y: number; pointerType: string } | null>(null); // pending text long-press
   const { t, lang } = useT();
   const langRef = useRef(lang);
@@ -365,7 +370,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         ctx.translate(vp.tx, lg.pageY * vp.scale + vp.ty);
         ctx.scale(vp.scale, vp.scale);
         if (lg.hi) {
-          ctx.globalAlpha = lg.darkPaper ? 0.45 : 0.5;
+          ctx.globalAlpha = hiAlphaOf({ gamma: 0, highlighterOpacity: useApp.getState().settings.highlighterOpacity, paperDark: lg.darkPaper });
           ctx.globalCompositeOperation = lg.darkPaper ? 'source-over' : 'multiply';
         }
         ctx.fillStyle = lg.color;
@@ -397,7 +402,18 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         ctx.restore();
       }
 
-      if (m.type === 'stroke') {
+      if (m.type === 'stroke' && m.lockedShape) {
+        // shape snapped (draw & hold) — preview the perfect shape
+        ctx.translate(vp.tx, m.pageY * vp.scale + vp.ty);
+        ctx.scale(vp.scale, vp.scale);
+        const lk = m.lockedShape;
+        ctx.strokeStyle = m.color;
+        ctx.lineWidth = clamp(m.width, 1, 16);
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+        shapePath(ctx, lk.shape, lk.x, lk.y, lk.w, lk.h);
+        ctx.stroke();
+      } else if (m.type === 'stroke') {
         ctx.translate(vp.tx, m.pageY * vp.scale + vp.ty);
         ctx.scale(vp.scale, vp.scale);
         const st = useApp.getState();
@@ -406,7 +422,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         if (m.tool === 'highlighter') {
           const page = st.editor.pages.find((p) => p.id === m.pageId);
           const dark = isDarkPaper(page?.backgroundHex);
-          ctx.globalAlpha = dark ? 0.45 : 0.5;
+          ctx.globalAlpha = hiAlphaOf({ gamma: 0, highlighterOpacity: st.settings.highlighterOpacity, paperDark: dark });
           ctx.globalCompositeOperation = dark ? 'source-over' : 'multiply';
         }
         ctx.fillStyle = m.color;
@@ -783,15 +799,21 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         m.points = [first, { x: px, y: py, p: m.pSmooth, v: 0.4 }];
         m.lastTs = ev.timeStamp;
         m.lastAbs = performance.now();
+        m.lastMoveAbs = performance.now();
         return;
       }
       const last = m.points[m.points.length - 1];
       const d = Math.hypot(px - last.x, py - last.y);
       const dt = Math.max(0.5, ev.timeStamp - m.lastTs);
+      if (m.lockedShape && d > SHAPE_UNLOCK_PX) {
+        // resumed drawing after a shape snap → unlock, continue freehand
+        m.lockedShape = null;
+      }
       if (d >= m.minDist) {
         m.points.push({ x: px, y: py, p: m.pSmooth, v: clamp(d / dt, 0, 5) });
         m.lastTs = ev.timeStamp;
         m.lastAbs = performance.now();
+        m.lastMoveAbs = performance.now();
       }
     };
 
@@ -806,6 +828,32 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       const py = world.y - page.y;
       const last = m.points[m.points.length - 1];
       if (Math.hypot(px - last.x, py - last.y) >= m.minDist) m.points.push({ x: px, y: py });
+    };
+
+    // dwell checker (runs while a stroke is active) — pen held still at the
+    // end of the stroke for ~600ms → try to recognize a clean shape (Notewise
+    // draw & hold). The live stroke MORPHS into the perfect shape; moving
+    // again (>18px) unlocks back to freehand; release commits a ShapeEl.
+    const startDwellWatch = () => {
+      if (dwellTimerRef.current) return;
+      dwellTimerRef.current = setInterval(() => {
+        const m = modeRef.current;
+        if (m.type !== 'stroke' || m.lockedShape) return;
+        const st = useApp.getState();
+        if (!st.settings.shapeDetection) return;
+        if (m.points.length < 12 || !m.lastMoveAbs) return;
+        if (performance.now() - m.lastMoveAbs < SHAPE_DWELL_MS) return;
+        const rec = recognizeShape(m.points);
+        if (rec) {
+          m.lockedShape = rec;
+          requestOverlayRepaint();
+        } else {
+          m.lastMoveAbs = performance.now(); // not shape-like — wait for another dwell
+        }
+      }, 140);
+    };
+    const stopDwellWatch = () => {
+      if (dwellTimerRef.current) { clearInterval(dwellTimerRef.current); dwellTimerRef.current = null }
     };
 
     const onPointerDown = (e: PointerEvent) => {
@@ -864,6 +912,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       cancelZoomAnim();
       cancelLocalScroll();   // any new pointer input ends an in-flight glide/settle
       hoverRef.current = null;
+      markInteraction();
       const st = useApp.getState();
       const tool = st.editor.tool;
       downInfoRef.current = { x: e.clientX, y: e.clientY, t: performance.now() };
@@ -1029,7 +1078,9 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         startAbs: performance.now(), lastAbs: performance.now(), lastTs: e.timeStamp,
         minDist: clamp(0.7 / getVp().scale, 0.25, 2.5), pSmooth: p0,
         straight, cached: null, cachedUpTo: 0,
+        lockedShape: null, lastMoveAbs: performance.now(),
       };
+      startDwellWatch();
       requestOverlayRepaint();
     };
 
@@ -1060,6 +1111,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         const a = pointers.get(m.ids[0]);
         const b = pointers.get(m.ids[1]);
         if (!a || !b) return;
+        markInteraction();
         const d = Math.hypot(a.x - b.x, a.y - b.y);
         const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
         const scale = clampScale(m.scale0 * (d / m.d0));
@@ -1071,6 +1123,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
 
       if (m.type === 'pan') {
         if (e.pointerId !== m.pointerId) return;
+        markInteraction();
         const dx = l.x - m.lastX, dy = l.y - m.lastY;
         m.lastX = l.x; m.lastY = l.y;
         m.rawX += dx; m.rawY += dy;
@@ -1267,6 +1320,24 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         return;
       }
       if (m.type === 'stroke' && e.pointerId === m.pointerId) {
+        stopDwellWatch();
+        if (m.lockedShape) {
+          // draw & hold snapped a clean shape — commit it as a shape element
+          // with the pen's color/width (Notewise-style)
+          const lk = m.lockedShape;
+          void st.ensureDoc(m.pageId).then((doc) => {
+            const z = doc.elements.reduce((acc, el) => Math.max(acc, el.z), 0) + 1;
+            st.addElements(m.pageId, [{
+              kind: 'shape', id: uid(), shape: lk.shape,
+              x: lk.x, y: lk.y, w: lk.w, h: lk.h,
+              stroke: m.color, strokeWidth: clamp(m.width, 1, 16), fill: null, z,
+            }]);
+          });
+          modeRef.current = { type: 'none' };
+          activeTypeRef.current = null;
+          requestOverlayRepaint();
+          return;
+        }
         void commitStroke(m, true);
         modeRef.current = { type: 'none' };
         activeTypeRef.current = null;
@@ -1369,7 +1440,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     const onPointerCancel = (e: PointerEvent) => {
       clearTextHold();
       const m = modeRef.current;
-      if (m.type === 'stroke' && e.pointerId === m.pointerId) { modeRef.current = { type: 'none' }; activeTypeRef.current = null; requestOverlayRepaint() }
+      if (m.type === 'stroke' && e.pointerId === m.pointerId) { stopDwellWatch(); modeRef.current = { type: 'none' }; activeTypeRef.current = null; requestOverlayRepaint() }
       if (m.type === 'laser' && e.pointerId === m.pointerId) {
         // cancel behaves like up: trail what was drawn, fade it away
         trailLaser(m.points, m.pageY, m.color, m.width);
@@ -1418,6 +1489,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       cancelLocalScroll();   // wheel takes over from any touch glide
+      markWheel();
       const rect = host.getBoundingClientRect();
       const l = { x: e.clientX - rect.left, y: e.clientY - rect.top };
       if (e.ctrlKey || e.metaKey) {
@@ -1455,6 +1527,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       cancelLocalScroll();
       clearImgHold();
       clearTextHold();
+      stopDwellWatch();
       const mEnd = modeRef.current;
       if (mEnd.type === 'imgmove') setHiddenIds(mEnd.pageId, null);
       stopLaserLoop(); // fade loop + trail die with the surface

@@ -33,6 +33,8 @@ export interface TextSel {
   anchor: CaretPoint;
   focus: CaretPoint;
   picked?: boolean;  // fresh long-press/tap word pick → rects pop in once
+  startPt: { x: number; y: number } | null; // world-space anchor of the start drag handle
+  endPt: { x: number; y: number } | null;   // …and of the end handle (document order)
 }
 
 // ---------------------------------------------------------------- registry (owned by TextLayer)
@@ -226,6 +228,21 @@ function mergeLineRects(rects: SelRect[]): SelRect[] {
   return lines;
 }
 
+/** Client point of a caret via its collapsed range rect — the drag handles
+ *  ride ~0.73em down the line, just above the baseline like native grips.
+ *  Null when the browser reports no measurable rect for the caret. */
+function caretClientPoint(c: CaretPoint): { x: number; y: number } | null {
+  try {
+    const r = document.createRange();
+    r.setStart(c.node, c.offset);
+    r.collapse(true);
+    const rect = r.getBoundingClientRect();
+    if (rect.height > 0) return { x: rect.left, y: rect.top + rect.height * 0.73 };
+    if (rect.width > 0 || rect.left !== 0 || rect.top !== 0) return { x: rect.left, y: rect.top };
+  } catch { /* detached node — caller falls back to the band edges */ }
+  return null;
+}
+
 /** Build a DOM Range from two caret points (order-independent). */
 function rangeFromCarets(a: CaretPoint, b: CaretPoint): Range | null {
   try {
@@ -283,12 +300,110 @@ export function setSelectionFromCarets(anchor: CaretPoint, focus: CaretPoint, pi
   }
   if (!byPage.size) { clearTextSel(); return null }
 
+  // drag-handle anchors: the world-space position of each boundary caret in
+  // document order (the start handle sits on the first boundary)
+  const anchorFirst = compareCarets(anchor, focus) <= 0;
+  const sC = anchorFirst ? anchor : focus;
+  const eC = anchorFirst ? focus : anchor;
+  const toWorld = (p: { x: number; y: number } | null) =>
+    p ? { x: (p.x - mirrorRect.x) / scale, y: (p.y - mirrorRect.y) / scale } : null;
+  let startPt = toWorld(caretClientPoint(sC));
+  let endPt = toWorld(caretClientPoint(eC));
+  if ((!startPt || !endPt) && merged.length) {
+    // unmeasurable carets → the outer band edges instead
+    const f = merged[0], l = merged[merged.length - 1];
+    startPt = startPt ?? { x: (f.x - mirrorRect.x) / scale, y: (f.y + f.h * 0.73 - mirrorRect.y) / scale };
+    endPt = endPt ?? { x: (l.x + l.w - mirrorRect.x) / scale, y: (l.y + l.h * 0.73 - mirrorRect.y) / scale };
+  }
+
   const next: TextSel = {
     top, bottom, cx: cxSum / merged.length,
     byPage: [...byPage.values()],
     text, anchor, focus, picked,
+    startPt, endPt,
   };
   state = next;
   notify();
   return next;
+}
+
+// ---------------------------------------------------------------- drag-handle extension
+// The floating selection grips extend the selection word-by-word: words are
+// segmented from the mounted mirror spans (cached), matched to the pointer by
+// distance (vertical slack, 3:1 y:x weighting) and the boundary lands on the
+// word's OUTER edge, so the whole word always joins the selection.
+
+interface SpanWord { node: Text; start: number; end: number }
+
+const spanWordsCache = new WeakMap<HTMLElement, SpanWord[]>();
+
+/** Words of one mirror span — segmented once per mounted span (span text is
+ *  immutable while mounted; a reload mounts fresh elements). */
+function spanWordsOf(span: HTMLElement): SpanWord[] {
+  const hit = spanWordsCache.get(span);
+  if (hit) return hit;
+  const words: SpanWord[] = [];
+  const node = span.firstChild;
+  if (node && node.nodeType === Node.TEXT_NODE) {
+    const text = node.textContent ?? '';
+    if (segmenter) {
+      for (const seg of segmenter.segment(text)) {
+        if (/[\p{L}\p{M}\p{N}]/u.test(seg.segment)) {
+          words.push({ node: node as Text, start: seg.index, end: seg.index + seg.segment.length });
+        }
+      }
+    } else {
+      for (const m of text.matchAll(/[\p{L}\p{M}\p{N}]+/gu)) {
+        if (m.index !== undefined) words.push({ node: node as Text, start: m.index, end: m.index + m[0].length });
+      }
+    }
+  }
+  spanWordsCache.set(span, words);
+  return words;
+}
+
+/** The mirror word nearest a client point — the drag-handle drop target. */
+function nearestWordAtPoint(clientX: number, clientY: number): SpanWord | null {
+  const mirror = mirrorEl;
+  if (!mirror) return null;
+  let best: SpanWord | null = null;
+  let bestD = Infinity;
+  for (const span of mirror.querySelectorAll<HTMLElement>('[data-pagetext] > span')) {
+    const box = span.getBoundingClientRect();
+    if (box.width === 0 || box.height === 0) continue;
+    if (clientY < box.top - box.height || clientY > box.bottom + box.height) continue; // one line of slack
+    for (const w of spanWordsOf(span)) {
+      const r = document.createRange();
+      r.setStart(w.node, w.start);
+      r.setEnd(w.node, w.end);
+      const rect = r.getBoundingClientRect();
+      const dx = Math.max(0, Math.abs(clientX - (rect.left + rect.right) / 2) - rect.width / 2);
+      const dy = Math.max(0, Math.abs(clientY - (rect.top + rect.bottom) / 2) - rect.height / 2);
+      const d = dy * 3 + dx;
+      if (d < bestD) { bestD = d; best = w }
+    }
+  }
+  return best;
+}
+
+/** Move one boundary caret ('start' | 'end', document order) onto the word
+ *  nearest the pointer and keep the other boundary anchored — the drag-handle
+ *  gesture. The boundary takes the word's outer edge (away from the fixed
+ *  caret), so the selection always covers whole words; the rects, toolbar and
+ *  text update live on every move. Returns whether the selection changed. */
+export function extendSelToWord(which: 'start' | 'end', clientX: number, clientY: number): boolean {
+  const st = state;
+  if (!st) return false;
+  const anchorFirst = compareCarets(st.anchor, st.focus) <= 0;
+  const startC = anchorFirst ? st.anchor : st.focus;
+  const endC = anchorFirst ? st.focus : st.anchor;
+  const fixed = which === 'start' ? endC : startC;
+  const moving = which === 'start' ? startC : endC;
+  const word = nearestWordAtPoint(clientX, clientY);
+  if (!word) return false;
+  const after = compareCarets({ node: word.node, offset: word.start }, fixed) >= 0;
+  const next: CaretPoint = { node: word.node, offset: after ? word.end : word.start };
+  if (next.node === moving.node && next.offset === moving.offset) return false; // already there
+  setSelectionFromCarets(fixed, next, false);
+  return true;
 }

@@ -9,7 +9,7 @@ import {
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useApp, useT } from '@/lib/nanote/store';
-import { PAGE_SIZES } from '@/lib/nanote/types';
+import { PAGE_SIZES, PageRow } from '@/lib/nanote/types';
 import { uid } from '@/lib/nanote/util';
 import * as db from '@/lib/nanote/idb';
 import { cn } from '@/lib/utils';
@@ -30,7 +30,7 @@ import { PagesDialog } from './PagesDialog';
 import { Ruler } from './Ruler';
 import { recallPage } from '@/lib/nanote/pagemem';
 import {
-  fitWidth, getVp, layoutPages, pageAtWorldY, scrollToPage, subscribeVp, useVp,
+  fitWidth, getVp, layoutPages, pageAtWorldY, scrollToPage, subscribeVp, useVp, type Vp,
   animateZoomTo, animatedFit, clampVpToWorld, setViewportSize, setVp, type PageLayout,
 } from './viewport';
 
@@ -38,7 +38,6 @@ const CULL_MARGIN = 1;
 
 export default function EditorShell({ notebookId }: { notebookId: string }) {
   const { t } = useT();
-  const vp = useVp();
   const notebook = useApp((s) => s.notebooks.find((n) => n.id === notebookId));
   const pages = useApp((s) => s.editor.pages);
   const activePageId = useApp((s) => s.editor.activePageId);
@@ -48,7 +47,6 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
   const leftHanded = useApp((s) => s.settings.leftHanded);
 
   const containerRef = useRef<HTMLDivElement>(null);
-  const [size, setSize] = useState({ w: 800, h: 600 });
   const lastFitWRef = useRef(0);   // container width the current fit was computed for
   const [textSession, setTextSession] = useState<TextSession | null>(null);
   const [outlineOpen, setOutlineOpen] = useState(false);
@@ -74,7 +72,6 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
     const apply = () => {
       const w = el.clientWidth, h = el.clientHeight;
       setViewportSize(w, h);
-      setSize({ w, h });
       const wh = layoutsRef.current.reduce((acc, l) => Math.max(acc, l.y + l.h), 0);
       const lastFitW = lastFitWRef.current;
       if (lastFitW && Math.abs(w - lastFitW) > 96) {
@@ -95,7 +92,6 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
     const ro = new ResizeObserver(apply);
     ro.observe(el);
     setViewportSize(el.clientWidth, el.clientHeight);
-    setSize({ w: el.clientWidth, h: el.clientHeight });
     fitWidth(el.clientWidth, pageW);
     lastFitWRef.current = el.clientWidth;
     // Per-file memory: land on the last page this notebook was read at —
@@ -205,26 +201,7 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
     if (flagged.length) toast.warning(t('editor.quarantined'));
   }, [quarantine, t]);
 
-  // -------------------------------------------------- culling
-  const visibleIds = useMemo(() => {
-    const top = -vp.ty / vp.scale;
-    const bottom = (size.h - vp.ty) / vp.scale;
-    const set = new Set<string>();
-    const ids = layouts.map((l) => l.id);
-    let first = -1, last = -1;
-    layouts.forEach((l, i) => {
-      const pageBottom = l.y + l.h;
-      const visible = pageBottom >= top - l.h * CULL_MARGIN && l.y <= bottom + l.h * CULL_MARGIN;
-      if (visible) {
-        set.add(l.id);
-        if (first === -1) first = i;
-        last = i;
-      }
-    });
-    if (first > 0) set.add(ids[first - 1]);
-    if (last >= 0 && last < ids.length - 1) set.add(ids[last + 1]);
-    return set;
-  }, [layouts, vp.ty, vp.scale, size.h]);
+  // -------------------------------------------------- culling is inside WorldLayer (no per-frame React renders)
 
   const activePage = pages.find((p) => p.id === activePageId) ?? pages[0];
   const activeIndex = pages.findIndex((p) => p.id === activePage?.id);
@@ -261,8 +238,6 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
       </main>
     );
   }
-
-  const zoomPct = Math.round(vp.scale * 100);
 
   return (
     <main className="flex h-dvh flex-col overflow-hidden bg-background" style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}>
@@ -351,31 +326,8 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
 
       {/* ------------------------------------------------ viewport */}
       <div ref={containerRef} className="relative min-h-0 flex-1" data-viewport>
-        {/* world */}
-        <div
-          className="absolute left-0 top-0 z-0"
-          style={{
-            width: pageW,
-            height: worldH,
-            transform: `translate(${vp.tx}px, ${vp.ty}px) scale(${vp.scale})`,
-            transformOrigin: '0 0',
-          }}
-          aria-hidden
-        >
-          {layouts.map((l) => {
-            const page = pages.find((p) => p.id === l.id);
-            if (!page) return null;
-            return visibleIds.has(l.id) ? (
-              <PageCanvas key={l.id} page={page} worldY={l.y} pageW={pageW} pageH={page.height} />
-            ) : (
-              <div
-                key={l.id}
-                className="absolute shadow-ink-2"
-                style={{ left: 0, top: l.y, width: pageW, height: page.height, background: page.backgroundHex || '#fff', borderRadius: 4, outline: '1px solid rgba(22,35,58,0.10)' }}
-              />
-            );
-          })}
-        </div>
+        {/* world — direct-DOM transform + culling (see WorldLayer below) */}
+        <WorldLayer pages={pages} layouts={layouts} pageW={pageW} worldH={worldH} />
 
         <ToolRail pageW={pageW} />
 
@@ -389,25 +341,8 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
           <TextEditorOverlay session={textSession} onDone={() => setTextSession(null)} />
         )}
 
-        {/* zoom bar */}
-        <div
-          dir="ltr"
-          className={cn(
-            // mobile: floats above the bottom tool rail; desktop: bottom-left of the canvas
-            'absolute bottom-[76px] z-30 flex items-center gap-0.5 rounded-full border border-border bg-card/95 p-1 shadow-ink-2 backdrop-blur lg:bottom-3',
-            leftHanded ? 'end-3' : 'start-3',
-          )}
-          role="toolbar"
-          aria-label={t('editor.zoom')}
-        >
-          <button type="button" aria-label={t('editor.zoom')} title={t('editor.zoom')} className="flex h-8 min-w-14 items-center justify-center rounded-full px-2 text-xs font-semibold tabular-nums hover:bg-accent" onClick={() => animateZoomTo(size.w / 2, size.h / 2, 1)}>
-            {zoomPct}%
-          </button>
-          <span className="h-4 w-px bg-border" />
-          <button type="button" aria-label={t('editor.zoomOut', 'Zoom out', 'تصغير')} className="flex h-8 w-8 items-center justify-center rounded-full hover:bg-accent" onClick={() => animateZoomTo(size.w / 2, size.h / 2, vp.scale / 1.25)}><ZoomOut className="h-4 w-4" /></button>
-          <button type="button" aria-label={t('editor.zoomIn', 'Zoom in', 'تكبير')} className="flex h-8 w-8 items-center justify-center rounded-full hover:bg-accent" onClick={() => animateZoomTo(size.w / 2, size.h / 2, vp.scale * 1.25)}><ZoomIn className="h-4 w-4" /></button>
-          <button type="button" aria-label={t('editor.fit')} className="flex h-8 w-8 items-center justify-center rounded-full hover:bg-accent" onClick={() => animatedFit(size.w, pageW)}><Maximize2 className="h-4 w-4" /></button>
-        </div>
+        {/* zoom bar — the only component that re-renders per vp frame */}
+        <ZoomBar pageW={pageW} leftHanded={leftHanded} />
       </div>
 
       {/* pages popup (jump / insert / duplicate / delete / export / multi-select) */}
@@ -499,6 +434,128 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
 }
 
 // ---------------------------------------------------------------- helpers & subcomponents
+/**
+ * WorldLayer — the zoom/pan world container.
+ * The transform is written DIRECTLY to the DOM node on every vp
+ * change (subscribeVp + translate3d → GPU-composited). React does NOT re-render
+ * here while the viewport moves; culling state updates only when the VISIBLE
+ * SET actually changes, and PageCanvas never subscribes to vp — so gestures
+ * stay pure compositor work (no React renders, no re-rasters mid-gesture).
+ */
+function WorldLayer({ pages, layouts, pageW, worldH }: {
+  pages: PageRow[];
+  layouts: PageLayout[];
+  pageW: number;
+  worldH: number;
+}) {
+  const worldRef = useRef<HTMLDivElement>(null);
+  const [visibleIds, setVisibleIds] = useState<Set<string>>(() => new Set(layouts.slice(0, 2).map((l) => l.id)));
+
+  useEffect(() => {
+    const el = worldRef.current;
+    if (!el) return;
+    let lastKey = '';
+    let containerH = el.parentElement?.clientHeight ?? 800;
+    const ro = new ResizeObserver(() => {
+      containerH = el.parentElement?.clientHeight ?? containerH;
+    });
+    if (el.parentElement) ro.observe(el.parentElement);
+
+    const apply = () => {
+      const vp: Vp = getVp();
+      el.style.transform = `translate3d(${vp.tx}px, ${vp.ty}px, 0) scale(${vp.scale})`;
+      // culling
+      const top = -vp.ty / vp.scale;
+      const bottom = (containerH - vp.ty) / vp.scale;
+      const ids = layouts.map((l) => l.id);
+      const set = new Set<string>();
+      let first = -1, last = -1;
+      layouts.forEach((l, i) => {
+        const pageBottom = l.y + l.h;
+        const visible = pageBottom >= top - l.h * CULL_MARGIN && l.y <= bottom + l.h * CULL_MARGIN;
+        if (visible) {
+          set.add(l.id);
+          if (first === -1) first = i;
+          last = i;
+        }
+      });
+      if (first > 0) set.add(ids[first - 1]);
+      if (last >= 0 && last < ids.length - 1) set.add(ids[last + 1]);
+      const key = [...set].join('|');
+      if (key !== lastKey) {
+        lastKey = key;
+        setVisibleIds(set);
+      }
+    };
+    const off = subscribeVp(apply);
+    apply();
+    return () => { off(); ro.disconnect() };
+  }, [layouts]);
+
+  return (
+    <div
+      ref={worldRef}
+      className="absolute left-0 top-0 z-0"
+      style={{
+        width: pageW,
+        height: worldH,
+        transformOrigin: '0 0',
+        willChange: 'transform',
+        backfaceVisibility: 'hidden',
+      }}
+      aria-hidden
+    >
+      {layouts.map((l) => {
+        const page = pages.find((p) => p.id === l.id);
+        if (!page) return null;
+        return visibleIds.has(l.id) ? (
+          <PageCanvas key={l.id} page={page} worldY={l.y} pageW={pageW} pageH={page.height} />
+        ) : (
+          <div
+            key={l.id}
+            className="absolute shadow-ink-2"
+            style={{ left: 0, top: l.y, width: pageW, height: page.height, background: page.backgroundHex || '#fff', borderRadius: 4, outline: '1px solid rgba(22,35,58,0.10)' }}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * ZoomBar — the only editor component that re-renders per vp frame (tiny).
+ * Zoom anchors are measured from the live DOM so the bar is self-contained.
+ */
+function ZoomBar({ pageW, leftHanded }: { pageW: number; leftHanded: boolean }) {
+  const vp = useVp();
+  const { t } = useT();
+  const zoomPct = Math.round(vp.scale * 100);
+  const hostOf = (el: HTMLElement) => {
+    const host = el.closest('[data-viewport]') as HTMLElement | null;
+    return { w: host?.clientWidth ?? window.innerWidth, h: host?.clientHeight ?? window.innerHeight };
+  };
+  return (
+    <div
+      dir="ltr"
+      className={cn(
+        // mobile: floats above the bottom tool rail; desktop: bottom-left of the canvas
+        'absolute bottom-[76px] z-30 flex items-center gap-0.5 rounded-full border border-border bg-card/95 p-1 shadow-ink-2 backdrop-blur lg:bottom-3',
+        leftHanded ? 'end-3' : 'start-3',
+      )}
+      role="toolbar"
+      aria-label={t('editor.zoom')}
+    >
+      <button type="button" aria-label={t('editor.zoom')} title={t('editor.zoom')} className="flex h-8 min-w-14 items-center justify-center rounded-full px-2 text-xs font-semibold tabular-nums hover:bg-accent" onClick={(e) => { const { w, h } = hostOf(e.currentTarget); animateZoomTo(w / 2, h / 2, 1) }}>
+        {zoomPct}%
+      </button>
+      <span className="h-4 w-px bg-border" />
+      <button type="button" aria-label={t('editor.zoomOut', 'Zoom out', 'تصغير')} className="flex h-8 w-8 items-center justify-center rounded-full hover:bg-accent" onClick={(e) => { const { w, h } = hostOf(e.currentTarget); animateZoomTo(w / 2, h / 2, vp.scale / 1.25) }}><ZoomOut className="h-4 w-4" /></button>
+      <button type="button" aria-label={t('editor.zoomIn', 'Zoom in', 'تكبير')} className="flex h-8 w-8 items-center justify-center rounded-full hover:bg-accent" onClick={(e) => { const { w, h } = hostOf(e.currentTarget); animateZoomTo(w / 2, h / 2, vp.scale * 1.25) }}><ZoomIn className="h-4 w-4" /></button>
+      <button type="button" aria-label={t('editor.fit')} className="flex h-8 w-8 items-center justify-center rounded-full hover:bg-accent" onClick={(e) => { const { w } = hostOf(e.currentTarget); animatedFit(w, pageW) }}><Maximize2 className="h-4 w-4" /></button>
+    </div>
+  );
+}
+
 function AddLabelInput({ onAdd }: { onAdd: (title: string) => void }) {
   const { t } = useT();
   const [value, setValue] = useState('');

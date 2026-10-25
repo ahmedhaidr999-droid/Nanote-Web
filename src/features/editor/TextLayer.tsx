@@ -8,11 +8,13 @@
 // native DOM selection — InkSurface feeds gesture carets into ./textsel
 // (caretRangeFromPoint + word segmentation), which owns the selection state.
 // We render the selection rects + a floating toolbar (Highlight / Underline /
-// Translate / Copy) from that state. Because no native selection ever exists,
+// Translate / Web search / Copy) from that state, with 44px drag handles on
+// both ends that extend the selection word-by-word; any press that reaches the
+// input surface dismisses it. Because no native selection ever exists,
 // the browser/WebView can never paint ITS selection handles or the Google
 // "Copy / Search" bubble on top of ours.
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { Copy, Highlighter, Languages, Loader2, Underline, X } from 'lucide-react';
+import { Copy, Highlighter, Languages, Loader2, Search, Underline, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { useApp, useT } from '@/lib/nanote/store';
 import { ShapeEl } from '@/lib/nanote/types';
@@ -22,7 +24,7 @@ import { translateOffline } from '@/lib/nanote/offlineTranslate';
 import { googleTranslateUrl, resolveTranslateTarget, translateOnline } from '@/lib/nanote/translate';
 import { cn } from '@/lib/utils';
 import {
-  clearTextSel, setMirror, setSelLayouts, useTextSel, type SelRect,
+  clearTextSel, extendSelToWord, getTextSel, setMirror, setSelLayouts, useTextSel, type SelRect,
 } from './textsel';
 import { getViewportSize, useVp, type PageLayout } from './viewport';
 
@@ -104,6 +106,8 @@ export function TextLayer({ layouts, pageW, notebookId }: {
   const mirrorRef = useRef<HTMLDivElement>(null);
   const tbRef = useRef<HTMLDivElement>(null);
   const popRef = useRef<HTMLDivElement>(null);
+  const hStartRef = useRef<HTMLDivElement>(null);
+  const hEndRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const vpRef = useRef(vp); vpRef.current = vp;
 
@@ -200,6 +204,33 @@ export function TextLayer({ layouts, pageW, notebookId }: {
   // leaving a PDF notebook clears the selection
   useEffect(() => {
     if (!active) clearSelectionUi();
+  }, [active, clearSelectionUi]);
+
+  // -------------------------------------------------- tap on the page dismisses the selection
+  // Any fresh press that reaches the input surface (the empty page, any text —
+  // even the selected one) clears the selection at once, like a tap on the
+  // glass of a native reader. Presses on our own UI (toolbar, translate card,
+  // drag handles) or on floating overlays never reach the surface, so they
+  // keep it. Capture phase ⇒ the clear lands before the long-press flow picks
+  // its fresh word, so "second long-press re-selects" still works.
+  useEffect(() => {
+    if (!active) return;
+    const outer = outerRef.current;
+    const host = outer?.previousElementSibling ?? null; // InkSurface's input host
+    if (!outer || !(host instanceof HTMLElement) || host.getAttribute('role') !== 'application') {
+      console.warn('[nanote] text selection: input surface not found — tap-to-dismiss is off');
+      return;
+    }
+    const onDown = (e: PointerEvent) => {
+      if (!getTextSel()) return;
+      const target = e.target as Node | null;
+      if (!target || outer.contains(target) || !host.contains(target)) return;
+      clearSelectionUi();
+    };
+    const parent = outer.parentElement;
+    if (!parent) return;
+    parent.addEventListener('pointerdown', onDown, true);
+    return () => parent.removeEventListener('pointerdown', onDown, true);
   }, [active, clearSelectionUi]);
 
   // -------------------------------------------------- "no selectable text" notice (once per session, explicit tool only)
@@ -346,6 +377,28 @@ export function TextLayer({ layouts, pageW, notebookId }: {
     }
   }, [t]);
 
+  // -------------------------------------------------- drag handles (extend the selection word-by-word)
+  const startHandleDrag = useCallback((e: React.PointerEvent, which: 'start' | 'end') => {
+    e.stopPropagation();
+    try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId) } catch { /* pointer already gone */ }
+    const onMove = (ev: PointerEvent) => { extendSelToWord(which, ev.clientX, ev.clientY) };
+    const stop = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', stop);
+      window.removeEventListener('pointercancel', stop);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', stop);
+    window.addEventListener('pointercancel', stop);
+  }, []);
+
+  // -------------------------------------------------- web search
+  const doWebSearch = useCallback(() => {
+    if (!sel) return;
+    openWebSearch(sel.text);
+    clearSelectionUi();
+  }, [sel, clearSelectionUi]);
+
   // -------------------------------------------------- toolbar / popover positioning (imperative: follows pan & zoom)
   useLayoutEffect(() => {
     const tb = tbRef.current;
@@ -378,6 +431,18 @@ export function TextLayer({ layouts, pageW, notebookId }: {
     pop.style.top = `${Math.round(top)}px`;
   }, [translate, sel, vp]);
 
+  // drag handles follow the boundary carets through pan & zoom (44px grips
+  // centered on the anchor point, regardless of the current zoom level)
+  useLayoutEffect(() => {
+    const place = (el: HTMLDivElement | null, pt: { x: number; y: number } | null) => {
+      if (!el || !pt) return;
+      el.style.left = `${Math.round(pt.x * vp.scale + vp.tx - 22)}px`;
+      el.style.top = `${Math.round(pt.y * vp.scale + vp.ty - 22)}px`;
+    };
+    place(hStartRef.current, sel?.startPt ?? null);
+    place(hEndRef.current, sel?.endPt ?? null);
+  }, [sel, vp]);
+
   // -------------------------------------------------- render
   return (
     <div ref={outerRef} className="absolute inset-0 z-[15]" style={{ pointerEvents: 'none' }}>
@@ -409,6 +474,21 @@ export function TextLayer({ layouts, pageW, notebookId }: {
       )}
 
       {sel && (
+        <>
+          <SelHandle
+            btnRef={hStartRef}
+            label={t('pdftext.handleStart', 'Selection start', 'بداية التحديد')}
+            onPointerDown={(e) => startHandleDrag(e, 'start')}
+          />
+          <SelHandle
+            btnRef={hEndRef}
+            label={t('pdftext.handleEnd', 'Selection end', 'نهاية التحديد')}
+            onPointerDown={(e) => startHandleDrag(e, 'end')}
+          />
+        </>
+      )}
+
+      {sel && (
         <div
           ref={tbRef}
           role="toolbar"
@@ -431,6 +511,11 @@ export function TextLayer({ layouts, pageW, notebookId }: {
             label={translateEngine === 'google' ? t('pdftext.translate.google') : t('pdftext.translate')}
             active={!!translate}
             onClick={doTranslate}
+          />
+          <ToolBtn
+            icon={<Search className="h-4 w-4" />}
+            label={t('pdftext.searchWeb', 'Web search', 'البحث في الويب')}
+            onClick={doWebSearch}
           />
           <ToolBtn
             icon={<Copy className="h-4 w-4" />}
@@ -498,6 +583,39 @@ export function TextLayer({ layouts, pageW, notebookId }: {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------- web search
+/** Google search results for the selected text — a named popup window (never
+ *  a full tab); falls back to a plain new tab when popups are constrained. */
+function openWebSearch(text: string) {
+  const url = `https://www.google.com/search?q=${encodeURIComponent(text)}`;
+  try {
+    window.open(url, 'nanote-web-search', 'popup,width=560,height=700');
+  } catch {
+    window.open(url, '_blank');
+  }
+}
+
+// ---------------------------------------------------------------- selection drag handle
+/** 44px touch-friendly grip on one end of the selection (the dot is 16px —
+ *  the hit area is the full grip, so fingers never miss it). */
+function SelHandle({ btnRef, label, onPointerDown }: {
+  btnRef: React.RefObject<HTMLDivElement | null>; label: string; onPointerDown: (e: React.PointerEvent) => void;
+}) {
+  return (
+    <div
+      ref={btnRef}
+      role="button"
+      tabIndex={0}
+      aria-label={label}
+      onPointerDown={onPointerDown}
+      className="absolute flex h-11 w-11 cursor-grab items-center justify-center"
+      style={{ left: 0, top: 0, pointerEvents: 'auto', touchAction: 'none' }}
+    >
+      <div className="h-4 w-4 rounded-full border-[2.5px] border-white bg-primary shadow-ink-1" />
     </div>
   );
 }

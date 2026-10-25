@@ -1,14 +1,31 @@
 'use client';
-// Ruler — draggable, rotatable on-screen ruler; ink snaps to its edge.
-import { useRef } from 'react';
-import { useT } from '@/lib/nanote/store';
+// Ruler — draggable, rotatable on-screen ruler. Visibility is React-driven
+// (editor.rulerVisible) so it appears/disappears the instant the toolbar
+// toggle flips; the geometry lives in the viewport module (world coords) so
+// ink snapping shares the exact same model. Ink snaps to the ruler's EDGES
+// (see snapToRuler) — it rides the face instead of passing underneath.
+import { useEffect, useRef, useState } from 'react';
+import { useApp, useT } from '@/lib/nanote/store';
 import { ruler, useVp, worldToScreen, getVp } from './viewport';
 
 export function Ruler() {
   const vp = useVp();
   const { t } = useT();
+  const rulerVisible = useApp((s) => s.editor.rulerVisible);
+  const [, forceTick] = useState(0);
   const dragRef = useRef<'move' | 'rotate' | null>(null);
-  if (!ruler.visible) return null;
+  // module flag stays in sync with the store (snapToRuler reads it)
+  useEffect(() => { ruler.visible = rulerVisible }, [rulerVisible]);
+
+  // re-render when the module geometry changes from outside (drag handlers
+  // write DOM directly for 60fps, this catches the settle state)
+  useEffect(() => {
+    if (!rulerVisible) return;
+    const id = setInterval(() => { if (!dragRef.current) forceTick((v) => v + 1) }, 400);
+    return () => clearInterval(id);
+  }, [rulerVisible]);
+
+  if (!rulerVisible) return null;
 
   const c = worldToScreen(ruler.cx, ruler.cy);
   const w = Math.max(120, ruler.len * vp.scale);
@@ -16,7 +33,7 @@ export function Ruler() {
 
   const startMove = (e: React.PointerEvent) => {
     e.stopPropagation();
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId) } catch { /* pointer gone */ }
     dragRef.current = 'move';
     const last = { x: e.clientX, y: e.clientY };
     const onMove = (ev: PointerEvent) => {
@@ -25,7 +42,6 @@ export function Ruler() {
       ruler.cx += (ev.clientX - last.x) / scale;
       ruler.cy += (ev.clientY - last.y) / scale;
       last.x = ev.clientX; last.y = ev.clientY;
-      // force repaint of this component via vp emit (cheap trick)
       const el = document.getElementById('nanote-ruler');
       if (el) {
         const nc = worldToScreen(ruler.cx, ruler.cy);
@@ -35,6 +51,7 @@ export function Ruler() {
     };
     const onUp = () => {
       dragRef.current = null;
+      forceTick((v) => v + 1);
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
     };
@@ -44,7 +61,7 @@ export function Ruler() {
 
   const startRotate = (e: React.PointerEvent) => {
     e.stopPropagation();
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId) } catch { /* pointer gone */ }
     dragRef.current = 'rotate';
     const onMove = (ev: PointerEvent) => {
       if (dragRef.current !== 'rotate') return;
@@ -93,8 +110,9 @@ export function Ruler() {
           backdropFilter: 'blur(2px)',
         }}
       />
-      {/* edge line */}
+      {/* both edge lines — ink snaps to either face */}
       <div className="absolute inset-x-0 top-0 h-[3px] rounded-full bg-primary" />
+      <div className="absolute inset-x-0 bottom-0 h-[3px] rounded-full bg-primary/80" />
       {/* rotate handle */}
       <button
         type="button"

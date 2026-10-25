@@ -120,6 +120,8 @@ export interface Settings {
   onboarded: boolean;
   favoriteColors: string[];   // up to 5 saved slots
   includeAudioInBackup: boolean;
+  highlighterOpacity: number; // 0..100 (%) — same-color highlighter passes never stack
+  shapeDetection: boolean;    // draw & hold → recognize shapes (pens, Notewise-style)
   // ----- translation platform (independent app platform: online engines +
   // downloaded offline language packs from the in-app language library)
   translateEngine: TranslateEngine; // which engine the Translate button uses
@@ -146,6 +148,8 @@ export const DEFAULT_SETTINGS: Settings = {
   onboarded: false,
   favoriteColors: ['#1E6FF2', '#16233A', '#E5484D', '#22A06B', '#FF9F1C'],
   includeAudioInBackup: true,
+  highlighterOpacity: 40,
+  shapeDetection: true,
   translateEngine: 'nanote',
   translateTarget: 'auto',
   laserMode: 'normal',
@@ -227,6 +231,8 @@ export interface ImageEl {
   x: number; y: number; w: number; h: number;
   imageId: string;
   rotation: number; // radians
+  flipH?: boolean;            // mirror horizontally (survives the NINK JSON section)
+  flipV?: boolean;            // mirror vertically
   cornerRadius?: number; // px in page-space; 0/undefined = sharp corners
   z: number;
 }

@@ -14,6 +14,7 @@ export interface RenderOpts {
   audio?: { recId: string; tMs: number; mode: 'off' | 'highlight' | 'replay' };
   hideIds?: Set<string>;
   paperDark?: boolean;              // dark paper → highlighter blends differently
+  highlighterOpacity?: number;      // 0..100 (%) — same-color overlaps never stack
   /** vector-quality PDF background (re-rendered from the stored original at
    *  the CURRENT zoom — keeps text razor-sharp at high magnification,
    *  Notewise-style) drawn instead of the stored raster PNG when present */
@@ -68,13 +69,18 @@ export function drawStroke(ctx: CanvasRenderingContext2D, stroke: StrokeEl, opts
   const isHi = stroke.tool === 'highlighter';
   ctx.save();
   if (isHi) {
-    ctx.globalAlpha = opts.paperDark ? 0.45 : 0.5;
+    ctx.globalAlpha = hiAlphaOf(opts);
     ctx.globalCompositeOperation = opts.paperDark ? 'source-over' : 'multiply';
   }
   ctx.fillStyle = stroke.color;
   pathOutline(ctx, outline);
   ctx.fill();
   ctx.restore();
+}
+
+/** highlighter alpha (0..1) from the settings percentage (clamped, never invisible-proof) */
+export function hiAlphaOf(opts: RenderOpts): number {
+  return Math.min(1, Math.max(0.03, (opts.highlighterOpacity ?? 40) / 100));
 }
 
 function fontStackOf(el: TextEl): string {
@@ -138,6 +144,7 @@ export function drawImageEl(ctx: CanvasRenderingContext2D, el: ImageEl, opts: Re
   const cx = el.x + el.w / 2, cy = el.y + el.h / 2;
   ctx.translate(cx, cy);
   if (el.rotation) ctx.rotate(el.rotation);
+  if (el.flipH || el.flipV) ctx.scale(el.flipH ? -1 : 1, el.flipV ? -1 : 1);
   // cover-fit the source into the element box
   const s = Math.max(Math.abs(el.w) / nat.w, Math.abs(el.h) / nat.h);
   const dw = nat.w * s, dh = nat.h * s;
@@ -225,15 +232,41 @@ export function renderPage(
   const hide = opts.hideIds;
   const els = doc.elements.filter((e) => !hide?.has(e.id));
 
-  // 5) highlighter strokes first (draws BEHIND ink), then everything else by z
+  // 5) highlighter strokes first (draws BEHIND ink) — grouped by color and
+  // filled as ONE merged path per color: overlapping passes of the same color
+  // never stack/darken, and the opacity slider controls the exact tint.
   const hiStrokes = els.filter((e): e is StrokeEl => isStroke(e) && e.tool === 'highlighter');
   const rest = els.filter((e) => !(isStroke(e) && (e as StrokeEl).tool === 'highlighter'));
   hiStrokes.sort((a, b) => a.z - b.z);
   rest.sort((a, b) => a.z - b.z);
 
-  for (const s of hiStrokes) {
-    if (!strokeVisible(doc, s, optsWithPaper)) continue;
-    drawStroke(ctx, s, optsWithPaper);
+  const hiVisible = hiStrokes.filter((s) => strokeVisible(doc, s, optsWithPaper));
+  if (hiVisible.length) {
+    const byColor = new Map<string, { paths: Path2D[]; glow: boolean }>();
+    for (const s of hiVisible) {
+      const outline = getOutline(s, optsWithPaper.gamma);
+      if (!outline.length) continue;
+      const g = byColor.get(s.color) ?? { paths: [], glow: false };
+      const p = new Path2D();
+      for (let i = 0; i < outline.length; i += 2) {
+        if (i === 0) p.moveTo(outline[i], outline[i + 1]);
+        else p.lineTo(outline[i], outline[i + 1]);
+      }
+      p.closePath();
+      g.paths.push(p);
+      if (strokeHighlighted(doc, s, optsWithPaper)) g.glow = true;
+      byColor.set(s.color, g);
+    }
+    for (const [color, g] of byColor) {
+      ctx.save();
+      ctx.globalAlpha = hiAlphaOf(optsWithPaper);
+      ctx.globalCompositeOperation = optsWithPaper.paperDark ? 'source-over' : 'multiply';
+      ctx.fillStyle = color;
+      const merged = new Path2D();
+      for (const p of g.paths) merged.addPath(p);
+      ctx.fill(merged, 'nonzero');
+      ctx.restore();
+    }
   }
 
   for (const el of rest) {

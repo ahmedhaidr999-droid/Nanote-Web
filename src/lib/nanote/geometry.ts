@@ -126,7 +126,8 @@ function sampleStrokePoints(s: StrokeEl, step = 12): { x: number; y: number }[] 
  *  polygon, so lassoing MORE THAN HALF of an image/text/shape selects it —
  *  no need to encircle it 100%. */
 function bboxCoverageInPoly(b: BBox, poly: { x: number; y: number }[]): number {
-  const cols = 6, rows = 6; // 36 probes ≈ area fraction with 3% granularity
+  const cols = 16, rows = 16; // 256 probes ≈ area fraction with 0.4% granularity — a true >50%
+  // sweep never quantizes to exactly 50% (which the strict rule would reject)
   let hits = 0;
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {

@@ -49,6 +49,8 @@ export function getVp(): Vp { return state }
 
 export function setVp(patch: Partial<Vp>) {
   state = { ...state, ...patch };
+  lastVpChange = performance.now();
+  scheduleIdleCheck();
   notify();
 }
 
@@ -282,6 +284,52 @@ export function requestRepaint() {
   requestOverlayRepaint();
 }
 
+// ---------------------------------------------------------------- interaction tracking (zoom perf)
+// While the user is actively pinching/panning/scrolling, pages must NOT
+// re-raster — the existing bitmap simply CSS-scales. Re-rastering happens
+// once, after the gesture settles (idle).
+let lastVpChange = 0;
+let interactionUntil = 0; // pointer-down / pinch window
+let lastWheel = 0;
+let idleTimer: ReturnType<typeof setTimeout> | null = null;
+const idleCbs = new Set<() => void>();
+
+export function markInteraction() {
+  interactionUntil = performance.now() + 120;
+  scheduleIdleCheck();
+}
+
+export function markWheel() {
+  lastWheel = performance.now();
+  scheduleIdleCheck();
+}
+
+export function isInteracting(): boolean {
+  return performance.now() < interactionUntil || performance.now() - lastWheel < 180;
+}
+
+/** fired once the viewport has been stable and untouched for ~280ms */
+export function onVpIdle(fn: () => void): () => void {
+  idleCbs.add(fn);
+  return () => { idleCbs.delete(fn) };
+}
+
+function scheduleIdleCheck() {
+  if (idleTimer) return;
+  const check = () => {
+    idleTimer = null;
+    const now = performance.now();
+    const stableFor = now - lastVpChange;
+    const busy = now < interactionUntil || now - lastWheel < 220;
+    if (stableFor >= 280 && !busy) {
+      for (const cb of idleCbs) cb();
+    } else {
+      idleTimer = setTimeout(check, 120);
+    }
+  };
+  idleTimer = setTimeout(check, 140);
+}
+
 // ---------------------------------------------------------------- ruler (world coords)
 export interface RulerState { visible: boolean; cx: number; cy: number; angle: number; len: number }
 export const ruler: RulerState = { visible: false, cx: 400, cy: 300, angle: 0, len: 420 };
@@ -292,16 +340,56 @@ export function rulerSegment(): { ax: number; ay: number; bx: number; by: number
   return { ax: ruler.cx - dx, ay: ruler.cy - dy, bx: ruler.cx + dx, by: ruler.cy + dy };
 }
 
-/** project a world point onto the ruler edge if within snap distance */
+/** thickness of the ruler body in world units (screen ~44px, clamped) */
+export function rulerThickness(): number {
+  const s = state.scale;
+  return Math.max(26 / s, Math.min(56 / s, 44));
+}
+
+/** the two edge segments (top & bottom faces) of the ruler strip */
+export function rulerEdges(): { ax: number; ay: number; bx: number; by: number }[] {
+  const { ax, ay, bx, by } = rulerSegment();
+  const dx = bx - ax, dy = by - ay;
+  const len = Math.hypot(dx, dy) || 1;
+  // unit normal
+  const nx = -dy / len, ny = dx / len;
+  const h = rulerThickness() / 2;
+  return [
+    { ax: ax + nx * h, ay: ay + ny * h, bx: bx + nx * h, by: by + ny * h },
+    { ax: ax - nx * h, ay: ay - ny * h, bx: bx - nx * h, by: by - ny * h },
+  ];
+}
+
+function projectOnSeg(wx: number, wy: number, seg: { ax: number; ay: number; bx: number; by: number }): { px: number; py: number; t: number; d: number } {
+  const abx = seg.bx - seg.ax, aby = seg.by - seg.ay;
+  const len2 = abx * abx + aby * aby;
+  if (len2 === 0) return { px: seg.ax, py: seg.ay, t: 0, d: Math.hypot(wx - seg.ax, wy - seg.ay) };
+  let t = ((wx - seg.ax) * abx + (wy - seg.ay) * aby) / len2;
+  t = Math.max(0, Math.min(1, t));
+  const px = seg.ax + abx * t, py = seg.ay + aby * t;
+  return { px, py, t, d: Math.hypot(wx - px, wy - py) };
+}
+
+/**
+ * Project a world point onto the ruler's nearest EDGE if within snap distance.
+ * The ink rides the ruler face instead of passing underneath it, and points
+ * that land inside the ruler strip are clamped out to the closer edge.
+ */
 export function snapToRuler(wx: number, wy: number, snapDist: number): { x: number; y: number } | null {
   if (!ruler.visible) return null;
-  const { ax, ay, bx, by } = rulerSegment();
-  const abx = bx - ax, aby = by - ay;
-  const len2 = abx * abx + aby * aby;
-  if (len2 === 0) return null;
-  let t = ((wx - ax) * abx + (wy - ay) * aby) / len2;
-  t = Math.max(0, Math.min(1, t));
-  const px = ax + abx * t, py = ay + aby * t;
-  if (Math.hypot(wx - px, wy - py) <= snapDist) return { x: px, y: py };
+  const edges = rulerEdges();
+  let best: { x: number; y: number } | null = null;
+  let bestD = Infinity;
+  for (const e of edges) {
+    const p = projectOnSeg(wx, wy, e);
+    if (p.d < bestD) { bestD = p.d; best = { x: p.px, y: p.py } }
+  }
+  if (!best) return null;
+  if (bestD <= snapDist) return best;
+  // inside the strip (both edges' nearest points are farther than snapDist but
+  // the point lies between them) → clamp to the closer edge so ink never
+  // crosses under the ruler body
+  const center = projectOnSeg(wx, wy, rulerSegment());
+  if (center.d <= rulerThickness() / 2 + 2) return best;
   return null;
 }

@@ -3,10 +3,10 @@
 // lasso selection. Drags (move/scale/rotate) preview on the live overlay and
 // commit as a single undoable command.
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Copy, Scissors, ClipboardPaste, Trash2, CopyPlus, Palette, X, RotateCw, Squircle } from 'lucide-react';
+import { Copy, Scissors, ClipboardPaste, Trash2, CopyPlus, Palette, X, RotateCw, RotateCcw, FlipHorizontal, FlipVertical, BringToFront, SendToBack, Image as ImageIcon, Squircle } from 'lucide-react';
 import { toast } from 'sonner';
 import { useApp, useT } from '@/lib/nanote/store';
-import { PageElement, TextEl, ImageEl } from '@/lib/nanote/types';
+import { PageElement, PageDoc, TextEl, ImageEl } from '@/lib/nanote/types';
 import { drawStroke, drawText, drawShape, drawImageEl } from '@/lib/nanote/render';
 import { resolveImage, imageNatural } from '@/lib/nanote/images';
 import { elementBBox, transformElement, unionBBox } from '@/lib/nanote/geometry';
@@ -44,6 +44,8 @@ export function SelectionLayer({
   const cornerPreviewRef = useRef<number | null>(null); // live slider preview radius
   const cornerPageRef = useRef<string | null>(null);   // page whose ids are hidden for the preview
   const cornersAnchorRef = useRef<HTMLDivElement>(null); // toggle button wrapper (outside-click ignore)
+  const [imgOptsOpen, setImgOptsOpen] = useState(false);
+  const imgOptsAnchorRef = useRef<HTMLDivElement>(null); // toggle button wrapper (outside-click ignore)
 
   const activePageLayout = useMemo(
     () => layouts.find((l) => l.id === selection?.pageId) ?? null,
@@ -246,9 +248,23 @@ export function SelectionLayer({
             </div>
           )}
         </div>
+        {singleImage && imgEl && doc && (
+          <div className="relative" ref={imgOptsAnchorRef}>
+            <SBtn label={t('tool.image.options')} onClick={() => { setImgOptsOpen((v) => !v); setCornersOpen(false) }}><ImageIcon className="h-4 w-4" /></SBtn>
+            {imgOptsOpen && (
+              <ImageOptionsPopover
+                key={imgEl.id}
+                imgEl={imgEl}
+                doc={doc}
+                anchorRef={imgOptsAnchorRef}
+                onClose={() => setImgOptsOpen(false)}
+              />
+            )}
+          </div>
+        )}
         {singleImage && (
           <div className="relative" ref={cornersAnchorRef}>
-            <SBtn label={t('tool.image.corners')} onClick={() => setCornersOpen((v) => !v)}><Squircle className="h-4 w-4" /></SBtn>
+            <SBtn label={t('tool.image.corners')} onClick={() => { setCornersOpen((v) => !v); setImgOptsOpen(false) }}><Squircle className="h-4 w-4" /></SBtn>
             {cornersOpen && imgEl && (
               <div className="absolute start-0 top-10 z-40" style={{ pointerEvents: 'auto' }}>
                 <CornersPopover
@@ -318,6 +334,83 @@ function drawTransformed(ctx: CanvasRenderingContext2D, el: PageElement, gamma: 
     case 'shape': drawShape(ctx, el); break;
     case 'image': drawImageEl(ctx, el, opts); break;
   }
+}
+
+/** radians normalized to (-π, π] */
+function normRad(r: number): number {
+  r = r % (Math.PI * 2);
+  if (r > Math.PI) r -= Math.PI * 2;
+  if (r < -Math.PI) r += Math.PI * 2;
+  return r;
+}
+
+function patchImage(el: ImageEl, patch: Partial<ImageEl>) {
+  const sel = useApp.getState().editor.selection;
+  if (!sel) return;
+  useApp.getState().patchElements(
+    sel.pageId,
+    [{ id: el.id, before: el, after: { ...el, ...patch } }],
+    'image',
+  );
+  requestRepaint();
+}
+
+/** image quick options — one-tap transforms (rotate ±90°, flips, z-order) */
+function ImageOptionsPopover({
+  imgEl, doc, anchorRef, onClose,
+}: {
+  imgEl: ImageEl;
+  doc: PageDoc;
+  anchorRef: React.RefObject<HTMLDivElement | null>;
+  onClose: () => void;
+}) {
+  const { t } = useT();
+  const boxRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const onDown = (e: PointerEvent) => {
+      const target = e.target as Node;
+      if (boxRef.current?.contains(target) || anchorRef.current?.contains(target)) return;
+      onClose();
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() };
+    window.addEventListener('pointerdown', onDown, { capture: true });
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('pointerdown', onDown, { capture: true });
+      window.removeEventListener('keydown', onKey);
+    };
+  }, []);
+  const act = (patch: Partial<ImageEl>) => { patchImage(imgEl, patch); onClose() };
+  const items: { label: string; icon: React.ReactNode; run: () => void }[] = [
+    { label: t('tool.image.rotate90'), icon: <RotateCw className="h-4 w-4" />, run: () => act({ rotation: normRad(imgEl.rotation + Math.PI / 2) }) },
+    { label: t('tool.image.rotate90ccw'), icon: <RotateCcw className="h-4 w-4" />, run: () => act({ rotation: normRad(imgEl.rotation - Math.PI / 2) }) },
+    { label: t('tool.image.flipH'), icon: <FlipHorizontal className="h-4 w-4" />, run: () => act({ flipH: !imgEl.flipH }) },
+    { label: t('tool.image.flipV'), icon: <FlipVertical className="h-4 w-4" />, run: () => act({ flipV: !imgEl.flipV }) },
+    { label: t('tool.image.front'), icon: <BringToFront className="h-4 w-4" />, run: () => act({ z: doc.elements.reduce((m, e) => Math.max(m, e.z), 0) + 1 }) },
+    { label: t('tool.image.back'), icon: <SendToBack className="h-4 w-4" />, run: () => act({ z: doc.elements.reduce((m, e) => Math.min(m, e.z), 0) - 1 }) },
+  ];
+  return (
+    <div
+      ref={boxRef}
+      className="absolute start-0 top-10 z-40 w-52 rounded-xl border border-border bg-card p-1.5 shadow-ink-2"
+      style={{ pointerEvents: 'auto' }}
+      role="menu"
+      aria-label={t('tool.image.options')}
+    >
+      {items.map((it) => (
+        <button
+          key={it.label}
+          type="button"
+          role="menuitem"
+          onClick={it.run}
+          className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-xs font-medium text-start hover:bg-accent press-scale"
+        >
+          {it.icon}
+          {it.label}
+        </button>
+      ))}
+    </div>
+  );
 }
 
 /** Corners popover (single selected image): Sharp/Rounded segmented toggle +

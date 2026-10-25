@@ -691,6 +691,22 @@ export default function SettingsView() {
 
               <Divider />
 
+              {/* render cache — page bitmaps persisted in Cache Storage */}
+              <Button
+                type="button"
+                variant="ghost"
+                className="press-scale text-muted-foreground hover:text-foreground"
+                onClick={() => {
+                  void import('@/lib/nanote/rastercache').then((m) => m.clearRasterCache());
+                  toast.success(t('settings.cache.clear.done'));
+                }}
+              >
+                <Eraser />
+                {t('settings.cache.clear')}
+              </Button>
+
+              <Divider />
+
               {/* backup */}
               <div className="space-y-3">
                 <div className="text-sm font-medium">{t('settings.backup')}</div>

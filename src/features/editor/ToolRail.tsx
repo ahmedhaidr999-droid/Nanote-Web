@@ -10,7 +10,7 @@
 import { useRef, useState } from 'react';
 import {
   PenLine, Pen, Brush, PenTool, Highlighter, Eraser, Lasso, Type, TextCursor, Shapes, ImagePlus,
-  Ruler as RulerIcon, Mic, Hand, Pointer, Trash2, Flashlight,
+  Ruler as RulerIcon, Mic, Hand, Pointer, Trash2, Flashlight, Sparkles,
 } from 'lucide-react';
 import { useApp, useT } from '@/lib/nanote/store';
 import {
@@ -23,7 +23,7 @@ import { Slider } from '@/components/ui/slider';
 import { Switch } from '@/components/ui/switch';
 import { toast } from 'sonner';
 import { ColorPopover } from './ColorPopover';
-import { ruler } from './viewport';
+import { ruler, getVp } from './viewport';
 import { AudioPanel } from './AudioPanel';
 
 const PEN_ICONS: Record<ToolId, typeof Pen> = {
@@ -218,7 +218,22 @@ export function ToolRail({ pageW }: { pageW: number }) {
             icon={<RulerIcon className="h-5 w-5" />}
             label={t('tool.ruler')}
             active={rulerVisible}
-            onClick={() => { toggleRuler(); ruler.visible = !ruler.visible }}
+            onClick={() => {
+              const next = !useApp.getState().editor.rulerVisible;
+              if (next) {
+                // place the ruler at the center of the CURRENT view (the page
+                // you're on) instead of its last/first-page position
+                const host = document.querySelector('[data-viewport]') as HTMLElement | null;
+                const vp = getVp();
+                if (host) {
+                  ruler.cx = (host.clientWidth / 2 - vp.tx) / vp.scale;
+                  ruler.cy = (host.clientHeight / 2 - vp.ty) / vp.scale;
+                  ruler.angle = 0;
+                }
+              }
+              ruler.visible = next;
+              toggleRuler();
+            }}
           />
           <RailBtn
             icon={<Mic className="h-5 w-5" />}
@@ -325,6 +340,8 @@ function PenPopover({ railPos, railOnRight, anchor }: { railPos: RailPos; railOn
   const { t } = useT();
   const lastPen = useApp((s) => s.editor.lastPen);
   const toolStates = useApp((s) => s.editor.toolStates);
+  const shapeDetection = useApp((s) => s.settings.shapeDetection);
+  const setSettings = useApp((s) => s.setSettings);
   const setTool = useApp((s) => s.setTool);
   const setToolState = useApp((s) => s.setToolState);
   const [colorOpen, setColorOpen] = useState(false);
@@ -363,6 +380,17 @@ function PenPopover({ railPos, railOnRight, anchor }: { railPos: RailPos; railOn
         onValueChange={(v) => setToolState(lastPen, { width: v[0] })}
         aria-label={t('tool.penSize')}
       />
+      <div className="mt-3 flex items-center justify-between">
+        <span className="flex items-center gap-1.5 text-xs font-medium">
+          <Sparkles className="h-3.5 w-3.5 text-primary" />
+          {t('tool.shapeDetect')}
+        </span>
+        <Switch
+          checked={shapeDetection}
+          onCheckedChange={(v) => { void setSettings({ shapeDetection: v }); toast.success(v ? t('tool.shapeDetect.on') : t('tool.shapeDetect.off'), { duration: 2000 }) }}
+          aria-label={t('tool.shapeDetect')}
+        />
+      </div>
       <div className="relative mt-3">
         <button
           type="button"
@@ -389,6 +417,8 @@ function HighlighterPopover({ railPos, railOnRight, anchor }: { railPos: RailPos
   const setToolState = useApp((s) => s.setToolState);
   const straight = useApp((s) => s.editor.highlighterStraight);
   const setStraight = useApp((s) => s.setHighlighterStraight);
+  const opacity = useApp((s) => s.settings.highlighterOpacity);
+  const setSettings = useApp((s) => s.setSettings);
   const [colorOpen, setColorOpen] = useState(false);
   return (
     <Pop railPos={railPos} railOnRight={railOnRight} anchor={anchor}>
@@ -409,6 +439,21 @@ function HighlighterPopover({ railPos, railOnRight, anchor }: { railPos: RailPos
         <span className="tabular-nums">{ts.width.toFixed(0)}</span>
       </div>
       <Slider value={[ts.width]} min={8} max={40} step={1} onValueChange={(v) => setToolState('highlighter', { width: v[0] })} aria-label={t('tool.width')} />
+      {/* opacity 0–100% — same-color overlaps never darken */}
+      <div className="mb-1 mt-3 flex items-center justify-between text-xs font-medium text-muted-foreground">
+        <span>{t('tool.highlighter.opacity')}</span>
+        <span className="tabular-nums">{Math.round(opacity)}%</span>
+      </div>
+      <Slider
+        value={[Math.round(opacity)]}
+        min={0}
+        max={100}
+        step={1}
+        onValueChange={(v) => void setSettings({ highlighterOpacity: v[0] })}
+        aria-label={t('tool.highlighter.opacity')}
+      />
+      {/* live opacity swatch */}
+      <div className="mt-2 h-5 w-full rounded-md border border-black/10" style={{ background: ts.color, opacity: Math.max(0.03, opacity / 100) }} />
       <div className="mt-3 flex items-center justify-between">
         <span className="text-xs font-medium">{t('tool.highlighter.straight')}</span>
         <Switch checked={straight} onCheckedChange={setStraight} aria-label={t('tool.highlighter.straight')} />

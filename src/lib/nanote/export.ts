@@ -6,6 +6,7 @@ import { PageRow, NotebookRow, TextEl, PAGE_SIZES } from './types';
 import { renderPage, measureTextEl, drawText } from './render';
 import { preloadPageImages, resolveImage, imageNatural, ensureImageLoaded } from './images';
 import { downloadBlob, shareBlob, sanitizeFilename } from './util';
+import { useApp } from './store';
 
 const PX_TO_PT = 0.75; // 96dpi CSS px → 72dpi PDF points
 
@@ -28,6 +29,7 @@ export async function renderPageToCanvas(page: PageRow, notebook: NotebookRow, s
   ctx.scale(scale, scale);
   renderPage(ctx, page, doc, w, h, {
     gamma: 1,
+    highlighterOpacity: useApp.getState().settings.highlighterOpacity,
     resolveImage,
     imageNatural,
   });
@@ -107,6 +109,7 @@ async function buildPdf(notebook: NotebookRow, pages: PageRow[]): Promise<Blob> 
     const hideIds = new Set(rasterTexts.keys());
     renderPage(ctx, page, doc, w, h, {
       gamma: 1,
+      highlighterOpacity: useApp.getState().settings.highlighterOpacity,
       resolveImage,
       imageNatural,
       hideIds,
