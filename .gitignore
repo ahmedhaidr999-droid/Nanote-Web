@@ -1,0 +1,39 @@
+# dependencies & build output
+node_modules/
+.next/
+out/
+tsconfig.tsbuildinfo
+
+# sandbox-only artifacts — never shipped to the repo
+dev.log
+server.log
+.env
+.env.*
+tool-results/
+agent-ctx/
+upload/
+download/
+examples/
+tests/
+db/
+prisma/
+mini-services/
+Caddyfile
+worklog.md
+PROGRESS.md
+
+# android build outputs (see android/.gitignore) + generated web assets
+android/app/src/main/assets/public/
+
+# signing keys — they live in GitHub Secrets, NEVER here
+*.jks
+*.keystore
+*.p12
+*.pk12
+
+# misc
+.DS_Store
+*.log
+skills/
+.e2e/
+.zscripts/

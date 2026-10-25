@@ -1,0 +1,217 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-surface-variant: var(--surface-variant);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  --radius: 0.75rem;
+  /* Nanote light — "ink on paper" */
+  --background: #F7F9FC;
+  --foreground: #16233A;
+  --card: #FFFFFF;
+  --card-foreground: #16233A;
+  --popover: #FFFFFF;
+  --popover-foreground: #16233A;
+  --primary: #1E6FF2;
+  --primary-foreground: #FFFFFF;
+  --secondary: #EEF2F8;
+  --secondary-foreground: #0A3A8F;
+  --muted: #EEF2F8;
+  --muted-foreground: #5A6B85;
+  --accent: #E8F0FE;
+  --accent-foreground: #0A3A8F;
+  --destructive: #E5484D;
+  --border: #E2E8F1;
+  --input: #E2E8F1;
+  --ring: #1E6FF2;
+  --success: #22A06B;
+  --warning: #FF9F1C;
+  --surface-variant: #EEF2F8;
+  --chart-1: #1E6FF2;
+  --chart-2: #22A06B;
+  --chart-3: #FF9F1C;
+  --chart-4: #9333EA;
+  --chart-5: #E5484D;
+  --sidebar: #FFFFFF;
+  --sidebar-foreground: #16233A;
+  --sidebar-primary: #1E6FF2;
+  --sidebar-primary-foreground: #FFFFFF;
+  --sidebar-accent: #E8F0FE;
+  --sidebar-accent-foreground: #0A3A8F;
+  --sidebar-border: #E2E8F1;
+  --sidebar-ring: #1E6FF2;
+}
+
+.dark {
+  /* Nanote dark */
+  --background: #0E1622;
+  --foreground: #E8EEF7;
+  --card: #16202E;
+  --card-foreground: #E8EEF7;
+  --popover: #16202E;
+  --popover-foreground: #E8EEF7;
+  --primary: #6BA6FF;
+  --primary-foreground: #0A2050;
+  --secondary: #1C2838;
+  --secondary-foreground: #C9D6EA;
+  --muted: #1C2838;
+  --muted-foreground: #94A6C0;
+  --accent: #1B2A44;
+  --accent-foreground: #BAD4FF;
+  --destructive: #FF6B6B;
+  --border: #24324A;
+  --input: #24324A;
+  --ring: #6BA6FF;
+  --success: #3ECF8E;
+  --warning: #FFB84D;
+  --surface-variant: #1C2838;
+  --chart-1: #6BA6FF;
+  --chart-2: #3ECF8E;
+  --chart-3: #FFB84D;
+  --chart-4: #C9A6FF;
+  --chart-5: #FF6B6B;
+  --sidebar: #16202E;
+  --sidebar-foreground: #E8EEF7;
+  --sidebar-primary: #6BA6FF;
+  --sidebar-primary-foreground: #0A2050;
+  --sidebar-accent: #1B2A44;
+  --sidebar-accent-foreground: #BAD4FF;
+  --sidebar-border: #24324A;
+  --sidebar-ring: #6BA6FF;
+}
+
+html[lang="ar"] body {
+  font-family: var(--font-noto-arabic), var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+}
+
+body {
+  font-feature-settings: "cv11", "ss01";
+  -webkit-tap-highlight-color: transparent;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* ---------------------------------------------------------------- nanote custom */
+
+/* fade-through page/view transition */
+@keyframes nanote-fade-through {
+  from { opacity: 0; transform: translateY(6px) scale(0.995); }
+  to { opacity: 1; transform: none; }
+}
+.view-enter {
+  animation: nanote-fade-through 0.28s cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+/* subtle card press feedback */
+.press-scale {
+  transition: transform 0.15s cubic-bezier(0.2, 0, 0, 1), box-shadow 0.15s ease;
+}
+.press-scale:active {
+  transform: scale(0.97);
+}
+
+/* soft ink shadows (2 elevations only) */
+.shadow-ink-1 { box-shadow: 0 1px 2px rgba(22, 35, 58, 0.08), 0 2px 8px rgba(22, 35, 58, 0.06); }
+.shadow-ink-2 { box-shadow: 0 4px 12px rgba(22, 35, 58, 0.10), 0 12px 32px rgba(22, 35, 58, 0.10); }
+.dark .shadow-ink-1 { box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 2px 8px rgba(0, 0, 0, 0.3); }
+.dark .shadow-ink-2 { box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5), 0 12px 32px rgba(0, 0, 0, 0.4); }
+
+/* custom scrollbars for long lists */
+.nanote-scroll { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+.nanote-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+.nanote-scroll::-webkit-scrollbar-track { background: transparent; }
+.nanote-scroll::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+.nanote-scroll::-webkit-scrollbar-thumb:hover { background: var(--muted-foreground); background-clip: content-box; }
+
+/* hide scrollbars on the ink viewport (gestures handle navigation) */
+.no-scrollbar { scrollbar-width: none; }
+.no-scrollbar::-webkit-scrollbar { display: none; }
+
+/* notebook cover sheen */
+.cover-sheen { position: relative; overflow: hidden; }
+.cover-sheen::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(115deg, rgba(255, 255, 255, 0.14) 0%, rgba(255, 255, 255, 0) 34%);
+  pointer-events: none;
+}
+
+/* lasso marching dashes */
+@keyframes nanote-dash {
+  to { stroke-dashoffset: -22; }
+}
+.lasso-dash { animation: nanote-dash 0.7s linear infinite; }
+
+/* recording pulse */
+@keyframes nanote-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.rec-pulse { animation: nanote-pulse 1.1s ease-in-out infinite; }
+
+/* skeleton shimmer for thumbnails */
+@keyframes nanote-shimmer {
+  from { background-position: -200px 0; }
+  to { background-position: 200px 0; }
+}
+.thumb-skeleton {
+  background: linear-gradient(90deg, var(--muted) 25%, var(--surface-variant) 50%, var(--muted) 75%);
+  background-size: 400px 100%;
+  animation: nanote-shimmer 1.4s linear infinite;
+}

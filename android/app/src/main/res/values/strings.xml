@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Nanote</string>
+    <string name="title_activity_main">Nanote</string>
+    <string name="package_name">com.nanote.web</string>
+    <string name="custom_url_scheme">com.nanote.web</string>
+</resources>

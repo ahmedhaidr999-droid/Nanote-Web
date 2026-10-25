@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Nanote adaptive-icon foreground: the brand "N" + dot, scaled into the
+     adaptive-icon safe zone (66/108dp circle) — verified every stroke corner
+     sits within radius 33 of the canvas centre after the 0.78 group scale. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:scaleX="0.78"
+        android:scaleY="0.78"
+        android:pivotX="54"
+        android:pivotY="54">
+        <!-- N glyph (from src/app/icon.svg, viewBox 512 → 108, then scaled) -->
+        <path
+            android:pathData="M39.24,74.68 L39.24,33.33 L68.78,74.68 L68.78,33.33"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="9.54"
+            android:strokeLineCap="butt"
+            android:strokeLineJoin="miter"
+            android:fillColor="#00000000" />
+        <!-- accent dot -->
+        <path
+            android:pathData="M25.04,40.67 a4.94,4.94 0 1,0 9.88,0 a4.94,4.94 0 1,0 -9.88,0 z"
+            android:fillColor="#FFFFFF" />
+    </group>
+</vector>

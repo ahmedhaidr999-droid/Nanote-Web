@@ -1,0 +1,228 @@
+// Nanote core domain types — mirrors the spec's data model exactly.
+
+export type Lang = 'en' | 'ar';
+export type ThemeMode = 'light' | 'dark' | 'system';
+
+// ---------------------------------------------------------------- tools
+export type ToolId = 'fountain' | 'ballpoint' | 'brush' | 'fineliner' | 'highlighter';
+export type EditorTool = ToolId | 'eraser' | 'lasso' | 'text' | 'shape' | 'image' | 'pan';
+export type ShapeType = 'line' | 'arrow' | 'rect' | 'rrect' | 'ellipse' | 'triangle' | 'star';
+export type EraserMode = 'stroke' | 'area';
+
+// ---------------------------------------------------------------- paper
+export type TemplateId =
+  | 'blank' | 'ruled' | 'wideruled' | 'grid' | 'dotgrid' | 'handwriting'
+  | 'music' | 'isometric' | 'daily' | 'weekly' | 'monthly' | 'custom';
+export type PageSizeId = 'a4p' | 'a4l' | 'letter' | 'infinite';
+
+export interface PageSize { id: PageSizeId; w: number; h: number } // h ignored for infinite (min A4 height, grows)
+
+export const PAGE_SIZES: Record<PageSizeId, PageSize> = {
+  a4p: { id: 'a4p', w: 794, h: 1123 },
+  a4l: { id: 'a4l', w: 1123, h: 794 },
+  letter: { id: 'letter', w: 816, h: 1054 },
+  infinite: { id: 'infinite', w: 794, h: 1123 },
+};
+
+// ---------------------------------------------------------------- db rows
+export interface PageLabel { id: string; title: string }
+
+export interface FolderRow {
+  id: string;
+  name: string;
+  parentId: string | null;
+  colorHex: string;
+  emoji: string;
+  createdAt: number;
+  updatedAt: number;
+  isFavorite: boolean;
+  deletedAt: number | null;
+}
+
+export interface NotebookRow {
+  id: string;
+  folderId: string | null;
+  title: string;
+  coverId: string;             // built-in cover style id ('custom' when coverCustomId set)
+  coverCustomId: string | null; // images-store id
+  defaultTemplate: TemplateId;
+  pageSize: PageSizeId;
+  backgroundHex: string;       // default paper color
+  createdAt: number;
+  updatedAt: number;
+  lastOpenedAt: number;
+  isFavorite: boolean;
+  deletedAt: number | null;
+  sortOrder: number;
+  tagIds: string[];
+}
+
+export interface PageRow {
+  id: string;
+  notebookId: string;
+  pageIndex: number;
+  template: TemplateId;
+  backgroundHex: string;
+  customTemplateImageId: string | null; // images store (custom template)
+  backgroundImageId: string | null;     // images store (pdf page background)
+  isBookmarked: boolean;
+  labels: PageLabel[];
+  createdAt: number;
+  updatedAt: number;
+  textIndex: string;  // searchable text-box content, maintained on save
+  height: number;     // page height in page-units (fixed sizes; grows for infinite)
+}
+
+export interface RecordingRow {
+  id: string;
+  pageId: string;
+  notebookId: string;
+  title: string;
+  mimeType: string;
+  durationMs: number;
+  sizeBytes: number;
+  createdAt: number;
+  imported: boolean;
+}
+
+export interface TagRow { id: string; name: string; colorHex: string }
+
+// ---------------------------------------------------------------- settings
+export interface Settings {
+  theme: ThemeMode;
+  lang: Lang;
+  defaultView: 'grid' | 'list';
+  pressureCurve: number;      // gamma exponent (0.4 firm .. 1 linear .. 2.5 soft)
+  fingerDrawing: boolean;
+  stylusOnly: boolean;
+  leftHanded: boolean;
+  autosaveMs: number;         // 0 immediate, 1000, 5000
+  onboarded: boolean;
+  favoriteColors: string[];   // up to 5 saved slots
+  includeAudioInBackup: boolean;
+}
+
+export const DEFAULT_SETTINGS: Settings = {
+  theme: 'system',
+  lang: 'en',
+  defaultView: 'grid',
+  pressureCurve: 1,
+  // Pen-first by default: the stylus writes, the finger navigates (pan/zoom).
+  // Users can enable finger drawing anytime from the editor toolbar or Settings.
+  fingerDrawing: false,
+  stylusOnly: false,
+  leftHanded: false,
+  autosaveMs: 1000, // UI options: 0 (immediate) / 1000 / 5000
+  onboarded: false,
+  favoriteColors: ['#1E6FF2', '#16233A', '#E5484D', '#22A06B', '#FF9F1C'],
+  includeAudioInBackup: true,
+};
+
+// ---------------------------------------------------------------- page document (ink codec payload)
+export interface InkPoint { x: number; y: number; p: number; t: number } // t = ms since stroke start
+
+export interface StrokeEl {
+  kind: 'stroke';
+  id: string;
+  tool: ToolId;
+  color: string;
+  width: number;
+  points: InkPoint[];
+  z: number;
+}
+
+export interface TextEl {
+  kind: 'text';
+  id: string;
+  x: number; y: number; w: number;
+  text: string;
+  fontId: string;
+  size: number;
+  color: string;
+  bold: boolean;
+  italic: boolean;
+  underline: boolean;
+  align: 'start' | 'center' | 'end';
+  z: number;
+}
+
+export interface ShapeEl {
+  kind: 'shape';
+  id: string;
+  shape: ShapeType;
+  x: number; y: number; w: number; h: number;
+  stroke: string;
+  strokeWidth: number;
+  fill: string | null;
+  z: number;
+}
+
+export interface ImageEl {
+  kind: 'image';
+  id: string;
+  x: number; y: number; w: number; h: number;
+  imageId: string;
+  rotation: number; // radians
+  z: number;
+}
+
+export type PageElement = StrokeEl | TextEl | ShapeEl | ImageEl;
+
+/** strokeId -> audio sync timing (ms relative to recording start) */
+export interface AudioSyncEntry { recId: string; tStart: number; tEnd: number }
+export type AudioSyncMap = Record<string, AudioSyncEntry>;
+
+export interface PageDoc {
+  version: 1;
+  elements: PageElement[];
+  sync: AudioSyncMap;
+}
+
+export function emptyDoc(): PageDoc { return { version: 1, elements: [], sync: {} } }
+
+// ---------------------------------------------------------------- palettes
+export const HIGHLIGHTER_PALETTE = ['#FFD84D', '#6FE38B', '#FF7EB6', '#7CC4FF', '#C9A6FF'];
+
+export const INK_PALETTE = [
+  '#16233A', '#1E6FF2', '#0A3A8F', '#5A6B85', '#22A06B', '#0E7A5F',
+  '#E5484D', '#C2410C', '#FF9F1C', '#CA8A04', '#9333EA', '#DB2777',
+  '#FFFFFF', '#94A3B8', '#6FE38B', '#7CC4FF',
+];
+
+export const PAPER_COLORS = [
+  '#FFFFFF', '#FFFDF5', '#F7F4EC', '#F4F7FC', '#FBF7F2',
+  '#1A1F2E', '#232936', '#2B2440',
+];
+
+// ---------------------------------------------------------------- fonts (bundled stacks, Arabic-capable)
+export interface FontDef { id: string; css: string; label: string; arabicOk: boolean }
+export const TEXT_FONTS: FontDef[] = [
+  { id: 'sans', css: "var(--font-sans), system-ui, sans-serif", label: 'Sans', arabicOk: true },
+  { id: 'arabic', css: "'Noto Sans Arabic', var(--font-sans), Tahoma, sans-serif", label: 'Arabic', arabicOk: true },
+  { id: 'serif', css: "Georgia, 'Times New Roman', serif", label: 'Serif', arabicOk: true },
+  { id: 'mono', css: "var(--font-mono), 'Courier New', monospace", label: 'Mono', arabicOk: true },
+  { id: 'rounded', css: "'Trebuchet MS', 'Segoe UI', system-ui, sans-serif", label: 'Rounded', arabicOk: true },
+  { id: 'typewriter', css: "'Courier New', Courier, monospace", label: 'Typewriter', arabicOk: true },
+];
+
+// ---------------------------------------------------------------- tool defaults
+export interface ToolState {
+  color: string;
+  width: number;
+}
+
+export const DEFAULT_TOOL_STATES: Record<ToolId, ToolState> = {
+  fountain: { color: '#1E6FF2', width: 5 },
+  ballpoint: { color: '#16233A', width: 2.4 },
+  brush: { color: '#16233A', width: 9 },
+  fineliner: { color: '#16233A', width: 1.8 },
+  highlighter: { color: '#FFD84D', width: 18 },
+};
+
+export const ERASER_DEFAULT = { mode: 'stroke' as EraserMode, size: 24 };
+
+// ---------------------------------------------------------------- misc
+export const TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+export const MIN_ZOOM = 0.5; // 50% max zoom-out — pages stay centered and readable
+export const MAX_ZOOM = 8;
+export const UNDO_LIMIT = 200;

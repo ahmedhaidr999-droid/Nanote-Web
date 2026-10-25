@@ -1,0 +1,169 @@
+name: Android APK
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NEXT_TELEMETRY_DISABLED: '1'
+
+jobs:
+  apk:
+    name: Build, sign & release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Type-check
+        run: bunx tsc --noEmit
+
+      - name: Build web app (static export → out/)
+        run: bun run build
+
+      - name: Sync web assets into the Android project
+        run: bunx cap sync android
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK components
+        run: yes | sdkmanager --install "platforms;android-36" "build-tools;35.0.0" > /dev/null
+
+      # ------------------------------------------------------------ versioning
+      - name: Derive version from tag
+        id: ver
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME#v}"
+            IFS='.' read -r MA MI PA <<< "$TAG"
+            CODE=$((MA*10000 + MI*100 + PA))
+            # the tag, package.json and version.ts must all agree — one source of truth
+            PKG=$(python3 -c "import json;print(json.load(open('package.json'))['version'])")
+            TS=$(grep -oE "APP_VERSION = '[^']+'" src/lib/nanote/version.ts | cut -d"'" -f2)
+            if [ "$PKG" != "$TAG" ] || [ "$TS" != "$TAG" ]; then
+              echo "::error::tag ($TAG), package.json ($PKG) and version.ts ($TS) must match"
+              exit 1
+            fi
+            NAME="$TAG"
+          else
+            CODE=10000
+            NAME="1.0.0-dev"
+          fi
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "Building versionName=$NAME versionCode=$CODE"
+
+      - name: Guard — versionCode must strictly increase
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          LATEST=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)
+          if [ -n "$LATEST" ]; then
+            code() { local t="${1#v}"; IFS='.' read -r MA MI PA <<< "$t"; echo $((MA*10000+MI*100+PA)); }
+            OLD=$(code "$LATEST"); NEW=$(code "$GITHUB_REF_NAME")
+            echo "latest release $LATEST → code $OLD · this tag $GITHUB_REF_NAME → code $NEW"
+            if [ "$NEW" -le "$OLD" ]; then
+              echo "::error::versionCode $NEW is not greater than the latest release's $OLD — Android refuses install-over updates otherwise."
+              exit 1
+            fi
+          else
+            echo "first release — no guard needed"
+          fi
+
+      # ------------------------------------------------------------ build
+      - name: Build release APK (signed with the release keystore)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          NANOTE_KEYSTORE_FILE: ${{ github.workspace }}/android/nanote-release.keystore
+          NANOTE_KEYSTORE_PASSWORD: ${{ secrets.NANOTE_KEYSTORE_PASSWORD }}
+          NANOTE_KEY_ALIAS: ${{ secrets.NANOTE_KEY_ALIAS }}
+          NANOTE_KEY_PASSWORD: ${{ secrets.NANOTE_KEY_PASSWORD }}
+        run: |
+          echo "${{ secrets.NANOTE_KEYSTORE_BASE64 }}" | base64 -d > "$NANOTE_KEYSTORE_FILE"
+          cd android
+          ./gradlew assembleRelease -PnanoteVersionCode="${{ steps.ver.outputs.code }}" -PnanoteVersionName="${{ steps.ver.outputs.name }}"
+
+      - name: Build debug APK (CI check builds)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          cd android
+          ./gradlew assembleDebug -PnanoteVersionCode="${{ steps.ver.outputs.code }}" -PnanoteVersionName="${{ steps.ver.outputs.name }}"
+
+      # ------------------------------------------------------------ verify
+      - name: Verify the release signature
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          APK="android/app/build/outputs/apk/release/app-release.apk"
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -1)"
+          "$APKSIGNER" verify --print-certs "$APK" | tee certs.txt
+          grep -q "CN=Nanote Web" certs.txt || { echo "::error::wrong signing certificate — refusing to publish"; exit 1; }
+          echo "✓ signed with the Nanote Web release key"
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            cp android/app/build/outputs/apk/release/app-release.apk "Nanote-v${{ steps.ver.outputs.name }}-release.apk"
+          else
+            cp android/app/build/outputs/apk/debug/app-debug.apk "Nanote-debug.apk"
+          fi
+          ls -lh *.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanote-apk
+          path: ./*.apk
+          if-no-files-found: error
+
+      # ------------------------------------------------------------ release
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VER="${{ steps.ver.outputs.name }}"
+          CODE="${{ steps.ver.outputs.code }}"
+          cat > notes.md <<EOF
+          # Nanote v${VER} (versionCode ${CODE})
+
+          **English** — Download \`Nanote-v${VER}-release.apk\` below and install it.
+          If you already have Nanote on your device, this update installs **directly over**
+          the old version — no uninstall, your notes stay untouched.
+
+          **العربية** — حمّل \`Nanote-v${VER}-release.apk\` بالأسفل وثبّته.
+          إذا كان التطبيق مثبتاً لديك، يُثبَّت هذا التحديث **فوق النسخة القديمة مباشرة** —
+          بدون حذف، وملاحظاتك تبقى كما هي تماماً.
+          EOF
+          gh release create "$GITHUB_REF_NAME" \
+            "Nanote-v${VER}-release.apk" \
+            --title "Nanote v${VER}" \
+            --notes-file notes.md \
+            --generate-notes
