@@ -146,6 +146,17 @@ export async function exportNotebookPdf(notebookId: string): Promise<void> {
   await shareOrDownload(blob, `${sanitizeFilename(notebook.title)}.pdf`, notebook.title);
 }
 
+/** Export an arbitrary subset of pages (pages dialog multi-select) as one PDF. */
+export async function exportPagesPdf(notebookId: string, pageIds: string[]): Promise<void> {
+  const notebook = (await db.listNotebooks()).find((n) => n.id === notebookId);
+  if (!notebook) throw new Error('notebook not found');
+  const idSet = new Set(pageIds);
+  const pages = (await db.listPages()).filter((p) => p.notebookId === notebookId && idSet.has(p.id));
+  if (!pages.length) throw new Error('no pages');
+  const blob = await buildPdf(notebook, pages);
+  await shareOrDownload(blob, `${sanitizeFilename(notebook.title)}-pages.pdf`, notebook.title);
+}
+
 /** used by the editor share menu */
 export async function sharePagePng(pageId: string): Promise<void> {
   const { blob, filename } = await exportPagePng(pageId);

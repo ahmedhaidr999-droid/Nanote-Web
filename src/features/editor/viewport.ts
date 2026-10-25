@@ -30,6 +30,15 @@ let containerSize = { w: 800, h: 600 };
 
 function notify() {
   if (raf) return;
+  // While the app is hidden (Android background) rAFs pause — but background
+  // flushes and session-restore need the ACTIVE PAGE to be current the
+  // moment the process may be killed. Fan out synchronously when hidden;
+  // batch to the next paint when visible (no paints happen while hidden, so
+  // a scheduled rAF could linger and block every later notify).
+  if (typeof document !== 'undefined' && document.hidden) {
+    for (const l of listeners) l();
+    return;
+  }
   raf = requestAnimationFrame(() => {
     raf = 0;
     for (const l of listeners) l();

@@ -12,6 +12,7 @@ import { uid } from './util';
 import { translate, fmt } from './i18n';
 import { useCallback } from 'react';
 import { seedWelcomeNotebook } from './sample';
+import { recallPage, recallSession, rememberPage, rememberSession, clearSession } from './pagemem';
 
 export type View =
   | { name: 'boot' }
@@ -118,6 +119,8 @@ interface AppState {
 
   openEditor(notebookId: string): Promise<void>;
   closeEditor(): void;
+  /** Persist every pending page save without leaving the editor (background). */
+  flushSaves(): void;
   ensureDoc(pageId: string): Promise<PageDoc>;
 
   setTool(tool: EditorTool): void;
@@ -265,6 +268,14 @@ export const useApp = create<AppState>((set, get) => ({
       view: settings.onboarded ? { name: 'library' } : { name: 'onboarding' },
       history: [],
     });
+    // Session restore: if the app died while a notebook was open (killed in the
+    // background, tab discarded, page refresh), reopen that notebook — the
+    // user comes back to the PDF they were reading, not the library.
+    if (settings.onboarded) {
+      const sessionId = recallSession();
+      const sessionNb = sessionId ? notebooks.find((n) => n.id === sessionId && !n.deletedAt) : undefined;
+      if (sessionNb) await get().openEditor(sessionNb.id);
+    }
   },
 
   navigate(v) {
@@ -533,12 +544,17 @@ export const useApp = create<AppState>((set, get) => ({
     if (!nb) return;
     await db.putNotebook({ ...nb, lastOpenedAt: Date.now(), updatedAt: Date.now() });
     const pages = get().pages.filter((p) => p.notebookId === notebookId).sort((a, b) => a.pageIndex - b.pageIndex);
+    // Per-file reading memory: reopen on the last page the user was reading.
+    const remembered = pages.find((p) => p.id === recallPage(notebookId));
+    const startPage = remembered ?? pages[0];
+    if (startPage) rememberPage(notebookId, startPage.id);
+    rememberSession(notebookId);
     set({
       editor: {
         ...get().editor,
         notebookId,
         pages,
-        activePageId: pages[0]?.id ?? null,
+        activePageId: startPage?.id ?? null,
         docs: {},
         docVersions: {},
         quarantine: {},
@@ -554,12 +570,18 @@ export const useApp = create<AppState>((set, get) => ({
         textDefaults: { ...get().editor.textDefaults },
       },
     });
-    if (pages[0]) await get().ensureDoc(pages[0].id);
+    if (startPage) await get().ensureDoc(startPage.id);
     get().navigate({ name: 'editor', notebookId });
   },
 
   closeEditor() {
-    // flush pending saves
+    get().flushSaves();
+    // an explicit exit ends the session — the next cold boot shows the library
+    clearSession();
+    get().navigate({ name: 'library' });
+  },
+
+  flushSaves() {
     const ids = [...dirtyPages];
     for (const id of ids) {
       const timer = saveTimers[id];
@@ -567,7 +589,6 @@ export const useApp = create<AppState>((set, get) => ({
       void persistDoc(get, id);
       dirtyPages.delete(id);
     }
-    get().navigate({ name: 'library' });
   },
 
   async ensureDoc(pageId) {
@@ -633,6 +654,8 @@ export const useApp = create<AppState>((set, get) => ({
     const ed = get().editor;
     if (ed.activePageId === pageId) return;
     set({ editor: { ...ed, activePageId: pageId } });
+    // per-file memory: remember where the user is reading
+    if (ed.notebookId) rememberPage(ed.notebookId, pageId);
   },
 
   // ------------------------------------------------------------ doc mutation + undo
@@ -901,6 +924,8 @@ export const useApp = create<AppState>((set, get) => ({
       pageCounts: { ...get().pageCounts, [nb.id]: newPages.length },
     });
     await get().ensureDoc(page.id);
+    // bump docVersions so the thumbnail pipeline renders the fresh page
+    set((s) => ({ editor: { ...s.editor, docVersions: { ...s.editor.docVersions, [page.id]: (s.editor.docVersions[page.id] ?? 0) + 1 } } }));
     return page.id;
   },
 

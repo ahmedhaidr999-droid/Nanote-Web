@@ -110,6 +110,10 @@ const en: Dict = {
   'pages.deleteLast': 'A notebook needs at least one page.',
   'pages.reorder': 'Drag to reorder', 'pages.label.add': 'Add outline label', 'pages.labels': 'Outline labels',
   'pages.bookmarked': 'Bookmarked', 'pages.jump': 'Jump to page',
+  'pages.countN': '{n} pages', 'pages.select': 'Select', 'pages.selectAll': 'Select all',
+  'pages.selectedN': '{n} selected', 'pages.deleteSelected': 'Delete selected',
+  'pages.deleteSelected.confirm': 'Delete {n} page(s)? This cannot be undone.',
+  'pages.deletedN': 'Deleted {n} page(s)',
 
   'audio.record': 'Record', 'audio.stop': 'Stop', 'audio.rec': 'REC', 'audio.play': 'Play', 'audio.pause': 'Pause',
   'audio.sync': 'Sync highlight', 'audio.replay': 'Ink replay', 'audio.recordings': 'Recordings',
@@ -154,6 +158,7 @@ const en: Dict = {
 
   'export.done': 'Exported', 'export.shared': 'Shared', 'export.downloaded': 'Downloaded',
   'export.pdf.building': 'Building PDF…', 'export.png.building': 'Rendering image…',
+  'export.png.multiple': 'Downloading {n} images…',
   'export.backup.building': 'Building backup…', 'export.noInk': 'Nothing to export yet.',
   'error.generic': 'Something went wrong', 'error.storageFull': 'Storage is full — delete unused notebooks or clear the thumbnail cache.',
 };
@@ -262,6 +267,10 @@ const ar: Dict = {
   'pages.deleteLast': 'يحتاج الدفتر إلى صفحة واحدة على الأقل.',
   'pages.reorder': 'اسحب لإعادة الترتيب', 'pages.label.add': 'أضف عنوانًا للمخطط', 'pages.labels': 'عناوين المخطط',
   'pages.bookmarked': 'مُشار إليه', 'pages.jump': 'انتقل إلى صفحة',
+  'pages.countN': '{n} صفحة', 'pages.select': 'تحديد', 'pages.selectAll': 'تحديد الكل',
+  'pages.selectedN': 'محدد: {n}', 'pages.deleteSelected': 'حذف المحدد',
+  'pages.deleteSelected.confirm': 'حذف {n} صفحة؟ لا يمكن التراجع عن هذا الإجراء.',
+  'pages.deletedN': 'تم حذف {n} صفحة',
 
   'audio.record': 'تسجيل', 'audio.stop': 'إيقاف', 'audio.rec': 'تسجيل', 'audio.play': 'تشغيل', 'audio.pause': 'إيقاف مؤقت',
   'audio.sync': 'تظليل متزامن', 'audio.replay': 'إعادة رسم الحبر', 'audio.recordings': 'التسجيلات',
@@ -306,6 +315,7 @@ const ar: Dict = {
 
   'export.done': 'تم التصدير', 'export.shared': 'تمت المشاركة', 'export.downloaded': 'تم التنزيل',
   'export.pdf.building': 'جارٍ إنشاء PDF…', 'export.png.building': 'جارٍ إعداد الصورة…',
+  'export.png.multiple': 'جارٍ تنزيل {n} صورة…',
   'export.backup.building': 'جارٍ إنشاء النسخة…', 'export.noInk': 'لا يوجد شيء للتصدير بعد.',
   'error.generic': 'حدث خطأ ما', 'error.storageFull': 'التخزين ممتلئ — احذف دفاتر غير مستخدمة أو امسح ذاكرة المصغرات.',
 };

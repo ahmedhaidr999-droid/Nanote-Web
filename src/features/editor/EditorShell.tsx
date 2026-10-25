@@ -26,8 +26,9 @@ import LiveOverlay from './LiveOverlay';
 import { SelectionLayer } from './SelectionLayer';
 import { TextEditorOverlay, TextSession } from './TextEditorOverlay';
 import { ToolRail } from './ToolRail';
-import { FilmstripRail } from './Filmstrip';
+import { PagesDialog } from './PagesDialog';
 import { Ruler } from './Ruler';
+import { recallPage } from '@/lib/nanote/pagemem';
 import {
   fitWidth, getVp, layoutPages, pageAtWorldY, scrollToPage, subscribeVp, useVp,
   animateZoomTo, animatedFit, clampVpToWorld, setViewportSize, setVp, type PageLayout,
@@ -51,10 +52,11 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
   const lastFitWRef = useRef(0);   // container width the current fit was computed for
   const [textSession, setTextSession] = useState<TextSession | null>(null);
   const [outlineOpen, setOutlineOpen] = useState(false);
-  const [pagesSheet, setPagesSheet] = useState(false);
+  const [pagesOpen, setPagesOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
   const [thumbVersion, setThumbVersion] = useState(0);
   const dirtyThumbsRef = useRef(new Set<string>());
+  const restoredRef = useRef(false); // last-page restore runs once per editor session
 
   const pageW = PAGE_SIZES[notebook?.pageSize ?? 'a4p'].w;
   const hasNotebook = notebook !== undefined;
@@ -96,8 +98,22 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
     setSize({ w: el.clientWidth, h: el.clientHeight });
     fitWidth(el.clientWidth, pageW);
     lastFitWRef.current = el.clientWidth;
+    // Per-file memory: land on the last page this notebook was read at —
+    // BEFORE the first paint, so the restored position is what the user sees
+    // (opening a PDF again takes you straight back where you left off).
+    if (!restoredRef.current) {
+      restoredRef.current = true;
+      const remembered = recallPage(notebookId);
+      const l = remembered ? layoutsRef.current.find((x) => x.id === remembered) : null;
+      if (l) {
+        const h = el.clientHeight;
+        setVp({ ty: h * 0.35 - l.y * getVp().scale });
+        clampVpToWorld(el.clientWidth, h, pageW, layoutsRef.current.reduce((acc, x) => Math.max(acc, x.y + x.h), 0));
+        useApp.getState().setActivePage(l.id);
+      }
+    }
     return () => ro.disconnect();
-  }, [pageW, hasNotebook]);
+  }, [pageW, hasNotebook, notebookId]);
 
   useEffect(() => {
     return subscribeVp(() => {
@@ -261,9 +277,20 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
         >
           {notebook.title}
         </button>
-        <span className="hidden text-xs text-muted-foreground sm:inline">
-          {t('editor.page').replace('{n}', String(activeIndex + 1))} / {pages.length}
-        </span>
+        {/* page manager — opens the pages popup (jump / insert / delete / export) */}
+        <Button
+          variant="ghost"
+          className="h-9 shrink-0 gap-1.5 rounded-full px-2.5"
+          onClick={() => setPagesOpen(true)}
+          aria-label={t('editor.pages')}
+          aria-haspopup="dialog"
+          title={t('editor.pages')}
+        >
+          <LayoutGrid className="h-4 w-4" />
+          <span className="text-xs font-semibold tabular-nums">
+            {activeIndex + 1} / {pages.length}
+          </span>
+        </Button>
 
         <div className="ms-auto flex items-center gap-0.5">
           <Button variant="ghost" size="icon" aria-label={t('editor.undo')} disabled={undoDepth === 0} onClick={() => useApp.getState().undo()}>
@@ -282,9 +309,6 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
           </Button>
           <Button variant="ghost" size="icon" aria-label={t('editor.outline')} onClick={() => setOutlineOpen(true)}>
             <ListTree className="h-5 w-5" />
-          </Button>
-          <Button variant="ghost" size="icon" aria-label={t('editor.pages')} className="lg:hidden" onClick={() => setPagesSheet(true)}>
-            <LayoutGrid className="h-5 w-5" />
           </Button>
 
           <DropdownMenu>
@@ -350,10 +374,6 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
           })}
         </div>
 
-        <FilmstripRail layouts={layouts} thumbVersion={thumbVersion} />
-        {/* rail lives INSIDE the viewport container so its absolute
-            positioning is relative to the area BELOW the top bar — a
-            vertically-centred rail can never end up behind the header. */}
         <ToolRail pageW={pageW} />
 
         <InkSurface layouts={layouts} pageW={pageW} onTextTap={onTextTap} />
@@ -371,7 +391,7 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
           className={cn(
             // mobile: floats above the bottom tool rail; desktop: bottom-left of the canvas
             'absolute bottom-[76px] z-30 flex items-center gap-0.5 rounded-full border border-border bg-card/95 p-1 shadow-ink-2 backdrop-blur lg:bottom-3',
-            leftHanded ? 'end-3 lg:end-16' : 'start-3 lg:start-36',
+            leftHanded ? 'end-3' : 'start-3',
           )}
           role="toolbar"
           aria-label={t('editor.zoom')}
@@ -386,17 +406,8 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
         </div>
       </div>
 
-      {/* mobile pages sheet */}
-      <Sheet open={pagesSheet} onOpenChange={setPagesSheet}>
-        <SheetContent side="bottom" className="h-[60vh] overflow-y-auto nanote-scroll rounded-t-2xl p-0">
-          <SheetHeader className="border-b border-border px-4 py-3">
-            <SheetTitle className="text-base">{t('pages.title')}</SheetTitle>
-          </SheetHeader>
-          <div className="p-2 pb-24">
-            <FilmstripGrid layouts={layouts} thumbVersion={thumbVersion} onJump={() => setPagesSheet(false)} />
-          </div>
-        </SheetContent>
-      </Sheet>
+      {/* pages popup (jump / insert / duplicate / delete / export / multi-select) */}
+      <PagesDialog open={pagesOpen} onOpenChange={setPagesOpen} layouts={layouts} thumbVersion={thumbVersion} notebookId={notebookId} />
 
       {/* outline sheet */}
       <Sheet open={outlineOpen} onOpenChange={setOutlineOpen}>
@@ -536,52 +547,5 @@ function RenameDialog({ open, onOpenChange, initial, onConfirm }: {
         </form>
       </DialogContent>
     </Dialog>
-  );
-}
-
-/** grid variant of the filmstrip for the mobile sheet */
-function FilmstripGrid({ layouts, thumbVersion, onJump }: { layouts: PageLayout[]; thumbVersion: number; onJump: () => void }) {
-  const pages = useApp((s) => s.editor.pages);
-  const activePageId = useApp((s) => s.editor.activePageId);
-  const [thumbs, setThumbs] = useState<Record<string, string>>({});
-  const { t } = useT();
-
-  useEffect(() => {
-    let alive = true;
-    void (async () => {
-      const entries = await Promise.all(layouts.map(async (l) => {
-        const rec = await db.getThumb(l.id);
-        return [l.id, rec?.dataUrl ?? ''] as const;
-      }));
-      if (alive) setThumbs(Object.fromEntries(entries));
-    })();
-    return () => { alive = false };
-  }, [layouts, thumbVersion]);
-
-  return (
-    <div className="grid grid-cols-3 gap-3 sm:grid-cols-5">
-      {layouts.map((l, i) => (
-        <button
-          key={l.id}
-          type="button"
-          className={cn(
-            'overflow-hidden rounded-lg border-2 bg-white p-1 press-scale',
-            l.id === activePageId ? 'border-primary' : 'border-border',
-          )}
-          onClick={() => { scrollToPage(l, 0.35); onJump() }}
-          aria-label={`${t('editor.page').replace('{n}', String(i + 1))}`}
-        >
-          <div className="relative w-full" style={{ aspectRatio: `${l.w} / ${l.h}` }}>
-            {thumbs[l.id]
-              ? <img src={thumbs[l.id]} alt="" className="h-full w-full object-contain" />
-              : <div className="thumb-skeleton h-full w-full" />}
-            <span className="absolute start-1 top-1 rounded bg-black/50 px-1 text-[10px] font-semibold text-white tabular-nums">{i + 1}</span>
-            {pages.find((p) => p.id === l.id)?.isBookmarked && (
-              <span className="absolute end-1 top-1 h-2 w-2 rounded-full bg-warning" />
-            )}
-          </div>
-        </button>
-      ))}
-    </div>
   );
 }

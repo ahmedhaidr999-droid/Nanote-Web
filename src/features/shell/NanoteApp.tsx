@@ -126,10 +126,14 @@ export default function NanoteApp() {
     return () => { dead = true; };
   }, []);
 
-  // flush pending saves when leaving / hiding
+  // Persist pending page saves when leaving / hiding — WITHOUT closing the
+  // editor. The old behavior navigated back to the library on every
+  // backgrounding, so coming back to the app kicked the user out of the PDF
+  // they were reading. Now the editor stays open; and even if the OS kills
+  // the process, boot() session-restore reopens the same notebook+page.
   useEffect(() => {
     const flush = () => {
-      if (useApp.getState().view.name === 'editor') useApp.getState().closeEditor();
+      useApp.getState().flushSaves();
     };
     window.addEventListener('pagehide', flush);
     const onVis = () => { if (document.hidden) flush() };
