@@ -18,7 +18,13 @@
 // page raster catches up (no vanish-frame), smooth animated double-tap zoom.
 //
 // Laser pointer mode: a presentation tool. Strokes glow on the overlay and
-// fade away (LASER_MS); they NEVER enter the page doc — no undo, no save.
+// fade away; they NEVER enter the page doc — no undo, no save.
+//
+// Text selection (app-owned): fingers and mice select PDF text with a
+// long-press (Notewise-style) or with the dedicated textselect tool; the
+// selection is computed from caret positions (./textsel) and NEVER creates a
+// native DOM selection, so no browser/WebView/Google selection UI can ever
+// appear on top of ours.
 import { useEffect, useRef } from 'react';
 import { toast } from 'sonner';
 import { useApp, useT } from '@/lib/nanote/store';
@@ -31,6 +37,10 @@ import {
   elementInLasso, strokeIntersectsCircle, elementIntersectsCircle, strokeErasedByArea,
   snapAngle, shapePath, pointInImage, transformElement,
 } from '@/lib/nanote/geometry';
+import {
+  caretAtPoint, clearTextSel, getTextSel, setSelectionFromCarets, wordRangeAt, compareCarets,
+  type CaretPoint,
+} from './textsel';
 import {
   Painter, addPainter, getVp, screenToWorld, worldToScreen, zoomAt, animateZoomTo, cancelZoomAnim,
   panBy, setVp, clampScale, requestOverlayRepaint, requestRepaint, setHiddenIds, snapToRuler,
@@ -46,6 +56,8 @@ import {
 // the overlay via hiddenIds + a painter, committed through patchElements).
 const IMG_HOLD_MS = 330;         // press-and-hold window before an image tap becomes a move
 const IMG_SLOP_PX = 8;           // movement that cancels a pending image tap
+const TEXT_HOLD_MS = 480;        // long-press that selects the word under a finger/mouse
+const TEXT_SLOP_PX = 12;         // movement that cancels a pending text long-press
 
 const AUTO_CONTINUE_PTS = 2400;   // very long strokes continue as a fresh stroke
 const PEN_IDLE_MS = 3000;         // pen "in range" window after last pen event
@@ -66,6 +78,7 @@ type Mode =
   | { type: 'none' }
   | { type: 'stroke'; pointerId: number; pageId: string; pageY: number; points: OP[]; tool: ToolId; color: string; width: number; startAbs: number; lastAbs: number; lastTs: number; minDist: number; pSmooth: number; straight: boolean; cached: Path2D | null; cachedUpTo: number }
   | { type: 'laser'; pointerId: number; pageId: string; pageY: number; points: { x: number; y: number }[]; color: string; width: number; minDist: number }
+  | { type: 'textpick'; pointerId: number; wordStart: CaretPoint | null; wordEnd: CaretPoint | null; anchor: CaretPoint; fromLongPress: boolean }
   | { type: 'erase'; pointerId: number; pageId: string; pageY: number; path: { x: number; y: number }[]; removed: Set<string>; lastScreen: { x: number; y: number } }
   | { type: 'lasso'; pointerId: number; pageId: string; pageY: number; poly: { x: number; y: number }[] }
   | { type: 'shape'; pointerId: number; pageId: string; pageY: number; ax: number; ay: number; bx: number; by: number }
@@ -86,8 +99,15 @@ const HOVER_TOOLS: Set<string> = new Set(['fountain', 'ballpoint', 'brush', 'fin
 // Finished laser polylines live here (module-level) and fade out on the
 // overlay canvas. They are purely transient: never committed to the page
 // doc, never undoable, never saved.
-const LASER_MS = 1100;        // total trail lifetime
-const LASER_MAX_TRAIL = 12;   // cap — oldest dropped
+//
+// Two modes (Settings → laser tool, Notewise-style):
+//   • normal — every stroke fades over LASER_MS (~1.1s).
+//   • timed — strokes STAY while you keep writing and all fade together
+//     laserFadeSec seconds (1..10) after the LAST writing activity.
+const LASER_MS = 1100;            // normal mode: total trail lifetime
+const LASER_TIMED_FADE_MS = 450;  // timed mode: fade-out duration once idle
+const LASER_MAX_TRAIL = 12;       // normal cap — oldest dropped
+const LASER_MAX_TRAIL_TIMED = 250;// timed cap (a whole presentation fits)
 interface LaserTrailItem {
   path: Path2D | null;        // null → single-point dot
   x: number; y: number;       // dot center (page-space) when path is null
@@ -99,12 +119,20 @@ interface LaserTrailItem {
 let laserTrail: LaserTrailItem[] = [];
 let laserRaf = 0;
 let laserLoopOn = false;
+let laserTimed = false;        // current mode snapshot (read on each activity)
+let laserFadeMs = 3000;        // timed idle threshold
+let laserLastActivity = 0;      // performance.now() of last laser point/trail
 
 /** repaint loop that runs while any trail item is alive */
 const laserLoop = () => {
   laserRaf = 0;
   const now = performance.now();
-  laserTrail = laserTrail.filter((tr) => now - tr.born < LASER_MS);
+  laserTrail = laserTrail.filter((tr) => {
+    if (!laserTimed) return now - tr.born < LASER_MS;
+    const idle = now - laserLastActivity;
+    if (idle < laserFadeMs) return true; // still inside the "writing" window
+    return idle - laserFadeMs < LASER_TIMED_FADE_MS; // fading out together
+  });
   requestOverlayRepaint();
   if (laserTrail.length) laserRaf = requestAnimationFrame(laserLoop);
   else laserLoopOn = false;
@@ -122,6 +150,15 @@ const stopLaserLoop = () => {
   laserLoopOn = false;
   laserTrail = [];
 };
+
+/** snapshot the laser settings + mark "still writing" (timed mode clock) */
+function noteLaserActivity() {
+  const st = useApp.getState();
+  laserTimed = st.settings.laserMode === 'timed';
+  laserFadeMs = clamp(st.settings.laserFadeSec || 3, 1, 10) * 1000;
+  laserLastActivity = performance.now();
+  wakeLaserLoop();
+}
 
 /** smooth polyline through the points (quadratic midpoint smoothing) */
 function laserSmoothPath(pts: { x: number; y: number }[]): Path2D {
@@ -167,12 +204,14 @@ function dotLaser(ctx: CanvasRenderingContext2D, x: number, y: number, color: st
 /** push a finished laser stroke into the fading trail */
 function trailLaser(pts: { x: number; y: number }[], pageY: number, color: string, width: number) {
   if (!pts.length) return;
+  noteLaserActivity();
   laserTrail.push({
     path: pts.length >= 2 ? laserSmoothPath(pts) : null,
     x: pts[0].x, y: pts[0].y,
     pageY, color, width, born: performance.now(),
   });
-  if (laserTrail.length > LASER_MAX_TRAIL) laserTrail.shift();
+  const cap = laserTimed ? LASER_MAX_TRAIL_TIMED : LASER_MAX_TRAIL;
+  if (laserTrail.length > cap) laserTrail.splice(0, laserTrail.length - cap);
   wakeLaserLoop();
 }
 
@@ -219,6 +258,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
   const downInfoRef = useRef<{ x: number; y: number; t: number } | null>(null);
   const scrollRafRef = useRef(0);   // momentum / settle rAF (one at a time)
   const holdTimerRef = useRef(0);  // image tool: pending long-press timer
+  const textHoldRef = useRef<{ timer: number; pointerId: number; x: number; y: number } | null>(null); // pending text long-press
   const { t, lang } = useT();
   const langRef = useRef(lang);
   const tRef = useRef(t);
@@ -300,7 +340,6 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
   const clearImgHold = () => {
     if (holdTimerRef.current) { clearTimeout(holdTimerRef.current); holdTimerRef.current = 0 }
   };
-
   /** topmost image under a page-space point (rotation-aware hit-test) */
   const hitImageAt = (pageId: string, px: number, py: number): ImageEl | null => {
     const doc = useApp.getState().editor.docs[pageId];
@@ -333,10 +372,21 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         ctx.restore();
       }
 
-      // laser trails — age-based fade, purely transient (never in the page doc)
+      // laser trails — purely transient (never in the page doc). Normal mode:
+      // age-based fade. Timed mode (Notewise-style): strokes stay at full glow
+      // while writing continues, then all fade together once the idle window
+      // (laserFadeSec) has passed since the LAST writing activity.
       const nowMs = performance.now();
       for (const tr of laserTrail) {
-        const alpha = 0.9 * (1 - (nowMs - tr.born) / LASER_MS);
+        let alpha: number;
+        if (laserTimed) {
+          const idle = nowMs - laserLastActivity;
+          alpha = idle < laserFadeMs
+            ? 0.9
+            : 0.9 * (1 - (idle - laserFadeMs) / LASER_TIMED_FADE_MS);
+        } else {
+          alpha = 0.9 * (1 - (nowMs - tr.born) / LASER_MS);
+        }
         if (alpha <= 0) continue;
         ctx.save();
         ctx.translate(vp.tx, tr.pageY * vp.scale + vp.ty);
@@ -527,6 +577,61 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       );
     };
 
+    // ================================================ app-owned text selection
+    const clearTextHold = () => {
+      const h = textHoldRef.current;
+      if (h) { clearTimeout(h.timer); textHoldRef.current = null }
+    };
+
+    /** start a word selection at the caret under a point: discards whatever
+     *  gesture was in flight (stroke dot / pan / pending lasso), then enters
+     *  the textpick mode — further dragging extends the selection. */
+    const beginTextPick = (e: PointerEvent, caret: CaretPoint, fromLongPress: boolean): boolean => {
+      const word = wordRangeAt(caret);
+      if (!word) return false;
+      const start: CaretPoint = { node: caret.node, offset: word.start };
+      const end: CaretPoint = { node: caret.node, offset: word.end };
+      // discard the in-flight gesture so a long-press never commits leftovers
+      const m = modeRef.current;
+      if (m.type === 'pan') endVpGesture();
+      if (m.type === 'imgmove') setHiddenIds(m.pageId, null);
+      if (m.type === 'imgtap') clearImgHold();
+      clearTextHold();
+      modeRef.current = {
+        type: 'textpick', pointerId: e.pointerId,
+        wordStart: start, wordEnd: end, anchor: start, fromLongPress,
+      };
+      setSelectionFromCarets(start, end);
+      return true;
+    };
+
+    /** drag-extend the selection; the anchor re-anchors on the initial word's
+     *  start/end depending on the drag direction (native-selection feel). */
+    const extendTextPick = (ev: { clientX: number; clientY: number }, m: Extract<Mode, { type: 'textpick' }>) => {
+      const caret = caretAtPoint(ev.clientX, ev.clientY);
+      if (!caret) return;
+      if (m.wordStart && m.wordEnd) {
+        m.anchor = compareCarets(caret, m.wordStart) >= 0 ? m.wordStart : m.wordEnd;
+      }
+      setSelectionFromCarets(m.anchor, caret);
+    };
+
+    /** long-press timer: a finger/mouse held still over PDF text selects the
+     *  word under it (Notewise-style) from ANY tool except eraser/laser. */
+    const scheduleTextHold = (e: PointerEvent) => {
+      clearTextHold();
+      const timer = window.setTimeout(() => {
+        textHoldRef.current = null;
+        const held = modeRef.current;
+        // the image tool's own (faster) hold won — it owns this gesture
+        if (held.type === 'imgmove' || held.type === 'imgtap') return;
+        const caret = caretAtPoint(e.clientX, e.clientY);
+        if (!caret) return; // held over empty page → nothing to select
+        beginTextPick(e, caret, true);
+      }, TEXT_HOLD_MS);
+      textHoldRef.current = { timer, pointerId: e.pointerId, x: e.clientX, y: e.clientY };
+    };
+
     // ================================================ modern pan physics
     // While a pan gesture / momentum / settle is in flight it OWNS the viewport
     // (global clamp stands down via the gesture guard) and applies:
@@ -710,12 +815,17 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
 
       if (pointers.size === 2) {
         // second touch → pinch (commit a finger stroke rather than dropping it)
+        clearTextHold(); // a pinch cancels any pending text long-press
         const m = modeRef.current;
         if (m.type === 'stroke') {
           const a0 = m.points[0];
           const aN = m.points[m.points.length - 1];
           const meaningful = m.points.length > 2 || Math.hypot(aN.x - a0.x, aN.y - a0.y) > 4;
           if (meaningful) void commitStroke(m, true);
+          modeRef.current = { type: 'none' };
+        }
+        if (m.type === 'textpick') {
+          // pinch takes over; the computed selection itself persists
           modeRef.current = { type: 'none' };
         }
         if (m.type === 'laser') {
@@ -793,6 +903,16 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         }
       }
 
+      // ---- textselect tool: caret-drag selection (empty areas pan)
+      // Runs BEFORE the pan gate so a touch that starts on text selects
+      // instead of scrolling.
+      if (tool === 'textselect' && e.button === 0 && !spaceRef.current) {
+        const caret = caretAtPoint(e.clientX, e.clientY);
+        if (caret && beginTextPick(e, caret, false)) return;
+        startPan(e, localPt(e));
+        return;
+      }
+
       if (isPanGesture(e)) {
         startPan(e, localPt(e));
         return;
@@ -804,6 +924,22 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         startPan(e, localPt(e));
         return;
       }
+
+      // ---- long-press text selection (finger/mouse; pens always draw):
+      // scheduled for PDF-background pages whose notebook keeps the original
+      // file (the text mirror must exist to hit carets). Not for eraser/laser.
+      if (
+        (e.pointerType === 'touch' || e.pointerType === 'mouse') &&
+        e.button === 0 && !spaceRef.current &&
+        tool !== 'eraser' && tool !== 'textselect' && tool !== 'laser'
+      ) {
+        const pageRow = st.editor.pages.find((p) => p.id === page.id);
+        if (pageRow?.backgroundImageId != null) {
+          const nb = st.notebooks.find((n) => n.id === st.editor.notebookId);
+          if (nb?.pdfOriginalId != null) scheduleTextHold(e);
+        }
+      }
+
       const stEd = st.editor;
       void st.ensureDoc(page.id);
       st.setActivePage(page.id);
@@ -845,6 +981,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       if (tool === 'laser') {
         // presentation pointer: transient overlay ink, nothing persists
         const ts = stEd.toolStates.laser;
+        noteLaserActivity(); // snapshot mode + start the "still writing" clock
         modeRef.current = {
           type: 'laser', pointerId: e.pointerId, pageId: page.id, pageY: page.y,
           points: [{ x: pagePt.x, y: pagePt.y }],
@@ -855,10 +992,8 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         return;
       }
 
-      // non-inking tools: text selection runs in the DOM text layer above this
-      // surface (empty-area drags still pan through here); the image tool
-      // resolves taps/long-presses on pointerup (selection + move).
-      if (tool === 'textselect' || tool === 'image') {
+      // image tool: taps are resolved on pointerup (selection + move)
+      if (tool === 'image') {
         modeRef.current = { type: 'none' };
         return;
       }
@@ -893,6 +1028,12 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       if (known) pointers.set(e.pointerId, { ...known, ...l });
       const m = modeRef.current;
 
+      // movement cancels a pending text long-press (the user is gesturing)
+      const th = textHoldRef.current;
+      if (th && e.pointerId === th.pointerId && Math.hypot(e.clientX - th.x, e.clientY - th.y) > TEXT_SLOP_PX) {
+        clearTextHold();
+      }
+
       // pen hover cursor when idle
       if (m.type === 'none' && e.pointerType === 'pen') {
         hoverRef.current = { x: l.x, y: l.y };
@@ -922,6 +1063,12 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         while (m.samples.length > 2 && now - m.samples[0].t > SAMPLE_WINDOW) m.samples.shift();
         m.lastMoveT = now;
         applyPanRaw(m, m.rawX, m.rawY);
+        return;
+      }
+
+      if (m.type === 'textpick' && e.pointerId === m.pointerId) {
+        // drag extends the app-owned selection (word-anchored)
+        extendTextPick(e, m);
         return;
       }
 
@@ -1051,10 +1198,17 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       const m = modeRef.current;
       const known = pointers.has(e.pointerId); // rejected (palm) pointers were never tracked
       pointers.delete(e.pointerId);
+      clearTextHold(); // gesture ended — no long-press can fire anymore
       const st = useApp.getState();
 
       if (m.type === 'pinch') {
         if (m.ids.includes(e.pointerId)) modeRef.current = { type: 'none' };
+        return;
+      }
+      if (m.type === 'textpick' && e.pointerId === m.pointerId) {
+        // release keeps the selection + its toolbar (actions live there)
+        modeRef.current = { type: 'none' };
+        activeTypeRef.current = null;
         return;
       }
       const down = downInfoRef.current;
@@ -1186,11 +1340,18 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         st.setSelection(null);
         return;
       }
+      // a quick tap elsewhere than the selection dismisses the app-owned text
+      // selection (touch/mouse only — pens keep writing dots). Tapping ON text
+      // keeps it; the textselect tool re-picks its own word on pointerdown.
+      if (known && quick && e.pointerType !== 'pen' && getTextSel() && !caretAtPoint(e.clientX, e.clientY)) {
+        clearTextSel();
+      }
       if (known && quick && e.pointerType === 'touch') tryDoubleTap(e);
     };
 
     const onPointerUp = (e: PointerEvent) => { finishGesture(e) };
     const onPointerCancel = (e: PointerEvent) => {
+      clearTextHold();
       const m = modeRef.current;
       if (m.type === 'stroke' && e.pointerId === m.pointerId) { modeRef.current = { type: 'none' }; activeTypeRef.current = null; requestOverlayRepaint() }
       if (m.type === 'laser' && e.pointerId === m.pointerId) {
@@ -1213,6 +1374,11 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       }
       if (m.type === 'imgtap' && e.pointerId === m.pointerId) {
         clearImgHold();
+        modeRef.current = { type: 'none' };
+        activeTypeRef.current = null;
+      }
+      if (m.type === 'textpick' && e.pointerId === m.pointerId) {
+        // cancel behaves like up: the computed selection survives
         modeRef.current = { type: 'none' };
         activeTypeRef.current = null;
       }
@@ -1272,6 +1438,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     return () => {
       cancelLocalScroll();
       clearImgHold();
+      clearTextHold();
       const mEnd = modeRef.current;
       if (mEnd.type === 'imgmove') setHiddenIds(mEnd.pageId, null);
       stopLaserLoop(); // fade loop + trail die with the surface
@@ -1288,12 +1455,12 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     };
   }, [layouts, pageW, onTextTap]);
 
-  const cursor = useApp((s) => (s.editor.tool === 'pan' ? 'grab' : s.editor.tool === 'image' ? 'default' : 'crosshair'));
+  const cursor = useApp((s) => (s.editor.tool === 'pan' ? 'grab' : s.editor.tool === 'textselect' ? 'text' : s.editor.tool === 'image' ? 'default' : 'crosshair'));
   return (
     <div
       ref={hostRef}
       className="absolute inset-0 z-10 touch-none select-none"
-      style={{ cursor }}
+      style={{ cursor, WebkitTouchCallout: 'none' }}
       role="application"
       aria-label={t('app.name')}
     />

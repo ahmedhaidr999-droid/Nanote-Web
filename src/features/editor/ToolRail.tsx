@@ -90,10 +90,16 @@ export function ToolRail({ pageW }: { pageW: number }) {
     const z = doc.elements.reduce((acc, e) => Math.max(acc, e.z), 0) + 1;
     const targetW = pageW * 0.5;
     const ih = targetW * (h / w);
+    const imgElId = uid();
     st.addElements(pageId, [{
-      kind: 'image', id: uid(), x: pageW * 0.22, y: 120, w: targetW, h: ih, imageId: id, rotation: 0, z,
+      kind: 'image', id: imgElId, x: pageW * 0.22, y: 120, w: targetW, h: ih, imageId: id, rotation: 0, z,
     }]);
-    st.setTool('lasso');
+    // the image's edit options appear IMMEDIATELY: size handles, rotate arrow
+    // and the action bar show around the fresh image; tapping empty space
+    // applies the changes, hides them, and it comes back only when the image
+    // is re-selected (lasso or image-tool tap).
+    st.setTool('image');
+    st.setSelection({ pageId, ids: [imgElId] });
     toast.success(t('tool.image.insert'));
   };
 
@@ -436,9 +442,46 @@ function LaserPopover({ railPos, railOnRight, anchor }: { railPos: RailPos; rail
   const { t } = useT();
   const ts = useApp((s) => s.editor.toolStates.laser);
   const setToolState = useApp((s) => s.setToolState);
+  const laserMode = useApp((s) => s.settings.laserMode);
+  const laserFadeSec = useApp((s) => s.settings.laserFadeSec);
+  const setSettings = useApp((s) => s.setSettings);
   const [colorOpen, setColorOpen] = useState(false);
   return (
     <Pop railPos={railPos} railOnRight={railOnRight} anchor={anchor}>
+      {/* laser mode — Notewise-style: normal fading pointer, or a timed laser
+         whose strokes stay glowing until N seconds after the last writing */}
+      <div className="mb-2 grid grid-cols-2 gap-1 rounded-lg bg-muted p-1">
+        {(['normal', 'timed'] as const).map((m) => (
+          <button
+            key={m}
+            type="button"
+            aria-pressed={laserMode === m}
+            onClick={() => void setSettings({ laserMode: m })}
+            className={cn(
+              'h-7 rounded-md text-xs font-medium transition-colors press-scale',
+              laserMode === m ? 'bg-card text-foreground shadow-ink-1' : 'text-muted-foreground hover:text-foreground',
+            )}
+          >
+            {t(`tool.laser.mode.${m}`)}
+          </button>
+        ))}
+      </div>
+      {laserMode === 'timed' && (
+        <div className="mb-2">
+          <div className="mb-1 flex items-center justify-between text-xs font-medium text-muted-foreground">
+            <span>{t('tool.laser.fade')}</span>
+            <span className="tabular-nums">{laserFadeSec}s</span>
+          </div>
+          <Slider
+            value={[laserFadeSec]}
+            min={1}
+            max={10}
+            step={1}
+            aria-label={t('tool.laser.fade')}
+            onValueChange={(v) => void setSettings({ laserFadeSec: v[0] ?? 3 })}
+          />
+        </div>
+      )}
       <div className="mb-2 grid grid-cols-4 gap-2">
         {LASER_SWATCHES.map((c) => (
           <button
@@ -472,7 +515,9 @@ function LaserPopover({ railPos, railOnRight, anchor }: { railPos: RailPos; rail
           </div>
         )}
       </div>
-      <p className="mt-2.5 text-[11px] leading-snug text-muted-foreground">{t('tool.laser.hint')}</p>
+      <p className="mt-2.5 text-[11px] leading-snug text-muted-foreground">
+        {laserMode === 'timed' ? t('tool.laser.hintTimed') : t('tool.laser.hint')}
+      </p>
     </Pop>
   );
 }

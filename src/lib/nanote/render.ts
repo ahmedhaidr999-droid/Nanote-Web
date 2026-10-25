@@ -14,6 +14,10 @@ export interface RenderOpts {
   audio?: { recId: string; tMs: number; mode: 'off' | 'highlight' | 'replay' };
   hideIds?: Set<string>;
   paperDark?: boolean;              // dark paper → highlighter blends differently
+  /** vector-quality PDF background (re-rendered from the stored original at
+   *  the CURRENT zoom — keeps text razor-sharp at high magnification,
+   *  Notewise-style) drawn instead of the stored raster PNG when present */
+  backgroundOverride?: { source: CanvasImageSource; w: number; h: number } | null;
 }
 
 const isStroke = (e: { kind: string }): e is StrokeEl => e.kind === 'stroke';
@@ -190,8 +194,11 @@ export function renderPage(
   ctx.fillStyle = page.backgroundHex || '#FFFFFF';
   ctx.fillRect(0, 0, w, h);
 
-  // 2) PDF/background image beneath everything
-  if (page.backgroundImageId && opts.resolveImage) {
+  // 2) PDF/background image beneath everything — the vector override (rendered
+  //    from the original PDF at the current zoom) wins when available
+  if (opts.backgroundOverride) {
+    try { ctx.drawImage(opts.backgroundOverride.source, 0, 0, w, h) } catch { /* ignore */ }
+  } else if (page.backgroundImageId && opts.resolveImage) {
     const src = opts.resolveImage(page.backgroundImageId);
     if (src) {
       const nat = opts.imageNatural?.(page.backgroundImageId) ?? { w, h };

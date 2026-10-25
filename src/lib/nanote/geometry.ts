@@ -121,23 +121,36 @@ function sampleStrokePoints(s: StrokeEl, step = 12): { x: number; y: number }[] 
   return out;
 }
 
-/** Is an element mostly inside the lasso polygon (>=60% of samples)? */
+/** Coverage of an element by the lasso polygon: a dense grid sample of the
+ *  element's bounding box (36 probes) measures the AREA fraction inside the
+ *  polygon, so lassoing MORE THAN HALF of an image/text/shape selects it —
+ *  no need to encircle it 100%. */
+function bboxCoverageInPoly(b: BBox, poly: { x: number; y: number }[]): number {
+  const cols = 6, rows = 6; // 36 probes ≈ area fraction with 3% granularity
+  let hits = 0;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const px = b.x0 + ((c + 0.5) / cols) * (b.x1 - b.x0);
+      const py = b.y0 + ((r + 0.5) / rows) * (b.y1 - b.y0);
+      if (pointInPolygon(px, py, poly)) hits++;
+    }
+  }
+  return hits / (cols * rows);
+}
+
+/** Is an element MORE THAN 50% inside the lasso polygon? (strokes: sampled
+ *  along their path; everything else: bbox area coverage). */
 export function elementInLasso(el: PageElement, poly: { x: number; y: number }[]): boolean {
   if (poly.length < 3) return false;
   if (el.kind === 'stroke') {
     const samples = sampleStrokePoints(el);
+    if (!samples.length) return false;
     let hits = 0;
     for (const s of samples) if (pointInPolygon(s.x, s.y, poly)) hits++;
-    return samples.length > 0 && hits / samples.length >= 0.6;
+    return hits / samples.length > 0.5;
   }
   const b = elementBBox(el, 4);
-  const probes = [
-    { x: (b.x0 + b.x1) / 2, y: (b.y0 + b.y1) / 2 },
-    { x: b.x0, y: b.y0 }, { x: b.x1, y: b.y0 }, { x: b.x0, y: b.y1 }, { x: b.x1, y: b.y1 },
-  ];
-  let hits = 0;
-  for (const pr of probes) if (pointInPolygon(pr.x, pr.y, poly)) hits++;
-  return hits / probes.length >= 0.6;
+  return bboxCoverageInPoly(b, poly) > 0.5;
 }
 
 export function strokeIntersectsCircle(s: StrokeEl, cx: number, cy: number, r: number): boolean {

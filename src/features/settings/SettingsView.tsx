@@ -18,7 +18,9 @@ import {
   Download,
   Eraser,
   FileText,
+  Globe,
   Image as ImageIcon,
+  Languages,
   LayoutGrid,
   List,
   Loader2,
@@ -31,6 +33,7 @@ import {
   PanelTop,
   RefreshCw,
   Sun,
+  Trash2,
   TriangleAlert,
   Upload,
 } from 'lucide-react';
@@ -40,12 +43,16 @@ import type { StorageStats } from '@/lib/nanote/idb';
 import { downloadBlob, fmtBytes } from '@/lib/nanote/util';
 import { getAppVersion, openReleasesPage } from '@/lib/nanote/native';
 import { computeOutline, pathOutline, type OP } from '@/lib/nanote/outline';
+import { LANG_LIBRARY, type LangPack } from '@/lib/nanote/types';
+import { invalidatePackCache } from '@/lib/nanote/offlineTranslate';
+import { langLabel } from '@/lib/nanote/translate';
 import { AppWordmark } from '@/components/nanote/AppIcon';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { Label } from '@/components/ui/label';
 import { Progress } from '@/components/ui/progress';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Slider } from '@/components/ui/slider';
 import { Switch } from '@/components/ui/switch';
 import {
@@ -221,6 +228,60 @@ export default function SettingsView() {
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [version, setVersion] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
+
+  // ----- language library: installed packs + download state
+  const [packs, setPacks] = useState<Record<string, LangPack>>({});
+  const [downloading, setDownloading] = useState<Set<string>>(new Set());
+
+  const reloadPacks = useCallback(async () => {
+    try {
+      const list = await db.listLangPacks();
+      const map: Record<string, LangPack> = {};
+      for (const p of list) map[p.code] = p;
+      setPacks(map);
+    } catch { /* informational */ }
+  }, []);
+
+  useEffect(() => { void reloadPacks() }, [reloadPacks]);
+
+  const downloadPack = useCallback(async (code: string) => {
+    if (downloading.has(code)) return;
+    setDownloading((s) => { const n = new Set(s); n.add(code); return n });
+    const tid = toast.loading(t('settings.translate.downloading'));
+    try {
+      const res = await fetch('/api/langpack', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lang: code }),
+      });
+      if (!res.ok) throw new Error(`langpack http ${res.status}`);
+      const pack = (await res.json()) as LangPack;
+      if (!pack?.code || !pack.entries) throw new Error('bad pack payload');
+      await db.putLangPack(pack);
+      invalidatePackCache(); // the offline engine re-reads packs on next use
+      await reloadPacks();
+      toast.success(t('settings.translate.packDone'), { id: tid });
+    } catch {
+      toast.error(t('settings.translate.packFail'), { id: tid, duration: 5000 });
+    } finally {
+      setDownloading((s) => { const n = new Set(s); n.delete(code); return n });
+    }
+  }, [downloading, reloadPacks, t]);
+
+  const deletePack = useCallback(async (code: string) => {
+    try {
+      await db.deleteLangPack(code);
+      invalidatePackCache();
+      // if the translate target pointed at the deleted pack, fall back to auto
+      if (useApp.getState().settings.translateTarget === code) {
+        await useApp.getState().setSettings({ translateTarget: 'auto' });
+      }
+      await reloadPacks();
+      toast.success(t('settings.translate.packDeleted'));
+    } catch {
+      toast.error(t('error.generic'));
+    }
+  }, [reloadPacks, t]);
 
   // installed version (APK versionName on Android) — loaded once on mount
   useEffect(() => {
@@ -413,7 +474,131 @@ export default function SettingsView() {
             </div>
           </Section>
 
-          {/* ------------------------------------------------ 3 · data */}
+          {/* ------------------------------------------------ 3 · translation */}
+          <Section title={t('settings.translate')}>
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <div className="text-sm font-medium">{t('settings.translate.engine')}</div>
+                <Segmented
+                  label={t('settings.translate.engine')}
+                  value={settings.translateEngine}
+                  onChange={(translateEngine) => void setSettings({ translateEngine })}
+                  options={[
+                    { value: 'nanote', label: t('settings.translate.engine.nanote'), icon: <Languages className="size-4 shrink-0" /> },
+                    { value: 'google', label: t('settings.translate.engine.google'), icon: <Globe className="size-4 shrink-0" /> },
+                  ]}
+                />
+                <p className="text-xs leading-snug text-muted-foreground">
+                  {settings.translateEngine === 'google'
+                    ? t('settings.translate.engine.google.hint')
+                    : t('settings.translate.engine.nanote.hint')}
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <Label className="cursor-pointer text-sm font-medium" htmlFor="translate-target">
+                  {t('settings.translate.target')}
+                </Label>
+                <Select
+                  value={settings.translateTarget}
+                  onValueChange={(translateTarget) => void setSettings({ translateTarget })}
+                >
+                  <SelectTrigger id="translate-target" className="w-full">
+                    <SelectValue aria-label={t('settings.translate.target')} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="auto">
+                      {t('settings.translate.target.auto')} — {lang === 'ar' ? 'العربية' : 'English'}
+                    </SelectItem>
+                    <SelectItem value="ar">العربية · Arabic</SelectItem>
+                    <SelectItem value="en">English</SelectItem>
+                    {Object.values(packs)
+                      .filter((p) => p.code !== 'ar' && p.code !== 'en')
+                      .sort((a, b) => a.name.localeCompare(b.name))
+                      .map((p) => (
+                        <SelectItem key={p.code} value={p.code}>
+                          {p.nativeName} · {p.name}
+                        </SelectItem>
+                      ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <Divider />
+
+              {/* language library — downloadable offline packs */}
+              <div className="space-y-2">
+                <div className="text-sm font-medium">{t('settings.translate.library')}</div>
+                <p className="text-xs leading-snug text-muted-foreground">
+                  {t('settings.translate.library.hint')}
+                </p>
+                <ul className="space-y-1.5">
+                  {LANG_LIBRARY.map((meta) => {
+                    const pack = packs[meta.code];
+                    const isBuiltin = meta.code === 'ar' || meta.code === 'en';
+                    const busyRow = downloading.has(meta.code);
+                    return (
+                      <li
+                        key={meta.code}
+                        className="flex items-center justify-between gap-3 rounded-lg bg-muted/60 px-3 py-2"
+                      >
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-medium">
+                            {meta.nativeName}
+                            <span className="ms-1.5 text-xs text-muted-foreground">· {meta.name}</span>
+                          </p>
+                          {isBuiltin ? (
+                            <p className="text-[11px] text-muted-foreground">{t('settings.translate.builtin')}</p>
+                          ) : pack ? (
+                            <p className="text-[11px] text-muted-foreground">
+                              {fmt(t('settings.translate.wordsCount'), { count: pack.wordCount })}
+                              {' · '}
+                              {new Date(pack.builtAt).toLocaleDateString()}
+                            </p>
+                          ) : (
+                            <p className="text-[11px] text-muted-foreground">{t('settings.translate.notDownloaded')}</p>
+                          )}
+                        </div>
+                        {isBuiltin ? (
+                          <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary">
+                            {t('settings.translate.builtinTag')}
+                          </span>
+                        ) : pack ? (
+                          <div className="flex shrink-0 items-center gap-1">
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              className="size-8 press-scale text-muted-foreground hover:text-destructive"
+                              disabled={busyRow}
+                              aria-label={t('common.delete')}
+                              onClick={() => void deletePack(meta.code)}
+                            >
+                              <Trash2 className="size-4" />
+                            </Button>
+                          </div>
+                        ) : (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            className="h-8 shrink-0 gap-1.5 rounded-full px-3 press-scale"
+                            disabled={busyRow}
+                            onClick={() => void downloadPack(meta.code)}
+                          >
+                            {busyRow ? <Loader2 className="size-3.5 animate-spin" /> : <Download className="size-3.5" />}
+                            {busyRow ? '' : t('common.download', 'Download', 'تحميل')}
+                          </Button>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            </div>
+          </Section>
+
+          {/* ------------------------------------------------ 4 · data */}
           <Section title={t('settings.data')}>
             <div className="space-y-4">
               <div className="space-y-2">

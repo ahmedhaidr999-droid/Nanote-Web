@@ -111,3 +111,44 @@ export async function ensurePdfText(page: PageRow, notebook: NotebookRow): Promi
   inflight.set(page.id, p);
   return p;
 }
+
+// ---------------------------------------------------------------- vector background
+// High-fidelity zoom (Notewise-style sharp text): instead of upscaling the
+// stored PNG page snapshot (~2x at import), re-render the page VECTOR from
+// the untouched original PDF at the CURRENT raster scale. The LRU keeps at
+// most two open pdf.js documents alive (shared with the text extractor).
+
+/** Render one PDF page's content into `canvas` at ink-width × raster pixels.
+ *  Returns false when there is no original (or rendering fails) — the caller
+ *  then falls back to the stored raster PNG. */
+export async function renderPdfPageVector(
+  page: PageRow,
+  notebook: NotebookRow,
+  canvas: HTMLCanvasElement,
+  raster: number,
+  pageW: number,
+): Promise<boolean> {
+  const originalId = notebook.pdfOriginalId;
+  if (!originalId || raster <= 0) return false;
+  try {
+    const { doc } = await openPdfDoc(originalId);
+    const num = Math.min(Math.max(1, page.pageIndex + 1), doc.numPages);
+    const pdfPage = await doc.getPage(num);
+    const vpBase = pdfPage.getViewport({ scale: 1 });
+    const scale = (pageW * raster) / vpBase.width;
+    const vp = pdfPage.getViewport({ scale });
+    const w = Math.max(2, Math.ceil(vp.width));
+    const h = Math.max(2, Math.ceil(vp.height));
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h }
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return false;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#FFFFFF'; // transparent PDF pages must stay readable
+    ctx.fillRect(0, 0, w, h);
+    await pdfPage.render({ canvas, viewport: vp }).promise;
+    return true;
+  } catch (e) {
+    console.warn(`[nanote] vector render failed for page index ${page.pageIndex}`, e);
+    return false;
+  }
+}

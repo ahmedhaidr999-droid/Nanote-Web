@@ -3,14 +3,14 @@
 // IndexedDB is unavailable (e.g. storage blocked in an embedding context).
 import { openDB, IDBPDatabase } from 'idb';
 import {
-  DEFAULT_SETTINGS, PageDoc, PageRow, PdfTextRec, RecordingRow, FolderRow, NotebookRow, Settings, TabRow, TagRow,
+  DEFAULT_SETTINGS, LangPack, PageDoc, PageRow, PdfTextRec, RecordingRow, FolderRow, NotebookRow, Settings, TabRow, TagRow,
   TRASH_RETENTION_MS,
 } from './types';
 import { encodeDoc, decodeDoc } from './ink';
 import { uid } from './util';
 
 const DB_NAME = 'nanote';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 export interface ImageBlob { id: string; blob: Blob; w: number; h: number; name: string; createdAt: number }
 export interface DocRec { pageId: string; data: ArrayBuffer }
@@ -36,6 +36,7 @@ const mem = {
   recordings: new Map<string, RecordingRow>(),
   tags: new Map<string, TagRow>(),
   quarantined: new Map<string, QuarantineRec>(),
+  langpacks: new Map<string, LangPack>(),
 };
 
 export const isMemoryMode = () => memoryMode;
@@ -71,6 +72,10 @@ async function get(): Promise<IDBPDatabase | null> {
           const tb = db.createObjectStore('tabs', { keyPath: 'id' });
           tb.createIndex('deletedAt', 'deletedAt');
           db.createObjectStore('pdftext', { keyPath: 'pageId' });
+        }
+        // v3: downloaded offline translation language packs (Settings → Languages).
+        if (oldVersion < 3) {
+          db.createObjectStore('langpacks', { keyPath: 'code' });
         }
       },
     }).catch((e) => { memoryMode = true; console.warn('[nanote] IndexedDB unavailable, using memory store', e); return null });
@@ -135,6 +140,32 @@ export async function getMetaFlag(key: string): Promise<boolean> {
 }
 export async function putMetaFlag(key: string, value: boolean) {
   await put('meta', { id: key, value } as unknown as { id: string });
+}
+
+// ------------------------------------------------------------------ language packs (offline translation)
+
+export async function putLangPack(pack: LangPack): Promise<void> {
+  const d = await get();
+  if (d) await d.put('langpacks', pack);
+  else mem.langpacks.set(pack.code, pack);
+}
+
+export async function getLangPack(code: string): Promise<LangPack | undefined> {
+  const d = await get();
+  if (d) return (await d.get('langpacks', code)) as LangPack | undefined;
+  return mem.langpacks.get(code);
+}
+
+export async function listLangPacks(): Promise<LangPack[]> {
+  const d = await get();
+  if (d) return (await d.getAll('langpacks')) as LangPack[];
+  return [...mem.langpacks.values()];
+}
+
+export async function deleteLangPack(code: string): Promise<void> {
+  const d = await get();
+  if (d) await d.delete('langpacks', code);
+  else mem.langpacks.delete(code);
 }
 
 // ------------------------------------------------------------------ folders
@@ -326,7 +357,7 @@ export async function estimateAudioBytes(): Promise<number> {
 // ------------------------------------------------------------------ full wipe (backup restore)
 const STORE_NAMES: (keyof typeof mem)[] = [
   'meta', 'folders', 'notebooks', 'pages', 'pagedocs', 'thumbs',
-  'images', 'audio', 'recordings', 'tags', 'quarantined',
+  'images', 'audio', 'recordings', 'tags', 'quarantined', 'tabs', 'pdftext', 'langpacks',
 ];
 
 export async function wipeAllData() {

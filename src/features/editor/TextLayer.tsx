@@ -1,61 +1,39 @@
 'use client';
 // TextLayer — the selectable text overlay for imported PDFs.
 //
-// When the "Select text" tool is active, a DOM mirror of the world viewport
+// ARCHITECTURE (v2 — app-owned selection): a DOM mirror of the world viewport
 // renders one transparent <span> per extracted PDF text item (pdf.js items
 // mapped to ink-space by lib/nanote/pdftext), exactly on top of the rendered
-// page background. The native browser selection then works on real text;
-// a floating toolbar offers Highlight / Underline / Translate / Copy on the
-// current selection, converting its client rects into page-space ink
-// elements (one undoable action per page).
+// page background. The spans NEVER take pointer events and NEVER produce a
+// native DOM selection — InkSurface feeds gesture carets into ./textsel
+// (caretRangeFromPoint + word segmentation), which owns the selection state.
+// We render the selection rects + a floating toolbar (Highlight / Underline /
+// Translate / Copy) from that state. Because no native selection ever exists,
+// the browser/WebView can never paint ITS selection handles or the Google
+// "Copy / Search" bubble on top of ours.
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Copy, Highlighter, Languages, Loader2, Underline, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { useApp, useT } from '@/lib/nanote/store';
-import { PdfTextItem, ShapeEl } from '@/lib/nanote/types';
+import { ShapeEl } from '@/lib/nanote/types';
 import { uid } from '@/lib/nanote/util';
 import { ensurePdfText } from '@/lib/nanote/pdftext';
-import { offlineTranslate } from '@/lib/nanote/offlineTranslate';
+import { translateOffline } from '@/lib/nanote/offlineTranslate';
+import { googleTranslateUrl } from '@/lib/nanote/translate';
 import { cn } from '@/lib/utils';
-import { getVp, getViewportSize, pageAtWorldY, useVp, type PageLayout } from './viewport';
+import {
+  clearTextSel, setMirror, setSelLayouts, useTextSel, type SelRect,
+} from './textsel';
+import { getViewportSize, useVp, type PageLayout } from './viewport';
 
 const MAX_SPANS_PER_PAGE = 1200; // pathological pages (pure glyph soup) render no layer
 
 // ---------------------------------------------------------------- types
-interface SelRect { x: number; y: number; w: number; h: number } // page-space ink coords
-interface PageRects { pageId: string; rects: SelRect[] }
-interface SelState {
-  top: number;     // world-space top edge of the selection (toolbar anchor)
-  bottom: number;  // world-space bottom edge
-  cx: number;      // world-space horizontal center
-  byPage: PageRects[];
-  text: string;
-}
-interface TranslateState { status: 'loading' | 'ok'; text: string; offline?: boolean }
-
-// ---------------------------------------------------------------- rect merging
-/** Merge the selection's client rects into one band per text line
- * (Chrome emits one rect per span; same-line rects get unioned). */
-function mergeLineRects(rects: SelRect[]): SelRect[] {
-  const rs = rects.filter((r) => r.w > 0 && r.h > 0);
-  rs.sort((a, b) => a.y - b.y || a.x - b.x);
-  const lines: SelRect[] = [];
-  for (const r of rs) {
-    const line = lines.find((l) => r.y < l.y + l.h && l.y < r.y + r.h); // vertical overlap = same line
-    if (line) {
-      const x0 = Math.min(line.x, r.x), x1 = Math.max(line.x + line.w, r.x + r.w);
-      const y0 = Math.min(line.y, r.y), y1 = Math.max(line.y + line.h, r.y + r.h);
-      line.x = x0; line.w = x1 - x0; line.y = y0; line.h = y1 - y0;
-    } else {
-      lines.push({ ...r });
-    }
-  }
-  return lines;
-}
+interface TranslateState { status: 'loading' | 'ok'; text: string; offline?: 'builtin' | 'pack' | 'pack-pivot' }
 
 // ---------------------------------------------------------------- page subcomponent (memoized: vp changes never re-render spans)
 const PageText = memo(function PageText({ pageId, layoutY, pageH, pageW, items }: {
-  pageId: string; layoutY: number; pageH: number; pageW: number; items: PdfTextItem[];
+  pageId: string; layoutY: number; pageH: number; pageW: number; items: import('@/lib/nanote/types').PdfTextItem[];
 }) {
   return (
     <div data-pagetext={pageId} style={{ position: 'absolute', left: 0, top: layoutY, width: pageW, height: pageH, pointerEvents: 'none' }}>
@@ -68,13 +46,44 @@ const PageText = memo(function PageText({ pageId, layoutY, pageH, pageW, items }
             left: it.x, top: it.y, width: it.w, height: it.h,
             fontSize: `${it.h}px`, lineHeight: `${it.h}px`,
             whiteSpace: 'pre', color: 'transparent',
-            userSelect: 'text', pointerEvents: 'auto', cursor: 'text',
+            // never selectable, never hit by pointer events — caret hit-testing
+            // (caretRangeFromPoint) still finds these nodes, which is exactly
+            // what the app-owned selection engine needs.
+            userSelect: 'none', WebkitUserSelect: 'none', pointerEvents: 'none',
           }}
         >
           {it.str}
         </span>
       ))}
     </div>
+  );
+});
+
+// ---------------------------------------------------------------- selection rect renderer (world-space → transforms with pan/zoom)
+const SelRects = memo(function SelRects({ byPage, layouts }: {
+  byPage: { pageId: string; rects: SelRect[] }[]; layouts: PageLayout[];
+}) {
+  return (
+    <>
+      {byPage.map(({ pageId, rects }) => {
+        const layout = layouts.find((l) => l.id === pageId);
+        if (!layout) return null;
+        return rects.map((r, i) => (
+          <div
+            key={`${pageId}-${i}`}
+            aria-hidden
+            style={{
+              position: 'absolute',
+              left: r.x, top: layout.y + r.y, width: r.w, height: r.h,
+              background: 'rgba(30,111,242,0.28)',
+              borderRadius: 2,
+              mixBlendMode: 'multiply',
+              pointerEvents: 'none',
+            }}
+          />
+        ));
+      })}
+    </>
   );
 });
 
@@ -85,31 +94,37 @@ export function TextLayer({ layouts, pageW, notebookId }: {
   const { t } = useT();
   const vp = useVp();
   const tool = useApp((s) => s.editor.tool);
+  const translateEngine = useApp((s) => s.settings.translateEngine);
   const notebook = useApp((s) => s.notebooks.find((n) => n.id === notebookId));
   const pages = useApp((s) => s.editor.pages);
-  const active = tool === 'textselect';
+  const active = !!notebook?.pdfOriginalId; // the mirror is always live for PDF notebooks
 
   const outerRef = useRef<HTMLDivElement>(null);
   const mirrorRef = useRef<HTMLDivElement>(null);
   const tbRef = useRef<HTMLDivElement>(null);
   const popRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const vpRef = useRef(vp); vpRef.current = vp;
 
-  const [items, setItems] = useState<Record<string, PdfTextItem[] | null>>({});
+  const [items, setItems] = useState<Record<string, import('@/lib/nanote/types').PdfTextItem[] | null>>({});
   const loadingRef = useRef(new Set<string>());
-  const [sel, setSel] = useState<SelState | null>(null);
   const [translate, setTranslate] = useState<TranslateState | null>(null);
 
-  const layoutsRef = useRef(layouts); layoutsRef.current = layouts;
-  const pagesRef = useRef(pages); pagesRef.current = pages;
-  const itemsRef = useRef(items); itemsRef.current = items;
   const translateRef = useRef(translate); translateRef.current = translate;
-  const lastTextRef = useRef<string | null>(null);
   const unavailableWarnedRef = useRef(false);
   const hintShownRef = useRef(false);
+  const sel = useTextSel();
 
   const worldH = useMemo(() => layouts.reduce((acc, l) => Math.max(acc, l.y + l.h), 0), [layouts]);
   const pdfPages = useMemo(() => pages.filter((p) => p.backgroundImageId != null), [pages]);
+
+  // register the mirror + layouts with the selection engine
+  useEffect(() => {
+    setMirror(mirrorRef.current);
+    setSelLayouts(layouts);
+    return () => { setMirror(null) };
+  }, [active, layouts, notebook?.pdfOriginalId]);
+  useEffect(() => { setSelLayouts(layouts) }, [layouts]);
 
   // visible PDF pages (one page of margin each side, like the editor culling)
   const visiblePdfIds = useMemo(() => {
@@ -124,7 +139,7 @@ export function TextLayer({ layouts, pageW, notebookId }: {
     return set;
   }, [active, layouts, vp.ty, vp.scale]);
 
-  // -------------------------------------------------- lazy text extraction for visible pages
+  // -------------------------------------------------- lazy text extraction for visible pages (always on for PDFs)
   useEffect(() => {
     if (!active || !notebook) return;
     const nb = notebook;
@@ -141,13 +156,13 @@ export function TextLayer({ layouts, pageW, notebookId }: {
 
   // -------------------------------------------------- one-time hint when the tool activates on a PDF
   useEffect(() => {
-    if (!active || !notebook?.pdfOriginalId) return;
+    if (tool !== 'textselect' || !notebook?.pdfOriginalId) return;
     if (hintShownRef.current) return;
     hintShownRef.current = true;
     toast.info(t('pdftext.selectHint'));
-  }, [active, notebook, t]);
+  }, [tool, notebook, t]);
 
-  // -------------------------------------------------- selection bookkeeping
+  // -------------------------------------------------- bookkeeping
   const closeTranslate = useCallback(() => {
     abortRef.current?.abort();
     abortRef.current = null;
@@ -155,89 +170,43 @@ export function TextLayer({ layouts, pageW, notebookId }: {
   }, []);
 
   const clearSelectionUi = useCallback(() => {
-    lastTextRef.current = null;
-    setSel(null);
+    clearTextSel();
     closeTranslate();
   }, [closeTranslate]);
 
-  const evaluate = useCallback(() => {
-    const mirror = mirrorRef.current;
-    const pop = popRef.current;
-    const selection = window.getSelection();
-    if (!mirror || !selection || selection.rangeCount === 0) return;
-    // the user is (de)selecting text INSIDE the translation card — never dismiss it
-    if (pop && selection.anchorNode && pop.contains(selection.anchorNode)) return;
-
-    const ours = !selection.isCollapsed
-      && !!selection.anchorNode && mirror.contains(selection.anchorNode)
-      && !!selection.focusNode && mirror.contains(selection.focusNode);
-    if (!ours) { clearSelectionUi(); return }
-
-    const text = selection.toString();
-    if (!text.trim()) { clearSelectionUi(); return }
-
-    const range = selection.getRangeAt(0);
-    const merged = mergeLineRects(Array.from(range.getClientRects(), (r) => ({ x: r.x, y: r.y, w: r.width, h: r.height })));
-    if (!merged.length) { clearSelectionUi(); return }
-
-    // the mirror carries the same transform as the world container, so
-    // (client - mirrorRect) / scale lands directly in world coordinates
-    const mirrorRect = mirror.getBoundingClientRect();
-    const { scale } = getVp();
-    const ls = layoutsRef.current;
-    let top = Infinity, bottom = -Infinity, cxSum = 0, any = false;
-    const byPage = new Map<string, PageRects>();
-    for (const r of merged) {
-      const wx = (r.x - mirrorRect.x) / scale;
-      const wy = (r.y - mirrorRect.y) / scale;
-      const ww = r.w / scale, wh = r.h / scale;
-      top = Math.min(top, wy);
-      bottom = Math.max(bottom, wy + wh);
-      cxSum += wx + ww / 2;
-      const layout = pageAtWorldY(ls, wy + wh / 2);
-      if (!layout) continue; // gap between pages
-      any = true;
-      let entry = byPage.get(layout.id);
-      if (!entry) { entry = { pageId: layout.id, rects: [] }; byPage.set(layout.id, entry) }
-      entry.rects.push({ x: wx, y: wy - layout.y, w: ww, h: wh });
-    }
-    if (!any) { clearSelectionUi(); return }
-
-    // a fresh selection supersedes an open translation card
-    if (translateRef.current && lastTextRef.current !== text) closeTranslate();
-    lastTextRef.current = text;
-
-    const next: SelState = { top, bottom, cx: cxSum / merged.length, byPage: [...byPage.values()], text };
-    setSel((prev) => (prev && prev.text === next.text && prev.top === next.top && prev.bottom === next.bottom && prev.cx === next.cx ? prev : next));
-  }, [clearSelectionUi, closeTranslate]);
-
+  // a fresh selection (different text) supersedes an open translation card
+  const lastSelTextRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!active) return;
-    const onSel = () => evaluate();
-    const onUp = () => evaluate();
-    document.addEventListener('selectionchange', onSel);
-    document.addEventListener('pointerup', onUp);
-    return () => {
-      document.removeEventListener('selectionchange', onSel);
-      document.removeEventListener('pointerup', onUp);
-    };
-  }, [active, evaluate]);
+    if (!sel) { lastSelTextRef.current = null; return }
+    if (lastSelTextRef.current !== null && sel.text !== lastSelTextRef.current) closeTranslate();
+    lastSelTextRef.current = sel.text;
+  }, [sel, closeTranslate]);
 
-  // leaving the tool dismisses everything
+  // Escape dismisses the selection; editor close (unmount) clears everything
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') clearSelectionUi();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      abortRef.current?.abort();
+      abortRef.current = null;
+      clearTextSel();
+    };
+  }, [clearSelectionUi]);
+
+  // leaving a PDF notebook clears the selection
   useEffect(() => {
     if (!active) clearSelectionUi();
   }, [active, clearSelectionUi]);
 
-  // abort any in-flight translation when the editor closes
-  useEffect(() => () => { abortRef.current?.abort(); abortRef.current = null }, []);
-
-  // -------------------------------------------------- "no selectable text" notice (once per session)
-  // Fires on capture-phase pointerdowns that land on a rendered PDF page
-  // whose text layer can never yield text (no stored original / empty page).
+  // -------------------------------------------------- "no selectable text" notice (once per session, explicit tool only)
   useEffect(() => {
-    if (!active || !notebook) return;
+    if (tool !== 'textselect' || !notebook) return;
     const parent = outerRef.current?.parentElement;
     if (!parent) return;
+    const pagesRef = useApp.getState().editor.pages;
     const onDown = (e: PointerEvent) => {
       if (unavailableWarnedRef.current) return;
       const target = e.target as Node | null;
@@ -245,13 +214,14 @@ export function TextLayer({ layouts, pageW, notebookId }: {
       const outer = outerRef.current;
       if (!outer) return;
       const rect = outer.getBoundingClientRect();
-      const { scale, tx, ty } = getVp();
+      const st = useApp.getState();
+      const { scale, tx, ty } = vpRef.current;
       const wy = (e.clientY - rect.top - ty) / scale;
-      const layout = pageAtWorldY(layoutsRef.current, wy);
+      const layout = layouts.find((l) => l.y <= wy && l.y + l.h >= wy);
       if (!layout) return;
-      const page = pagesRef.current.find((p) => p.id === layout.id);
+      const page = pagesRef.find((p) => p.id === layout.id);
       if (!page?.backgroundImageId) return; // plain ink pages: nothing to select
-      const its = itemsRef.current[page.id];
+      const its = items[page.id];
       const empty = its !== undefined && (its === null || its.length === 0);
       if (notebook.pdfOriginalId == null || empty) {
         unavailableWarnedRef.current = true;
@@ -260,7 +230,7 @@ export function TextLayer({ layouts, pageW, notebookId }: {
     };
     parent.addEventListener('pointerdown', onDown, true);
     return () => parent.removeEventListener('pointerdown', onDown, true);
-  }, [active, notebook, t]);
+  }, [tool, notebook, t, items, layouts]);
 
   // -------------------------------------------------- actions
   const doShapeAction = useCallback((kind: 'highlight' | 'underline') => {
@@ -290,17 +260,29 @@ export function TextLayer({ layouts, pageW, notebookId }: {
         useApp.getState().addElements(pageId, els); // ONE undoable action per page
       }
     })();
-    window.getSelection()?.removeAllRanges();
     clearSelectionUi();
   }, [sel, clearSelectionUi]);
 
   const doTranslate = useCallback(() => {
     if (!sel) return;
+    const st = useApp.getState();
+    const target = st.settings.translateTarget === 'auto'
+      ? (st.settings.lang === 'ar' ? 'ar' : 'en')
+      : st.settings.translateTarget;
+
+    // ---- Google engine: pop up the Google Translate window with the text
+    if (st.settings.translateEngine === 'google') {
+      const url = googleTranslateUrl(sel.text, target);
+      const win = window.open(url, '_blank', 'noopener,noreferrer');
+      if (!win) toast.error(t('pdftext.translate.popupBlocked'));
+      return;
+    }
+
+    // ---- Nanote engine: online LLM first, offline pack fallback second
     abortRef.current?.abort();
     const ac = new AbortController();
     abortRef.current = ac;
     setTranslate({ status: 'loading', text: '' });
-    const target = useApp.getState().settings.lang === 'ar' ? 'ar' : 'en';
     // hard timeout — a hung request (e.g. captive network) must not freeze the card
     const timer = setTimeout(() => {
       if (abortRef.current === ac) ac.abort();
@@ -319,15 +301,14 @@ export function TextLayer({ layouts, pageW, notebookId }: {
         clearTimeout(timer);
         setTranslate({ status: 'ok', text: j.translation });
       })
-      .catch((e) => {
+      .catch(async (e) => {
         clearTimeout(timer);
         if (abortRef.current !== ac) return; // user cancelled / new request
-        console.warn('[nanote] translate api failed — offline fallback', e);
-        // offline engine — the APK has no server at all (static export), and the
-        // browser may be offline; rough dictionary translation beats an error.
-        const off = offlineTranslate(sel.text, target);
+        console.warn('[nanote] translate api failed — offline pack fallback', e);
+        // downloaded language packs (Settings → Languages) + built-in AR↔EN
+        const off = await translateOffline(sel.text, target);
         if (off) {
-          setTranslate({ status: 'ok', text: off.translation, offline: true });
+          setTranslate({ status: 'ok', text: off.translation, offline: off.via === 'builtin' ? 'builtin' : off.via });
         } else {
           setTranslate(null);
           toast.error(t('pdftext.translate.error'));
@@ -367,7 +348,7 @@ export function TextLayer({ layouts, pageW, notebookId }: {
     const w = tb.offsetWidth, h = tb.offsetHeight;
     const cxScreen = sel.cx * vp.scale + vp.tx;
     let left = Math.max(8, Math.min(ow - w - 8, cxScreen - w / 2));
-    let top = sel.top * vp.scale + vp.ty - h - 8;      // above the selection
+    let top = sel.top * vp.scale + vp.ty - h - 8;       // above the selection
     if (top < 8) top = sel.bottom * vp.scale + vp.ty + 8; // not enough room → below
     top = Math.max(8, Math.min(oh - h - 8, top));
     tb.style.left = `${Math.round(left)}px`;
@@ -383,8 +364,8 @@ export function TextLayer({ layouts, pageW, notebookId }: {
     const pw = pop.offsetWidth, ph = pop.offsetHeight;
     let left = tb.offsetLeft + tb.offsetWidth / 2 - pw / 2;
     left = Math.max(8, Math.min(ow - pw - 8, left));
-    let top = tb.offsetTop - ph - 8;                       // above the toolbar
-    if (top < 8) top = tb.offsetTop + tb.offsetHeight + 8; // → below it
+    let top = tb.offsetTop - ph - 8;                        // above the toolbar
+    if (top < 8) top = tb.offsetTop + tb.offsetHeight + 8;  // → below it
     top = Math.max(8, Math.min(oh - ph - 8, top));
     pop.style.left = `${Math.round(left)}px`;
     pop.style.top = `${Math.round(top)}px`;
@@ -393,9 +374,7 @@ export function TextLayer({ layouts, pageW, notebookId }: {
   // -------------------------------------------------- render
   return (
     <div ref={outerRef} className="absolute inset-0 z-[15]" style={{ pointerEvents: 'none' }}>
-      <style>{`.nanote-textlayer span::selection { background: rgba(30,111,242,0.30); }`}</style>
-
-      {active && notebook?.pdfOriginalId && (
+      {active && (
         <div
           ref={mirrorRef}
           aria-hidden
@@ -405,7 +384,7 @@ export function TextLayer({ layouts, pageW, notebookId }: {
             width: pageW, height: worldH,
             transform: `translate(${vp.tx}px, ${vp.ty}px) scale(${vp.scale})`,
             transformOrigin: '0 0',
-            pointerEvents: 'none', // only the spans themselves receive events
+            pointerEvents: 'none', // the whole mirror is transparent to input
           }}
         >
           {pdfPages.map((p) => {
@@ -418,6 +397,7 @@ export function TextLayer({ layouts, pageW, notebookId }: {
               <PageText key={p.id} pageId={p.id} layoutY={layout.y} pageH={p.height} pageW={pageW} items={its} />
             );
           })}
+          {sel && <SelRects byPage={sel.byPage} layouts={layouts} />}
         </div>
       )}
 
@@ -441,7 +421,7 @@ export function TextLayer({ layouts, pageW, notebookId }: {
           />
           <ToolBtn
             icon={<Languages className="h-4 w-4" />}
-            label={t('pdftext.translate')}
+            label={translateEngine === 'google' ? t('pdftext.translate.google') : t('pdftext.translate')}
             active={!!translate}
             onClick={doTranslate}
           />
@@ -467,7 +447,9 @@ export function TextLayer({ layouts, pageW, notebookId }: {
             <span className="text-xs font-semibold text-muted-foreground">{t('pdftext.translated')}</span>
             {translate.offline && (
               <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
-                {t('pdftext.translate.offline')}
+                {translate.offline === 'builtin'
+                  ? t('pdftext.translate.offline')
+                  : t('pdftext.translate.offlinePack', 'Offline pack', 'حزمة بدون اتصال')}
               </span>
             )}
             <button
@@ -490,7 +472,7 @@ export function TextLayer({ layouts, pageW, notebookId }: {
               <p
                 dir="auto"
                 className="nanote-scroll max-h-48 overflow-y-auto whitespace-pre-wrap text-sm leading-relaxed"
-                style={{ userSelect: 'text' }}
+                style={{ userSelect: 'none', WebkitUserSelect: 'none' }}
               >
                 {translate.text}
               </p>
@@ -522,7 +504,6 @@ function ToolBtn({ icon, label, onClick, active }: {
       type="button"
       aria-label={label}
       title={label}
-      // never let the click steal focus/collapse the DOM text selection
       onMouseDown={(e) => e.preventDefault()}
       onClick={onClick}
       className={cn(

@@ -103,6 +103,9 @@ export interface RecordingRow {
 export interface TagRow { id: string; name: string; colorHex: string }
 
 // ---------------------------------------------------------------- settings
+export type TranslateEngine = 'nanote' | 'google';
+export type LaserMode = 'normal' | 'timed';
+
 export interface Settings {
   theme: ThemeMode;
   lang: Lang;
@@ -117,6 +120,14 @@ export interface Settings {
   onboarded: boolean;
   favoriteColors: string[];   // up to 5 saved slots
   includeAudioInBackup: boolean;
+  // ----- translation platform (independent app platform: online engines +
+  // downloaded offline language packs from the in-app language library)
+  translateEngine: TranslateEngine; // which engine the Translate button uses
+  translateTarget: string;    // 'auto' (UI language) | ISO code ('ar','en','fr',…)
+  // ----- laser pointer (Notewise-style): normal fades ~1s; timed strokes
+  // linger and all fade together N seconds after writing stops
+  laserMode: LaserMode;
+  laserFadeSec: number;        // 1..10 seconds (timed mode)
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -135,7 +146,41 @@ export const DEFAULT_SETTINGS: Settings = {
   onboarded: false,
   favoriteColors: ['#1E6FF2', '#16233A', '#E5484D', '#22A06B', '#FF9F1C'],
   includeAudioInBackup: true,
+  translateEngine: 'nanote',
+  translateTarget: 'auto',
+  laserMode: 'normal',
+  laserFadeSec: 3,
 };
+
+// ---------------------------------------------------------------- offline language packs
+/** A downloaded language pack (from Settings → Languages). English-keyed so
+ *  any pair can translate through the English pivot; the built-in AR↔EN
+ *  dictionary ships in the binary and needs no download. */
+export interface LangPackMeta {
+  code: string;        // ISO 639-1 ('fr', 'de', …)
+  name: string;        // English name
+  nativeName: string;  // endonym shown in the library
+  rtl: boolean;
+}
+export interface LangPack extends LangPackMeta {
+  entries: Record<string, string>;   // english word (lowercase) → pack-language word
+  phrases: Record<string, string>;   // english phrase → pack-language phrase
+  wordCount: number;                 // entries + phrases count
+  builtAt: number;
+}
+
+/** Languages offered in the Settings language library. 'ar' is special: the
+ *  AR↔EN dictionary is BUILT-IN (marked ready out of the box). */
+export const LANG_LIBRARY: LangPackMeta[] = [
+  { code: 'ar', name: 'Arabic', nativeName: 'العربية', rtl: true },
+  { code: 'fr', name: 'French', nativeName: 'Français', rtl: false },
+  { code: 'de', name: 'German', nativeName: 'Deutsch', rtl: false },
+  { code: 'es', name: 'Spanish', nativeName: 'Español', rtl: false },
+  { code: 'tr', name: 'Turkish', nativeName: 'Türkçe', rtl: false },
+  { code: 'ru', name: 'Russian', nativeName: 'Русский', rtl: false },
+  { code: 'fa', name: 'Persian', nativeName: 'فارسی', rtl: true },
+  { code: 'ur', name: 'Urdu', nativeName: 'اردو', rtl: true },
+];
 
 // ---------------------------------------------------------------- page document (ink codec payload)
 export interface InkPoint { x: number; y: number; p: number; t: number } // t = ms since stroke start
