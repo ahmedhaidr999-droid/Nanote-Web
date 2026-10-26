@@ -38,6 +38,7 @@ import { computeOutline, OP } from '@/lib/nanote/outline';
 import { drawImageEl, hiAlphaOf } from '@/lib/nanote/render';
 import { resolveImage, imageNatural } from '@/lib/nanote/images';
 import { recognizeShape, type RecognizedShape } from '@/lib/nanote/shapedetect';
+import { observePenEvent } from '@/lib/nanote/penengine';
 import {
   elementInLasso, strokeIntersectsCircle, elementIntersectsCircle,
   snapAngle, shapePath, pointInImage, transformElement,
@@ -266,6 +267,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
   const penLastUpRef = useRef(0);        // last pen pointerup — palm-rejection linger anchor
   const penHoverCapableRef = useRef(false); // stylus reports hover events (Apple Pencil 2 / S Pen / Surface)
   const momentaryToolRef = useRef<EditorTool | null>(null); // tool restored after hold-to-erase
+  const penBtnRef = useRef(0); // last observed stylus button mask (edge-triggered hardware buttons)
   const pendingTapRef = useRef<{ m: Extract<Mode, { type: 'stroke' }>; timer: ReturnType<typeof setTimeout>; x: number; y: number; t: number } | null>(null);
   const twoTapRef = useRef<{ t0: number; moved: boolean; fired: boolean } | null>(null);
   const touchCountRef = useRef(0);       // tracked touches currently down
@@ -569,9 +571,17 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     if (!page) return;
     const doc = await st.ensureDoc(m.pageId);
     const z = doc.elements.reduce((acc, e) => Math.max(acc, e.z), 0) + 1;
+    // REAL timestamps: the committed stroke re-renders through withSpeed()
+    // with the exact speed profile it was drawn with — the old fabricated
+    // `t: i * 16` broke brush velocity-thinning and pressure taping so a
+    // reloaded page never matched what the user actually drew.
+    const ts0 = m.points[0]?.ts;
     const pts = m.points.length === 1
       ? [{ ...m.points[0], t: 16 }]
-      : m.points.map((p, i) => ({ x: p.x, y: p.y, p: p.p, t: i * 16 }));
+      : m.points.map((p, i) => ({
+          x: p.x, y: p.y, p: p.p,
+          t: ts0 != null && p.ts != null ? Math.max(1, Math.round(p.ts - ts0)) : i * 16,
+        }));
     const el: StrokeEl = {
       kind: 'stroke', id: uid(), tool: m.tool, color: m.color, width: m.width, points: pts, z,
     };
@@ -669,6 +679,45 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
           return;
         case 'pen': st.setTool(st.editor.lastPen); return;
       }
+    };
+
+    /** restore the tool that a held hardware button momentary-activated */
+    const restoreMomentaryTool = () => {
+      const restore = momentaryToolRef.current;
+      if (!restore) return;
+      momentaryToolRef.current = null;
+      useApp.getState().setTool(restore);
+    };
+
+    /**
+     * Stylus hardware-button router — EDGE-TRIGGERED so every press fires its
+     * configured shortcut exactly once, no matter how the pen reports it:
+     *   • pressed while HOVERING (S Pen / Wacom EMR surface the side button on
+     *     pointermove with pressure 0 — there is never a pointerdown),
+     *   • pressed at tip contact (button bits on pointerdown),
+     *   • pressed mid-stroke (bits appear on the live pointermove stream),
+     *   • the dedicated ERASER end/button (bit 32 — Surface / MPP pens).
+     * Releasing a momentary button (hold-to-erase) restores the previous tool.
+     * The pen engine samples every event, so the Pen & input settings can
+     * show which buttons this physical pen actually has.
+     */
+    const penButtonEdge = (e: PointerEvent) => {
+      const prev = penBtnRef.current;
+      const cur = e.buttons & (1 | 2 | 4 | 32); // tip + barrel + second + eraser
+      if (cur === prev) return;
+      penBtnRef.current = cur;
+      const prefs = useApp.getState().settings.penShortcuts;
+      const bit = (b: number) => ({
+        pressed: (cur & b) !== 0 && (prev & b) === 0,
+        released: (cur & b) === 0 && (prev & b) !== 0,
+      });
+      const er = bit(32), b1 = bit(2), b2 = bit(4);
+      if (er.pressed) { if (prefs.eraser && prefs.eraser !== 'none') applyPenAction(prefs.eraser); return }
+      if (er.released) { restoreMomentaryTool(); return }
+      if (b1.pressed) { if (prefs.barrel !== 'none') applyPenAction(prefs.barrel); return }
+      if (b1.released) { restoreMomentaryTool(); return }
+      if (b2.pressed) { if (prefs.barrel2 !== 'none') applyPenAction(prefs.barrel2); return }
+      if (b2.released) { restoreMomentaryTool(); return }
     };
 
     // ================================================ app-owned text selection
@@ -894,7 +943,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       m.pSmooth = m.pSmooth + (p - m.pSmooth) * 0.6; // light pressure smoothing for steppy sensors
       if (m.straight) {
         const first = m.points[0];
-        m.points = [first, { x: px, y: py, p: m.pSmooth, v: 0.4 }];
+        m.points = [first, { x: px, y: py, p: m.pSmooth, v: 0.4, ts: ev.timeStamp }];
         m.lastTs = ev.timeStamp;
         m.lastAbs = performance.now();
         m.lastMoveAbs = performance.now();
@@ -908,7 +957,9 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         m.lockedShape = null;
       }
       if (d >= m.minDist) {
-        m.points.push({ x: px, y: py, p: m.pSmooth, v: clamp(d / dt, 0, 5) });
+        // ts carries the REAL event timestamp so the committed stroke keeps
+        // its true speed profile (brush velocity thinning survives save+reload)
+        m.points.push({ x: px, y: py, p: m.pSmooth, v: clamp(d / dt, 0, 5), ts: ev.timeStamp });
         m.lastTs = ev.timeStamp;
         m.lastAbs = performance.now();
         m.lastMoveAbs = performance.now();
@@ -960,21 +1011,20 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       if (e.pointerType === 'pen') {
         penSeenRef.current = performance.now();
         penDownRef.current = true; // pen contact
+        // feed the pen engine (identification + capabilities for Settings) and
+        // route hardware buttons — hover presses already fired on pointermove;
+        // a press that begins exactly at tip contact fires here
+        observePenEvent(e);
+        penButtonEdge(e);
       }
 
       // ---- palm rejection gate (touches only; pens & mice always pass)
       if (e.pointerType === 'touch' && rejectTouch(e)) return;
 
-      // ---- stylus hardware buttons (barrel / barrel2) → configured shortcut.
-      // Wacom EMR, S Pen, Surface Slim and USI pens report held side buttons
-      // in pointer `buttons` (bit 2 = primary, bit 4 = secondary).
+      // ---- pen double-tap (second half): a pending first tap exists and this
+      // press lands at the same spot quickly → drop the pending dot and run
+      // the configured action instead of drawing a second dot.
       if (e.pointerType === 'pen') {
-        const prefs = useApp.getState().settings.penShortcuts;
-        const bAct = (e.buttons & 2) ? prefs.barrel : (e.buttons & 4) ? prefs.barrel2 : null;
-        if (bAct && bAct !== 'none') applyPenAction(bAct);
-        // pen double-tap (second half): a pending first tap exists and this
-        // press lands at the same spot quickly → drop the pending dot and run
-        // the configured action instead of drawing a second dot.
         const pt = pendingTapRef.current;
         if (
           pt &&
@@ -1221,7 +1271,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         points: [{
           x: snapped ? snapped.x : pagePt.x,
           y: snapped ? snapped.y - page.y : pagePt.y,
-          p: p0, v: 0.4,
+          p: p0, v: 0.4, ts: e.timeStamp,
         }],
         tool: tool as ToolId, color: ts.color, width: ts.width,
         startAbs: performance.now(), lastAbs: performance.now(), lastTs: e.timeStamp,
@@ -1240,6 +1290,10 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         // display, touches stay rejected — the moment it leaves range the
         // finger works again (Samsung Notes-style instant palm rejection)
         if ((e.buttons & 1) === 0 && e.pressure === 0) penHoverCapableRef.current = true;
+        // pen engine: identify the pen + track capabilities; route hardware
+        // buttons pressed while hovering or mid-stroke (edge-triggered)
+        observePenEvent(e, coalescedOf(e).length);
+        penButtonEdge(e);
       }
       const rect = host.getBoundingClientRect();
       const l = { x: e.clientX - rect.left, y: e.clientY - rect.top };
@@ -1452,11 +1506,12 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       if (e.pointerType === 'pen') {
         penDownRef.current = false;
         penLastUpRef.current = performance.now();
-        const restore = momentaryToolRef.current;
-        if (restore) {
-          momentaryToolRef.current = null;
-          st.setTool(restore);
-        }
+        observePenEvent(e);
+        penButtonEdge(e); // a button released exactly at lift restores here
+        restoreMomentaryTool();
+        // keep only bits that are still physically held after the lift so the
+        // next press can never be swallowed by a stale mask
+        penBtnRef.current = e.buttons & (2 | 4 | 32);
       }
 
       // two-finger tap (finger gesture): both touches released quickly and

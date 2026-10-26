@@ -572,7 +572,13 @@ export const useApp = create<AppState>((set, get) => ({
   },
 
   async updateNotebook(id, patch) {
-    const n = get().notebooks.find((x) => x.id === id);
+    // IMPORTANT: fall back to IndexedDB when the row is not in the in-memory
+    // list yet. PDF imports (and any future writer that goes straight to IDB)
+    // create notebooks the Zustand cache has never seen — without this
+    // fallback, moves/patches silently no-op'd and imported PDFs "fell out"
+    // of the tab/folder they were imported into.
+    let n = get().notebooks.find((x) => x.id === id);
+    if (!n) n = (await db.getNotebook(id)) ?? undefined;
     if (!n) return;
     const next = { ...n, ...patch, updatedAt: Date.now() };
     await db.putNotebook(next);
@@ -704,7 +710,9 @@ export const useApp = create<AppState>((set, get) => ({
 
   // ------------------------------------------------------------ editor session
   async openEditor(notebookId) {
-    const nb = get().notebooks.find((x) => x.id === notebookId);
+    // IDB fallback for notebooks created outside the in-memory cache (imports)
+    let nb = get().notebooks.find((x) => x.id === notebookId);
+    if (!nb) nb = (await db.getNotebook(notebookId)) ?? undefined;
     if (!nb) return;
     await db.putNotebook({ ...nb, lastOpenedAt: Date.now(), updatedAt: Date.now() });
     const pages = get().pages.filter((p) => p.notebookId === notebookId).sort((a, b) => a.pageIndex - b.pageIndex);
@@ -852,6 +860,12 @@ export const useApp = create<AppState>((set, get) => ({
     };
     if (undoable) get().pushCmd({ label: 'add', run: add, revert: remove }, [pageId]);
     else { add(); get().markDirty(pageId) }
+    // dev-only probe: lets E2E verification observe what was committed
+    // (element kinds, stroke timestamps…) without touching production builds
+    if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+      (window as unknown as { __nanoteProbe?: (info: { pageId: string; els: PageElement[] }) => void })
+        .__nanoteProbe?.({ pageId, els });
+    }
     // infinity paper: the sheet chases the content in ALL four directions —
     // strokes, text, shapes, images and pastes can all grow it (up/left pads,
     // right/down width/height). Covers every commit path in one place.
@@ -1103,7 +1117,8 @@ export const useApp = create<AppState>((set, get) => ({
   },
 
   async saveNotebookVp(notebookId, vp) {
-    const nb = get().notebooks.find((x) => x.id === notebookId);
+    let nb = get().notebooks.find((x) => x.id === notebookId);
+    if (!nb) nb = (await db.getNotebook(notebookId)) ?? undefined;
     if (!nb) return;
     await db.putNotebook({ ...nb, lastVp: vp });
     set({ notebooks: get().notebooks.map((n) => (n.id === notebookId ? { ...n, lastVp: vp } : n)) });

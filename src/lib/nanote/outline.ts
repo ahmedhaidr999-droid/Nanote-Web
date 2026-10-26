@@ -8,7 +8,7 @@
 import { ToolId } from './types';
 import { clamp } from './util';
 
-export interface OP { x: number; y: number; p: number; v: number } // v = speed px/ms at input
+export interface OP { x: number; y: number; p: number; v: number; ts?: number } // v = speed px/ms at input, ts = event timeStamp (ms) for exact commit
 
 export interface OutlineOpts {
   tool: ToolId;
@@ -25,7 +25,10 @@ function radiusFactor(tool: ToolId, p: number, gamma: number): number {
   switch (tool) {
     case 'fountain': return 0.22 + 0.78 * Math.pow(clamp(p, 0, 1), clamp(gamma, 0.3, 3));
     case 'ballpoint': return 0.52 + 0.48 * Math.pow(clamp(p, 0, 1), clamp(gamma, 0.3, 3));
-    case 'brush': return 0.30 + 0.70 * clamp(p, 0, 1);
+    // brush: full pressure-curve support + a wider dynamic range — light
+    // strokes go genuinely thin, hard presses fill out (the Settings pressure
+    // curve shapes it exactly like the other pens)
+    case 'brush': return 0.24 + 0.76 * Math.pow(clamp(p, 0, 1), clamp(gamma, 0.3, 3));
     case 'fineliner': return 0.86 + 0.14 * clamp(p, 0, 1);
     case 'highlighter': return 1;
     default: return 1;

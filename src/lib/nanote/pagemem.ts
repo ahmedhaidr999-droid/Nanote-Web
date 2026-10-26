@@ -33,3 +33,25 @@ export function clearSession(): void {
 export function recallSession(): string | null {
   try { return localStorage.getItem(SESSION_KEY) } catch { return null }
 }
+
+// ------------------------------------------------------------------ library place memory
+// The tab/folder the user was browsing in the library. Survives app restarts so
+// a note created inside a tab is found in that tab when the user comes back —
+// the library reopens exactly where the user left it.
+
+const NAV_KEY = 'nanote.lastNav';
+
+/** Remember the library browsing place (tab + folder). */
+export function rememberNav(tabId: string | null, folderId: string | null): void {
+  try { localStorage.setItem(NAV_KEY, JSON.stringify({ tabId, folderId })) } catch { /* ignore */ }
+}
+
+/** The last library browsing place, or nulls when never recorded. */
+export function recallNav(): { tabId: string | null; folderId: string | null } {
+  try {
+    const raw = localStorage.getItem(NAV_KEY);
+    if (!raw) return { tabId: null, folderId: null };
+    const v = JSON.parse(raw) as { tabId?: string | null; folderId?: string | null };
+    return { tabId: v.tabId ?? null, folderId: v.folderId ?? null };
+  } catch { return { tabId: null, folderId: null } }
+}

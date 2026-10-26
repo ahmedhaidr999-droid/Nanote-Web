@@ -185,6 +185,7 @@ export const deleteTabRow = (id: string) => del('tabs', id);
 // ------------------------------------------------------------------ notebooks
 export const listNotebooks = () => getAll<NotebookRow>('notebooks');
 export const putNotebook = (n: NotebookRow) => put('notebooks', n);
+export const getNotebook = (id: string) => getOne<NotebookRow>('notebooks', id);
 export const deleteNotebookRow = (id: string) => del('notebooks', id);
 
 // ------------------------------------------------------------------ pages

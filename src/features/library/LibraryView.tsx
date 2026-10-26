@@ -18,6 +18,7 @@ import {
   DropdownMenuRadioItem, DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { recallNav, rememberNav } from '@/lib/nanote/pagemem';
 import { useApp, useT } from '@/lib/nanote/store';
 import type { FolderRow, NotebookRow, TabRow, ThemeMode } from '@/lib/nanote/types';
 import { cn } from '@/lib/utils';
@@ -44,7 +45,9 @@ type SortId = 'recent' | 'title' | 'created';
 
 // Module-scope memory of the last tab/folder context so returning from the
 // editor (or settings) drops the user back where they were browsing.
-let lastNav: { tabId: string | null; folderId: string | null } = { tabId: null, folderId: null };
+// Seeded from localStorage (pagemem.recallNav) so the place ALSO survives a
+// full app restart — the user finds their notes exactly where they left them.
+let lastNav: { tabId: string | null; folderId: string | null } = recallNav();
 
 export default function LibraryView() {
   const { t, fmt, lang } = useT();
@@ -92,9 +95,11 @@ export default function LibraryView() {
   const effTab = effTabId ? tabById.get(effTabId) ?? null : null;
   const inTabView = headerTab === 'all' && effTab != null;
 
-  // remember the browsing context for back-navigation (external module memory)
+  // remember the browsing context for back-navigation (module memory) and
+  // persist it so the next app launch reopens this exact tab/folder
   useEffect(() => {
     lastNav = { tabId: effTabId, folderId: activeFolder?.id ?? null };
+    rememberNav(lastNav.tabId, lastNav.folderId);
   }, [effTabId, activeFolder]);
 
   const visibleFolders = useMemo(() => {

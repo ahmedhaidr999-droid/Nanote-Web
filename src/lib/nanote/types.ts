@@ -128,6 +128,7 @@ export interface PenShortcutPrefs {
   barrel: PenAction;    // primary side button held during contact (Wacom/S Pen/Surface/USI)
   barrel2: PenAction;   // secondary side button (3-button styluses)
   doubleTap: PenAction; // quick double-tap of the pen tip (works on every stylus)
+  eraser: PenAction;    // dedicated eraser end/button (Surface & MPP pens, bit 32)
 }
 export interface FingerGesturePrefs {
   doubleTap: FingerAction;    // one-finger double tap
@@ -137,6 +138,7 @@ export const PEN_SHORTCUTS_DEFAULT: PenShortcutPrefs = {
   barrel: 'eraserHold',
   barrel2: 'undo',
   doubleTap: 'eraserToggle',
+  eraser: 'eraserHold',
 };
 export const FINGER_GESTURES_DEFAULT: FingerGesturePrefs = {
   doubleTap: 'zoom',

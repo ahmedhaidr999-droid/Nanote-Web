@@ -38,7 +38,7 @@ export function FabMenu({ activeTabId, activeFolderId, onNewFolder }: FabMenuPro
     const tid = toast.loading(t('library.importPdf.doing', 'Importing PDF…', 'جارٍ استيراد PDF…'));
     try {
       // Dynamic import keeps pdf.js out of the library chunk.
-      // @ts-ignore -- module ships with the PDF stage; contract: importPdfAsNotebook(file, onProgress) → PdfImportResult.
+      // @ts-ignore -- module ships with the PDF stage; contract: importPdfAsNotebook(file, onProgress, ctx) → PdfImportResult.
       const mod = await import('@/lib/nanote/pdfimport');
       const res = await mod.importPdfAsNotebook(file, (done, total) => {
         toast.loading(
@@ -46,14 +46,14 @@ export function FabMenu({ activeTabId, activeFolderId, onNewFolder }: FabMenuPro
             .replace('{done}', String(done)).replace('{total}', String(total)),
           { id: tid },
         );
+      }, {
+        // the PDF is created directly inside the folder/tab the user is
+        // browsing — its location is written with the notebook itself, so it
+        // can never fall back to "All Notes" (the old post-import move raced
+        // with the in-memory cache and silently failed)
+        folderId: activeFolderId,
+        tabId: activeTabId,
       });
-      // The importer creates the notebook at the library root — carry it into
-      // the current context with a move (existing store actions).
-      if (activeFolderId) {
-        await useApp.getState().moveNotebook(res.notebookId, activeFolderId);
-      } else if (activeTabId) {
-        await useApp.getState().moveNotebookToTab(res.notebookId, activeTabId);
-      }
       await useApp.getState().refreshLibrary();
       if (res.capped) {
         toast.warning(t('library.pdfImport.capped', 'Imported the first 200 pages.', 'تم استيراد أول ٢٠٠ صفحة.'));

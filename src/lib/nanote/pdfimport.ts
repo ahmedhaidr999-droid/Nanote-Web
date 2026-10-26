@@ -48,6 +48,8 @@ async function renderPagePng(page: pdfjs.PDFPageProxy, maxW: number): Promise<{ 
 export async function importPdfAsNotebook(
   file: File,
   onProgress?: (done: number, total: number) => void,
+  /** where the imported notebook should live (folder and/or tab) */
+  ctx?: { folderId?: string | null; tabId?: string | null },
 ): Promise<PdfImportResult> {
   if (file.size > MAX_FILE_BYTES) {
     const err = new Error('pdf-too-large') as Error & { name: string };
@@ -84,8 +86,10 @@ export async function importPdfAsNotebook(
 
   const notebook: NotebookRow = {
     id: uid(),
-    folderId: null,
-    tabId: null,
+    // the import lands directly in the tab/folder the user is browsing —
+    // no post-import move, so the location can never be lost again
+    folderId: ctx?.folderId ?? null,
+    tabId: ctx?.tabId ?? null,
     pdfOriginalId: originalImageId, // the untouched source file — powers the text layer
     title,
     coverId: 'paper-white',
