@@ -1,40 +1,34 @@
-// Nanote Pen Engine v2 — stylus identification + hardware-capability tracking.
+// Nanote Pen Engine v3 — stylus identification, capability tracking and the
+// hardware-button PATTERN state machine.
 //
-// Every pen PointerEvent the editor receives is fed to observePenEvent().
-// The engine accumulates evidence (pressure behaviour, tilt, in-range hover,
-// hardware button bits, coalesced-sample rate) and classifies the pen into a
-// family, exposing:
-//   • a human-readable label — resolved against the PEN_MODELS registry
-//     (Apple Pencil, Samsung S Pen / Wacom EMR, USI, MPP/Surface, and the
-//     Android-vendor pens: Xiaomi Smart Pen, Huawei M-Pencil, Honor Magic
-//     Pencil, OnePlus Stylo, OPPO Pen, vivo Pencil, realme Pen, Lenovo…) with
-//     optional manual override ("Pen & input" sheet → Pen model);
-//   • live capability flags — which hardware inputs actually exist on THIS
-//     pen (barrel button, second button, eraser end, pressure, tilt, hover,
-//     report rate) — so the Pen & input settings can coordinate the shortcut
-//     mapping with the pen the user is actually holding;
-//   • ADAPTIVE PRESSURE CALIBRATION — many digitizers report pressure in a
-//     compressed band (a Huawei M-Pencil might never leave 0.18–0.72; some
-//     USI pens floor at 0.12). The engine tracks the observed contact
-//     envelope and normalizePenPressure() remaps it to the full 0–1 range,
-//     so every pen's light/heavy stroke response is correct;
-//   • BARREL-BIT AUTO-MAPPING — vendors surface the side button on different
-//     PointerEvent.buttons bits (S Pen hover → bit 2, Surface/MPP barrel →
-//     bit 4, some Android pens → 8/16). The engine locks the FIRST bit the
-//     physical pen actually reports as the primary barrel and routes the
-//     shortcut accordingly, so "the pen button" works no matter which bit it
-//     arrives on.
+// Every pen PointerEvent the editor receives is fed to observePenEvent()
+// (down/move/up). The engine accumulates evidence and exposes:
+//   • a human-readable label resolved against the pen DATABASE (pendb.ts —
+//     25+ sourced models incl. Xiaomi Focus Pen Pro / Smart Pen, Samsung S Pen,
+//     Apple Pencil, Huawei M-Pencil, Honor Magic Pencil, Lenovo Tab/Precision
+//     pens, Surface/MPP, Wacom One, USI, OnePlus/OPPO/vivo/realme, generic
+//     active + capacitive) with manual override;
+//   • live capability flags (pressure / tilt / hover / report rate / buttons
+//     actually reported by THIS pen) — capability-based, never name-only;
+//   • ADAPTIVE PRESSURE CALIBRATION — compressed digitizer bands are remapped
+//     onto the full 0–1 range so light/heavy response is correct everywhere;
+//   • BARREL-BIT AUTO-MAPPING — the FIRST bit the pen actually reports locks
+//     as the primary barrel (S Pen hover → 2, MPP → 4, some pens → 8/16);
+//   • BUTTON PATTERNS — press / double press / long press per physical bit,
+//     each tagged with its CONTEXT (hover vs. writing) so bindings can
+//     differentiate "press while hovering" from "press while writing";
+//   • a live SAMPLE feed for the pen test pad (pressure/tilt/hover/buttons
+//     in real time — the Pen & input management UI subscribes to it).
 //
-// Why an engine: the browser only exposes raw PointerEvents. Different pen
-// families surface their hardware differently. Sampling and classifying those
-// signals once — instead of scattering heuristics through the input handlers —
-// lets the app "read" any pen and wire its real buttons to the user's
-// shortcuts.
+// Detection truthfulness: the browser cannot read USB/BLE vendor IDs. We
+// combine platform + report evidence + Android UA device markers, keep the UA
+// as a HINT only, and always allow the manual profile picker. When the model
+// cannot be pinned we fall back to the capability-based generic profile.
 //
-// Pure client-side, zero dependencies, safe on every platform (all access is
-// guarded; SSR/private-mode must never throw).
+// Pure client-side, zero dependencies, guarded for SSR/private mode.
 
 import { clamp } from './util';
+import { getPenSpecs, type StylusSpec } from './pendb';
 
 export type PenFamily =
   | 'apple-pencil'
@@ -45,65 +39,54 @@ export type PenFamily =
   | 'generic'    // active stylus, family unknown
   | 'none';
 
-// ---------------------------------------------------------------- pen model registry
-/**
- * Known stylus models. The browser cannot read USB/BLE vendor IDs, so
- * detection combines platform + report signals + Android UA device markers
- * (tablet models usually appear in the UA string) — and the user can always
- * pick their exact pen in Pen & input, which also tunes the shortcut hints.
- */
+// ---------------------------------------------------------------- pen model view
+/** compact capability view of a DB record — what the engine/UI reason about */
 export interface PenModel {
   id: string;
   vendor: string;
   name: string;
   nameAr: string;
-  protocol: 'emr' | 'usi' | 'mpp' | 'apple' | 'wgp' | 'vendor-bt';
+  protocol: StylusSpec['protocol'];
   buttons: number;        // physical barrel buttons (excluding tip & eraser end)
-  eraserEnd: boolean;     // dedicated eraser cap/end
-  pressureLevels: number; // 0 = none
+  eraserEnd: boolean;
+  pressureLevels: number; // 0 = none/unknown
   tilt: boolean;
   hover: boolean;
-  bodyDoubleTap: boolean; // double-tap gesture on the pen body (Bluetooth)
-  ua?: RegExp;            // Android UA device markers for auto-detection
+  bodyDoubleTap: boolean;
+  ua?: RegExp;
 }
 
-export const PEN_MODELS: PenModel[] = [
-  // ---- Apple
-  { id: 'apple-pencil-usb', vendor: 'Apple', name: 'Apple Pencil (USB‑C)', nameAr: 'آبل بنسل (USB‑C)', protocol: 'apple', buttons: 0, eraserEnd: false, pressureLevels: 0, tilt: false, hover: true, bodyDoubleTap: false },
-  { id: 'apple-pencil-1', vendor: 'Apple', name: 'Apple Pencil (1st gen)', nameAr: 'آبل بنسل (الجيل الأول)', protocol: 'apple', buttons: 0, eraserEnd: false, pressureLevels: 0, tilt: false, hover: false, bodyDoubleTap: false },
-  { id: 'apple-pencil-2', vendor: 'Apple', name: 'Apple Pencil (2nd gen)', nameAr: 'آبل بنسل (الجيل الثاني)', protocol: 'apple', buttons: 0, eraserEnd: false, pressureLevels: 0, tilt: true, hover: true, bodyDoubleTap: true },
-  // ---- Samsung
-  { id: 's-pen-tab', vendor: 'Samsung', name: 'S Pen (Galaxy Tab)', nameAr: 'قلم S Pen (جالكسي تاب)', protocol: 'emr', buttons: 1, eraserEnd: false, pressureLevels: 4096, tilt: true, hover: true, bodyDoubleTap: false, ua: /SM-(T|P|X9|X8)/ },
-  { id: 's-pen-phone', vendor: 'Samsung', name: 'S Pen (Galaxy Note/Ultra)', nameAr: 'قلم S Pen (نوت / ألترا)', protocol: 'emr', buttons: 1, eraserEnd: false, pressureLevels: 4096, tilt: true, hover: true, bodyDoubleTap: true, ua: /SM-(N|S9|S1)/ },
-  // ---- Xiaomi
-  { id: 'xiaomi-smart-pen-2', vendor: 'Xiaomi', name: 'Xiaomi Smart Pen (2nd gen)', nameAr: 'قلم شاومي الذكي (الجيل الثاني)', protocol: 'wgp', buttons: 1, eraserEnd: false, pressureLevels: 8192, tilt: true, hover: true, bodyDoubleTap: true, ua: /\b(Mi\s|Redmi|POCO|Mix|2212|2202|Pad\s?[56])/ },
-  { id: 'xiaomi-smart-pen', vendor: 'Xiaomi', name: 'Xiaomi Smart Pen', nameAr: 'قلم شاومي الذكي', protocol: 'wgp', buttons: 1, eraserEnd: false, pressureLevels: 4096, tilt: false, hover: false, bodyDoubleTap: false, ua: /\b(Mi\s|Redmi|POCO|Pad\s?5)/ },
-  // ---- Huawei
-  { id: 'huawei-mpencil-3', vendor: 'Huawei', name: 'Huawei M‑Pencil (3rd gen)', nameAr: 'قلم هواوي M‑Pencil (الجيل الثالث)', protocol: 'vendor-bt', buttons: 1, eraserEnd: false, pressureLevels: 4096, tilt: true, hover: true, bodyDoubleTap: true, ua: /(HUAWEI|Huawei|HW-|HarmonyOS)/ },
-  { id: 'huawei-mpencil-2', vendor: 'Huawei', name: 'Huawei M‑Pencil (2nd gen)', nameAr: 'قلم هواوي M‑Pencil (الجيل الثاني)', protocol: 'vendor-bt', buttons: 1, eraserEnd: false, pressureLevels: 4096, tilt: true, hover: false, bodyDoubleTap: true, ua: /(HUAWEI|Huawei|HW-|HarmonyOS)/ },
-  { id: 'huawei-mpencil', vendor: 'Huawei', name: 'Huawei M‑Pencil', nameAr: 'قلم هواوي M‑Pencil', protocol: 'vendor-bt', buttons: 1, eraserEnd: false, pressureLevels: 4096, tilt: false, hover: false, bodyDoubleTap: false, ua: /(HUAWEI|Huawei|HW-)/ },
-  // ---- Honor
-  { id: 'honor-magic-pencil-3', vendor: 'Honor', name: 'Honor Magic Pencil 3', nameAr: 'قلم هونر ماجيك 3', protocol: 'vendor-bt', buttons: 1, eraserEnd: false, pressureLevels: 4096, tilt: true, hover: true, bodyDoubleTap: true, ua: /(HONOR|honor|HonorOS|MagicOS)/ },
-  { id: 'honor-magic-pencil-2', vendor: 'Honor', name: 'Honor Magic Pencil 2', nameAr: 'قلم هونر ماجيك 2', protocol: 'vendor-bt', buttons: 1, eraserEnd: false, pressureLevels: 4096, tilt: false, hover: false, bodyDoubleTap: true, ua: /(HONOR|honor)/ },
-  // ---- OnePlus / OPPO / vivo / realme
-  { id: 'oneplus-stylo-2', vendor: 'OnePlus', name: 'OnePlus Stylo 2', nameAr: 'قلم ون بلس ستايلو 2', protocol: 'wgp', buttons: 1, eraserEnd: false, pressureLevels: 4096, tilt: true, hover: true, bodyDoubleTap: true, ua: /(OnePlus|OPD2|OP4)/ },
-  { id: 'oppo-pen', vendor: 'OPPO', name: 'OPPO Pen', nameAr: 'قلم أوبو', protocol: 'wgp', buttons: 1, eraserEnd: false, pressureLevels: 4096, tilt: true, hover: false, bodyDoubleTap: true, ua: /(OPPO|OPD2|PAD)/ },
-  { id: 'vivo-pen-2', vendor: 'vivo', name: 'vivo Pencil 2', nameAr: 'قلم فيفو 2', protocol: 'wgp', buttons: 1, eraserEnd: false, pressureLevels: 4096, tilt: true, hover: true, bodyDoubleTap: true, ua: /(vivo|V2[0-9]{3}A|PAD)/ },
-  { id: 'realme-pen', vendor: 'realme', name: 'realme Pen', nameAr: 'قلم ريلمي', protocol: 'wgp', buttons: 1, eraserEnd: false, pressureLevels: 4096, tilt: true, hover: false, bodyDoubleTap: true, ua: /(realme|RMX)/ },
-  // ---- Lenovo / Google
-  { id: 'lenovo-tab-pen', vendor: 'Lenovo', name: 'Lenovo Tab Pen Plus', nameAr: 'قلم لينوفو تاب', protocol: 'emr', buttons: 2, eraserEnd: true, pressureLevels: 4096, tilt: true, hover: true, bodyDoubleTap: false, ua: /(Lenovo|TB-|TB3)/ },
-  { id: 'pixel-stylus', vendor: 'Google', name: 'Pixel Tablet Pen', nameAr: 'قلم جوجل بيكسل', protocol: 'usi', buttons: 1, eraserEnd: false, pressureLevels: 2048, tilt: false, hover: false, bodyDoubleTap: false, ua: /(Pixel|GT52)/ },
-  // ---- Microsoft / MPP
-  { id: 'surface-slim-2', vendor: 'Microsoft', name: 'Surface Slim Pen 2', nameAr: 'سيرفيس سليم بن 2', protocol: 'mpp', buttons: 1, eraserEnd: true, pressureLevels: 4096, tilt: true, hover: true, bodyDoubleTap: false },
-  { id: 'surface-pen', vendor: 'Microsoft', name: 'Surface Pen (MPP)', nameAr: 'قلم سيرفيس (MPP)', protocol: 'mpp', buttons: 1, eraserEnd: true, pressureLevels: 4096, tilt: true, hover: true, bodyDoubleTap: false },
-  // ---- Wacom / USI
-  { id: 'wacom-one', vendor: 'Wacom', name: 'Wacom One Pen', nameAr: 'قلم واكوم ون', protocol: 'emr', buttons: 2, eraserEnd: true, pressureLevels: 4096, tilt: true, hover: true, bodyDoubleTap: false },
-  { id: 'usi-generic', vendor: 'USI', name: 'USI Stylus', nameAr: 'قلم USI', protocol: 'usi', buttons: 1, eraserEnd: false, pressureLevels: 2048, tilt: false, hover: true, bodyDoubleTap: false },
-];
+function modelOf(s: StylusSpec): PenModel {
+  return {
+    id: s.id,
+    vendor: s.vendor,
+    name: s.name,
+    nameAr: s.nameAr,
+    protocol: s.protocol,
+    buttons: s.buttons.filter((b) => b.id === 'barrel' || b.id === 'barrel2').length,
+    eraserEnd: s.eraserEnd === true,
+    pressureLevels: s.pressureLevels ?? 0,
+    tilt: s.tilt === true,
+    hover: s.hover === true,
+    bodyDoubleTap: s.bodyDoubleTap === true,
+    ua: s.ua,
+  };
+}
+
+/** registry derived from the live pen DB (updates after a DB merge) */
+export function PEN_MODELS(): PenModel[] {
+  return getPenSpecs().map(modelOf);
+}
 
 export function penModelById(id: string | null | undefined): PenModel | null {
   if (!id || id === 'auto') return null;
-  return PEN_MODELS.find((m) => m.id === id) ?? null;
+  const s = getPenSpecs().find((m) => m.id === id);
+  return s ? modelOf(s) : null;
+}
+
+export function penSpecById(id: string | null | undefined): StylusSpec | null {
+  if (!id || id === 'auto') return null;
+  return getPenSpecs().find((m) => m.id === id) ?? null;
 }
 
 // ---------------------------------------------------------------- profile state
@@ -125,6 +108,8 @@ export interface PenInfo {
   pressureCeil: number;
   /** tiltX/tiltY vary */
   tilt: boolean;
+  /** last observed tilt magnitude (degrees, 0 = upright) */
+  tiltDeg: number;
   /** the pen reported motion with pressure 0 — in-range hovering (EMR/USI) */
   hover: boolean;
   /** observed hardware buttons (bitmask over 2 | 4 | 8 | 16 | 32) */
@@ -137,8 +122,8 @@ export interface PenInfo {
 
 const NO_PEN: PenInfo = {
   detected: false, family: 'none', label: '', profileId: 'auto', pressure: false,
-  maxPressure: 0, pressureFloor: 0, pressureCeil: 1, tilt: false, hover: false,
-  buttons: 0, rateHz: 0, lastSeen: 0,
+  maxPressure: 0, pressureFloor: 0, pressureCeil: 1, tilt: false, tiltDeg: 0,
+  hover: false, buttons: 0, rateHz: 0, lastSeen: 0,
 };
 
 let info: PenInfo = { ...NO_PEN };
@@ -156,14 +141,11 @@ let pressureValues: number[] = [];
 // tilt evidence
 let tiltSeen = false;
 
-// multiple pointers: remember which pen pointerId we are profiling (a second
-// pen swapped mid-session re-seeds the profile)
+// multiple pointers: remember which pen pointerId we are profiling
 let profiledPointerId: number | null = null;
 
-// barrel-bit auto-mapping: vendors surface the side button on different
-// PointerEvent.buttons bits (S Pen hover → 2, Surface/MPP → 4, some Android
-// pens → 8/16). The FIRST bit the physical pen reports locks as the primary
-// barrel; other observed barrel bits route to the secondary shortcut.
+// barrel-bit auto-mapping: the FIRST bit the physical pen reports locks as
+// the primary barrel; other observed barrel bits route to the secondary.
 const BARREL_CANDIDATES = [2, 4, 8, 16] as const;
 let primaryBarrelBit = 0; // 0 = not locked yet
 
@@ -172,13 +154,75 @@ const listeners = new Set<Listener>();
 
 function emit() { for (const l of listeners) l(info) }
 
+// ---------------------------------------------------------------- live sample feed
+/** raw per-event pen data for the test pad / live meters */
+export interface PenSample {
+  pressure: number;   // raw 0..1
+  tiltX: number;
+  tiltY: number;
+  tiltDeg: number;
+  hover: boolean;      // pressure 0 + no tip button
+  buttons: number;     // raw bits
+  t: number;           // performance.now()
+}
+type SampleListener = (s: PenSample) => void;
+const sampleListeners = new Set<SampleListener>();
+
+export function subscribePenSamples(cb: SampleListener): () => void {
+  sampleListeners.add(cb);
+  return () => { sampleListeners.delete(cb) };
+}
+
+// ---------------------------------------------------------------- button patterns
+export type PenPatternKind = 'press' | 'double' | 'long' | 'release';
+export interface PenButtonEvent {
+  bit: number;               // 2/4/8/16 barrel or 32 eraser end
+  primary: boolean;          // routed through the locked primary mapping?
+  pattern: PenPatternKind;
+  /** true when the tip is in contact (writing) at the moment of the press */
+  writing: boolean;
+}
+type ButtonListener = (ev: PenButtonEvent) => void;
+const buttonListeners = new Set<ButtonListener>();
+
+export function onPenButtonEvent(cb: ButtonListener): () => void {
+  buttonListeners.add(cb);
+  return () => { buttonListeners.delete(cb) };
+}
+
+const DBL_MS = 450;      // double-press window
+const LONG_MS = 650;     // long-press threshold
+/** per-bit pattern tracking: press time + long-press timer */
+const btnState = new Map<number, { downAt: number; longTimer: ReturnType<typeof setTimeout> | null }>();
+/** per-bit "moment of the previous release" — feeds the double-press detector */
+const btnLastUp = new Map<number, number>();
+
+const bitsOf = (buttons: number) => {
+  const out: number[] = [];
+  for (const b of [2, 4, 8, 16, 32] as const) if (buttons & b) out.push(b);
+  return out;
+};
+
+function emitButton(bit: number, pattern: PenPatternKind, writing: boolean) {
+  const ev: PenButtonEvent = { bit, primary: bit !== 32 && bit === barrelMap().primary, pattern, writing };
+  for (const l of buttonListeners) l(ev);
+}
+
+/** clear all pending pattern state (pointer cancelled / pen left range) */
+function resetButtonPatterns(keepBits = 0) {
+  for (const [bit, st] of btnState) {
+    if (st.longTimer) clearTimeout(st.longTimer);
+    if (!(keepBits & bit)) btnState.delete(bit);
+  }
+}
+
+// ---------------------------------------------------------------- platform helpers
 function platform(): 'android' | 'ios' | 'cros' | 'windows' | 'mac' | 'other' {
   try {
     const ua = navigator.userAgent;
     const tp = navigator.maxTouchPoints || 0;
     if (/CrOS/.test(ua)) return 'cros';
     if (/Android/.test(ua)) return 'android';
-    // iPadOS 13+ masquerades as desktop Safari — maxTouchPoints separates it
     if (/iPhone|iPad|iPod/.test(ua) || (/(Macintosh|Mac OS X)/.test(ua) && tp > 1)) return 'ios';
     if (/Windows/.test(ua)) return 'windows';
     if (/Mac/.test(ua)) return 'mac';
@@ -186,25 +230,22 @@ function platform(): 'android' | 'ios' | 'cros' | 'windows' | 'mac' | 'other' {
   return 'other';
 }
 
-function uaVendorModel(): PenModel | null {
+function uaVendorModel(): StylusSpec | null {
   try {
     const ua = navigator.userAgent;
     const plat = platform();
-    if (plat === 'ios') {
-      if (/Pencil/.test(ua)) return PEN_MODELS.find((m) => m.id === 'apple-pencil-2') ?? null;
-      return null; // Apple Pencil family handled by classify()
-    }
+    if (plat === 'ios') return null; // Apple Pencil family handled by classify()
     if (plat !== 'android') return null;
-    for (const m of PEN_MODELS) {
+    for (const m of getPenSpecs()) {
       if (m.ua && m.ua.test(ua)) return m;
     }
   } catch { /* guarded */ }
   return null;
 }
 
-/** resolve the current label/family against the registry + evidence */
-function resolveProfile(): { family: PenFamily; label: string; model: PenModel | null } {
-  const manual = penModelById(manualProfileId);
+/** resolve the current label/family against the DB + evidence */
+function resolveProfile(): { family: PenFamily; label: string; spec: StylusSpec | null } {
+  const manual = penSpecById(manualProfileId);
   if (manual) {
     const fam: PenFamily =
       manual.protocol === 'apple' ? 'apple-pencil'
@@ -212,46 +253,44 @@ function resolveProfile(): { family: PenFamily; label: string; model: PenModel |
       : manual.protocol === 'usi' ? 'usi'
       : manual.protocol === 'mpp' ? 'mpp'
       : 'vendor';
-    return { family: fam, label: manual.name, model: manual };
+    return { family: fam, label: manual.name, spec: manual };
   }
   const plat = platform();
   const highRate = info.rateHz >= 110;
   const vendor = uaVendorModel();
   if (vendor) {
-    // the device markers say which pen family the tablet takes — trust them
-    // (the physical pen is that vendor's, or a compatible clone)
+    // device markers say which pen family the tablet takes — a strong hint,
+    // but still just a hint (the user can always pin the exact model)
     const fam: PenFamily =
       vendor.protocol === 'emr' ? 'emr'
       : vendor.protocol === 'usi' ? 'usi'
       : vendor.protocol === 'apple' ? 'apple-pencil'
       : 'vendor';
-    return { family: fam, label: vendor.name, model: vendor };
+    return { family: fam, label: vendor.name, spec: vendor };
   }
   switch (plat) {
     case 'ios':
-      return { family: 'apple-pencil', label: 'Apple Pencil', model: null };
+      return { family: 'apple-pencil', label: 'Apple Pencil', spec: null };
     case 'cros':
-      return { family: 'usi', label: 'USI stylus', model: null };
+      return { family: 'usi', label: 'USI stylus', spec: null };
     case 'windows':
-      // Windows pens: MPP/Slim report buttons (incl. eraser bit 32) + tilt
-      return { family: 'mpp', label: 'MPP stylus (Surface / Slim Pen)', model: null };
+      return { family: 'mpp', label: 'MPP stylus (Surface / Slim Pen)', spec: null };
     case 'android':
-      // hover + high report rate = Wacom EMR digitizer (Galaxy S Pen, Lenovo…)
-      if (info.hover && highRate) return { family: 'emr', label: 'Samsung S Pen / Wacom EMR', model: null };
-      if (info.hover) return { family: 'emr', label: 'EMR stylus', model: null };
-      if (info.buttons) return { family: 'generic', label: 'Active stylus (buttons)', model: null };
-      return { family: 'generic', label: 'Active stylus', model: null };
+      if (info.hover && highRate) return { family: 'emr', label: 'Samsung S Pen / Wacom EMR', spec: null };
+      if (info.hover) return { family: 'emr', label: 'EMR stylus', spec: null };
+      if (info.buttons) return { family: 'generic', label: 'Active stylus (buttons)', spec: null };
+      return { family: 'generic', label: 'Active stylus', spec: null };
     default:
-      if (info.buttons) return { family: 'generic', label: 'Active stylus (buttons)', model: null };
-      return { family: 'generic', label: 'Active stylus', model: null };
+      if (info.buttons) return { family: 'generic', label: 'Active stylus (buttons)', spec: null };
+      return { family: 'generic', label: 'Active stylus', spec: null };
   }
 }
 
 /**
  * Feed one pen pointer event into the engine. Call for EVERY pen event
- * (pointerdown / pointermove / pointerup) with the number of coalesced
- * samples the event carried (1 when none) — the batch size refines the
- * report-rate estimate.
+ * (pointerdown / pointermove / pointerup). Runs the button-edge detector +
+ * the press/double/long pattern state machine and emits PenButtonEvent's —
+ * subscribers (the shortcut router) fire the user's bindings.
  */
 export function observePenEvent(e: {
   pointerType: string;
@@ -265,19 +304,18 @@ export function observePenEvent(e: {
   const now = performance.now();
 
   if (!info.detected || (profiledPointerId !== null && profiledPointerId !== e.pointerId)) {
-    // (re)seed the profile for this pen
+    // (re)seed the profile for this pen (a new pen swapped mid-session)
     info = { ...NO_PEN, detected: true, lastSeen: now, profileId: manualProfileId ?? 'auto' };
     rateTs = [];
     pressureValues = [];
     tiltSeen = false;
     primaryBarrelBit = 0;
     profiledPointerId = e.pointerId;
+    resetButtonPatterns(0);
   }
   info.lastSeen = now;
 
-  // ---- pressure evidence (contact only; hover reports 0). Track the
-  // envelope for adaptive calibration: many digitizers report a compressed
-  // band (never near 0 at light touch, never near 1 at full press).
+  // ---- pressure evidence + adaptive envelope (contact only; hover reports 0)
   if (e.pressure > 0.015) {
     info.maxPressure = Math.max(info.maxPressure, e.pressure);
     pressureValues.push(e.pressure);
@@ -289,36 +327,68 @@ export function observePenEvent(e: {
     }
     if (pressureValues.length >= 8) {
       const sorted = [...pressureValues].sort((a, b) => a - b);
-      // robust envelope: ignore single-sample spikes at both ends
       const lo = sorted[Math.floor(sorted.length * 0.05)];
       const hi = sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.97))];
       info.pressureFloor = lo;
       info.pressureCeil = Math.max(hi, lo + 0.001);
     }
   } else if (e.pressure === 0) {
-    // motion with pressure 0 while a pen is in range = hover-capable
-    info.hover = true;
+    info.hover = true; // motion with pressure 0 while in range = hover-capable
   }
 
-  // ---- tilt evidence
-  if (!tiltSeen) {
-    const tx = Math.abs(Number(e.tiltX) || 0);
-    const ty = Math.abs(Number(e.tiltY) || 0);
-    if (tx > 2 || ty > 2) tiltSeen = true;
-  }
+  // ---- tilt evidence + live magnitude
+  const tx = Number(e.tiltX) || 0;
+  const ty = Number(e.tiltY) || 0;
+  if (!tiltSeen && (Math.abs(tx) > 2 || Math.abs(ty) > 2)) tiltSeen = true;
   info.tilt = tiltSeen;
+  info.tiltDeg = Math.min(90, Math.hypot(tx, ty) * 0.5);
 
-  // ---- hardware buttons (barrel candidates 2/4/8/16, eraser end = 32;
-  // bit 1 is the tip contact itself and is not a "button")
+  // ---- hardware buttons: edge detection + pattern machine
   const barrel = e.buttons & (2 | 4 | 8 | 16);
   if (barrel) {
     info.buttons |= barrel;
-    if (primaryBarrelBit === 0) primaryBarrelBit = barrel & -barrel; // lowest set bit
+    if (primaryBarrelBit === 0) primaryBarrelBit = barrel & -barrel; // lowest set bit locks
   }
   if (e.buttons & 32) info.buttons |= 32;
 
-  // ---- report-rate estimate from inter-event spacing, scaled by the
-  // coalesced batch (high-Hz digitizers deliver many samples per event)
+  const writing = (e.buttons & 1) === 1 && e.pressure > 0.015;
+  const curBits = bitsOf(e.buttons);
+  // newly pressed bits → press/double event + long-press timer;
+  // released bits → cancel their timers and record the release moment
+  for (const bit of curBits) {
+    if (!btnState.has(bit)) {
+      const st = { downAt: now, longTimer: null as ReturnType<typeof setTimeout> | null };
+      btnState.set(bit, st);
+      const prevUp = btnLastUp.get(bit) ?? 0;
+      if (prevUp && now - prevUp < DBL_MS) {
+        emitButton(bit, 'double', writing);
+      } else {
+        emitButton(bit, 'press', writing);
+      }
+      btnLastUp.set(bit, 0);
+      st.longTimer = setTimeout(() => {
+        st.longTimer = null;
+        emitButton(bit, 'long', writing);
+      }, LONG_MS);
+    }
+  }
+  for (const [bit, st] of [...btnState]) {
+    if (!curBits.includes(bit)) {
+      if (st.longTimer) { clearTimeout(st.longTimer); st.longTimer = null }
+      btnLastUp.set(bit, now);
+      btnState.delete(bit);
+      emitButton(bit, 'release', writing);
+    }
+  }
+
+  // ---- live sample feed (test pad + meters)
+  const sample: PenSample = {
+    pressure: e.pressure, tiltX: tx, tiltY: ty, tiltDeg: info.tiltDeg,
+    hover: e.pressure === 0 && (e.buttons & 1) === 0, buttons: e.buttons, t: now,
+  };
+  for (const l of sampleListeners) l(sample);
+
+  // ---- report-rate estimate (coalesced batches refine it)
   rateTs.push(now);
   if (rateTs.length > RATE_SAMPLES) rateTs.shift();
   if (rateTs.length >= 8) {
@@ -326,7 +396,6 @@ export function observePenEvent(e: {
     for (let i = 1; i < rateTs.length; i++) dts.push(rateTs[i] - rateTs[i - 1]);
     dts.sort((a, b) => a - b);
     const median = dts[Math.floor(dts.length / 2)] || 1;
-    // ignore huge gaps (pen idle between strokes) — median handles them
     if (median > 0 && median < 120) {
       const est = Math.round((1000 / median) * Math.max(1, coalescedCount));
       info.rateHz = Math.max(info.rateHz, Math.min(est, 480));
@@ -342,10 +411,8 @@ export function observePenEvent(e: {
 
 /**
  * Adaptive pressure normalization: remaps the pen's observed contact
- * envelope onto the full 0–1 range. Pens already reporting the full range
- * pass through unchanged (floor≈0, ceil≥0.75). Called by the ink pipeline
- * for every pen sample BEFORE the pressure curve — light touches go thin,
- * hard presses go bold, on every digitizer.
+ * envelope onto the full 0–1 range (compressed bands → full response).
+ * Called by the ink pipeline for every pen sample BEFORE the pressure curve.
  */
 export function normalizePenPressure(raw: number): number {
   const r = clamp(raw, 0, 1);
@@ -399,4 +466,17 @@ export function observedButtons(): string[] {
   if (barrelMap().secondary) out.push('second');
   if (info.buttons & 32) out.push('eraser');
   return out;
+}
+
+/** reset all engine state (used when the editor closes / test hooks) */
+export function resetPenEngine(): void {
+  info = { ...NO_PEN };
+  rateTs = [];
+  pressureValues = [];
+  tiltSeen = false;
+  primaryBarrelBit = 0;
+  profiledPointerId = null;
+  resetButtonPatterns(0);
+  btnLastUp.clear();
+  emit();
 }

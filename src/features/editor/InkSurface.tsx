@@ -32,13 +32,13 @@
 // appear on top of ours.
 import { useEffect, useRef } from 'react';
 import { useApp, useT } from '@/lib/nanote/store';
-import { EditorTool, FingerAction, PenAction, StrokeEl, ToolId, TextEl, ImageEl } from '@/lib/nanote/types';
+import { EditorTool, FingerAction, INK_PALETTE, PenAction, StrokeEl, ToolId, TextEl, ImageEl } from '@/lib/nanote/types';
 import { uid, clamp } from '@/lib/nanote/util';
 import { computeOutline, OP } from '@/lib/nanote/outline';
 import { drawImageEl, hiAlphaOf } from '@/lib/nanote/render';
 import { resolveImage, imageNatural } from '@/lib/nanote/images';
 import { recognizeShape, type RecognizedShape } from '@/lib/nanote/shapedetect';
-import { observePenEvent, normalizePenPressure, barrelMap } from '@/lib/nanote/penengine';
+import { observePenEvent, normalizePenPressure, onPenButtonEvent, barrelMap } from '@/lib/nanote/penengine';
 import {
   elementInLasso, strokeIntersectsCircle, elementIntersectsCircle,
   snapAngle, shapePath, pointInImage, transformElement,
@@ -267,7 +267,6 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
   const penLastUpRef = useRef(0);        // last pen pointerup — palm-rejection linger anchor
   const penHoverCapableRef = useRef(false); // stylus reports hover events (Apple Pencil 2 / S Pen / Surface)
   const momentaryToolRef = useRef<EditorTool | null>(null); // tool restored after hold-to-erase
-  const penBtnRef = useRef(0); // last observed stylus button mask (edge-triggered hardware buttons)
   const pendingTapRef = useRef<{ m: Extract<Mode, { type: 'stroke' }>; timer: ReturnType<typeof setTimeout>; x: number; y: number; t: number } | null>(null);
   const twoTapRef = useRef<{ t0: number; moved: boolean; fired: boolean } | null>(null);
   const touchCountRef = useRef(0);       // tracked touches currently down
@@ -661,6 +660,45 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
           }
           return;
         }
+        case 'colorNext': {
+          // cycle the active tool's color through the ink palette
+          const tool = (st.editor.tool === 'eraser' || st.editor.tool === 'pan' || st.editor.tool === 'lasso')
+            ? st.editor.lastPen : (st.editor.tool as ToolId);
+          const ts = st.editor.toolStates[tool] ?? st.editor.toolStates.fountain;
+          const idx = INK_PALETTE.findIndex((c) => c.toLowerCase() === ts.color.toLowerCase());
+          const nextCol = INK_PALETTE[(idx + 1 + INK_PALETTE.length) % INK_PALETTE.length] ?? INK_PALETTE[0];
+          st.setToolState(tool, { color: nextCol });
+          st.pushRecentColor(nextCol);
+          return;
+        }
+        case 'widthUp': case 'widthDown': {
+          const tool = (st.editor.tool === 'eraser' || st.editor.tool === 'pan' || st.editor.tool === 'lasso')
+            ? st.editor.lastPen : (st.editor.tool as ToolId);
+          const ts = st.editor.toolStates[tool] ?? st.editor.toolStates.fountain;
+          const w = clamp(act === 'widthUp' ? ts.width * 1.3 : ts.width / 1.3, 0.6, 40);
+          st.setToolState(tool, { width: w });
+          return;
+        }
+        case 'zoomIn': case 'zoomOut': {
+          const el = hostRef.current;
+          const w = el?.clientWidth ?? 800, h = el?.clientHeight ?? 600;
+          const factor = act === 'zoomIn' ? 1.25 : 1 / 1.25;
+          animateZoomTo(w / 2, h / 2, getVp().scale * factor, 200);
+          return;
+        }
+        case 'toggleToolbar': st.toggleToolbar(); return;
+        case 'quickExport': {
+          const pageId = st.editor.activePageId;
+          if (!pageId) return;
+          void (async () => {
+            try {
+              const mod = await import('@/lib/nanote/export');
+              const { blob, filename } = await mod.exportPagePng(pageId);
+              mod.downloadBlob(blob, filename);
+            } catch { /* export failed silently — a shortcut must never crash the editor */ }
+          })();
+          return;
+        }
       }
     };
 
@@ -693,42 +731,43 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     };
 
     /**
-     * Stylus hardware-button router — EDGE-TRIGGERED so every press fires its
-     * configured shortcut exactly once, no matter how the pen reports it:
-     *   • pressed while HOVERING (S Pen / Wacom EMR surface the side button on
-     *     pointermove with pressure 0 — there is never a pointerdown),
-     *   • pressed at tip contact (button bits on pointerdown),
-     *   • pressed mid-stroke (bits appear on the live pointermove stream),
-     *   • the dedicated ERASER end/button (bit 32 — Surface / MPP pens).
-     * Which bit is "the barrel button" is pen-dependent (S Pen hover → 2,
-     * Surface/MPP → 4, some Android pens → 8/16): the pen engine locks the
-     * FIRST bit the physical pen actually reports as primary (see
-     * barrelMap()), so the user's Barrel shortcut fires no matter the vendor.
-     * observePenEvent runs BEFORE this on every event, so the very first
-     * press already routes through the freshly-locked bit. Releasing a
-     * momentary button (hold-to-erase) restores the previous tool.
+     * Stylus hardware-button PATTERN router — the pen engine tracks every
+     * physical bit through its press/double/long/release state machine (fed by
+     * observePenEvent on down/move/up, so hover presses, contact presses and
+     * mid-stroke presses all register) and emits the pattern here:
+     *   • press  — while HOVERING → binding.press; while WRITING (tip in
+     *              contact) → binding.pressWriting ?? press
+     *   • double — two quick presses           → binding.double
+     *   • long   — held ≥ 650 ms               → binding.long
+     *   • release — momentary actions (hold-to-erase) restore the tool
+     * Which bit is "the barrel" is pen-dependent (S Pen hover → 2, MPP → 4,
+     * some Android pens → 8/16): the engine locks the first bit the physical
+     * pen reports as primary — the user's Barrel shortcut fires on any vendor.
      */
-    const penButtonEdge = (e: PointerEvent) => {
-      const prev = penBtnRef.current;
-      const cur = e.buttons & (1 | 2 | 4 | 8 | 16 | 32); // tip + barrel bits + eraser
-      if (cur === prev) return;
-      penBtnRef.current = cur;
+    const offPenButtons = onPenButtonEvent((ev) => {
       const prefs = useApp.getState().settings.penShortcuts;
-      const bit = (b: number) => ({
-        pressed: (cur & b) !== 0 && (prev & b) === 0,
-        released: (cur & b) === 0 && (prev & b) !== 0,
-      });
-      const map = barrelMap();
-      const er = bit(32), b1 = bit(map.primary), b2 = map.secondary ? bit(map.secondary) : null;
-      if (er.pressed) { if (prefs.eraser && prefs.eraser !== 'none') applyPenAction(prefs.eraser); return }
-      if (er.released) { restoreMomentaryTool(); return }
-      if (b1.pressed) { if (prefs.barrel !== 'none') applyPenAction(prefs.barrel); return }
-      if (b1.released) { restoreMomentaryTool(); return }
-      if (b2) {
-        if (b2.pressed) { if (prefs.barrel2 !== 'none') applyPenAction(prefs.barrel2); return }
-        if (b2.released) { restoreMomentaryTool(); return }
+      if (ev.bit === 32) {
+        // dedicated eraser end/button (Surface / MPP / Wacom One / Lenovo)
+        if (ev.pattern === 'press') { if (prefs.eraser.press !== 'none') applyPenAction(prefs.eraser.press) }
+        else if (ev.pattern === 'double') { if (prefs.eraser.double !== 'none') applyPenAction(prefs.eraser.double) }
+        else if (ev.pattern === 'long') { if (prefs.eraser.long !== 'none') applyPenAction(prefs.eraser.long) }
+        else restoreMomentaryTool();
+        return;
       }
-    };
+      const map = barrelMap();
+      const binding = ev.bit === map.primary ? prefs.barrel : ev.bit === map.secondary ? prefs.barrel2 : null;
+      if (!binding) return;
+      if (ev.pattern === 'press') {
+        const act2 = ev.writing ? (binding.pressWriting ?? binding.press) : binding.press;
+        if (act2 !== 'none') applyPenAction(act2);
+      } else if (ev.pattern === 'double') {
+        if (binding.double !== 'none') applyPenAction(binding.double);
+      } else if (ev.pattern === 'long') {
+        if (binding.long !== 'none') applyPenAction(binding.long);
+      } else {
+        restoreMomentaryTool();
+      }
+    });
 
     // ================================================ app-owned text selection
     const clearTextHold = () => {
@@ -1025,7 +1064,6 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         // route hardware buttons — hover presses already fired on pointermove;
         // a press that begins exactly at tip contact fires here
         observePenEvent(e);
-        penButtonEdge(e);
       }
 
       // ---- palm rejection gate (touches only; pens & mice always pass)
@@ -1303,7 +1341,6 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         // pen engine: identify the pen + track capabilities; route hardware
         // buttons pressed while hovering or mid-stroke (edge-triggered)
         observePenEvent(e, coalescedOf(e).length);
-        penButtonEdge(e);
       }
       const rect = host.getBoundingClientRect();
       const l = { x: e.clientX - rect.left, y: e.clientY - rect.top };
@@ -1516,12 +1553,12 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       if (e.pointerType === 'pen') {
         penDownRef.current = false;
         penLastUpRef.current = performance.now();
+        // the engine sees the release too (buttons released exactly at lift
+        // restore momentary tools through the pattern router)
         observePenEvent(e);
-        penButtonEdge(e); // a button released exactly at lift restores here
         restoreMomentaryTool();
         // keep only bits that are still physically held after the lift so the
         // next press can never be swallowed by a stale mask
-        penBtnRef.current = e.buttons & (2 | 4 | 8 | 16 | 32);
       }
 
       // two-finger tap (finger gesture): both touches released quickly and
@@ -1858,6 +1895,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       window.removeEventListener('keydown', onKey);
       window.removeEventListener('keyup', onKey);
       window.removeEventListener('blur', onBlurWin);
+      offPenButtons();
     };
   }, [layouts, pageW, onTextTap]);
 

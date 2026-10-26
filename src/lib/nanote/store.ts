@@ -4,7 +4,7 @@
 import { create } from 'zustand';
 import * as db from './idb';
 import {
-  DEFAULT_SETTINGS, DEFAULT_TOOL_STATES, EditorTool, EraserMode, FolderRow, ImageEl, INFINITE_GROW_MARGIN, INFINITE_GROW_STEP, NotebookRow,
+  DEFAULT_SETTINGS, DEFAULT_TOOL_STATES, EditorTool, EraserMode, FINGER_GESTURES_DEFAULT, FolderRow, ImageEl, INFINITE_GROW_MARGIN, INFINITE_GROW_STEP, migratePenShortcuts, NotebookRow,
   PageDoc, PageElement, PageRow, PageSizeId, PdfTextRec, RecordingRow, Settings, ShapeType, StrokeEl, TabRow, TagRow,
   TemplateId, ToolId, ToolState, UNDO_LIMIT, emptyDoc,
 } from './types';
@@ -83,6 +83,8 @@ interface AppState {
     redoStack: Cmd[];
     recordings: RecordingRow[];
     rulerVisible: boolean;
+    /** pen-shortcut "toggle toolbar": hides/shows the tool dock (session state) */
+    toolbarHidden: boolean;
     activeRecording: { recId: string; startedAt: number } | null;
     audio: { recId: string | null; playing: boolean; tMs: number; sync: boolean; replay: boolean };
   };
@@ -143,6 +145,7 @@ interface AppState {
   setTextDefaults(patch: Partial<TextDefaults>): void;
   pushRecentColor(hex: string): void;
   toggleRuler(): void;
+  toggleToolbar(): void;
   setActivePage(pageId: string): void;
 
   addElements(pageId: string, els: PageElement[], opts?: { undoable?: boolean }): void;
@@ -294,6 +297,7 @@ export const useApp = create<AppState>((set, get) => ({
     redoStack: [],
     recordings: [],
     rulerVisible: false,
+    toolbarHidden: false,
     activeRecording: null,
     audio: { recId: null, playing: false, tMs: 0, sync: true, replay: false },
   },
@@ -301,9 +305,17 @@ export const useApp = create<AppState>((set, get) => ({
   // ------------------------------------------------------------ boot / nav
   async boot() {
     const settings = await db.loadSettings();
-    set({ settings });
+    // schema migrations for persisted prefs (v1 pen shortcuts → per-pattern
+    // bindings; legacy laser/finger objects are normalized too)
+    const migrated: Settings = {
+      ...DEFAULT_SETTINGS,
+      ...settings,
+      penShortcuts: migratePenShortcuts(settings.penShortcuts),
+      fingerGestures: { ...FINGER_GESTURES_DEFAULT, ...(settings.fingerGestures ?? {}) },
+    };
+    set({ settings: migrated });
     // manual pen profile override → pen engine (label + capability hints)
-    setPenProfile(settings.penProfileId ?? 'auto');
+    setPenProfile(migrated.penProfileId ?? 'auto');
     try { await migrateTabsV2() } catch (e) { console.warn('[nanote] migration failed', e) }
     try { await db.purgeTrash() } catch (e) { console.warn('[nanote] purge failed', e) }
     // UNLIMITED STORAGE: ask the platform to mark our quota as persistent —
@@ -323,8 +335,8 @@ export const useApp = create<AppState>((set, get) => ({
       tags,
       pages,
       pageCounts,
-      libraryView: settings.defaultView,
-      view: settings.onboarded ? { name: 'library' } : { name: 'onboarding' },
+      libraryView: migrated.defaultView,
+      view: migrated.onboarded ? { name: 'library' } : { name: 'onboarding' },
       history: [],
     });
     // Session restore: if the app died while a notebook was open (killed in the
@@ -739,6 +751,7 @@ export const useApp = create<AppState>((set, get) => ({
         redoStack: [],
         recordings: [],
         rulerVisible: false,
+        toolbarHidden: false,
         highlighterStraight: false,
         activeRecording: null,
         audio: { recId: null, playing: false, tMs: 0, sync: true, replay: false },
@@ -823,6 +836,11 @@ export const useApp = create<AppState>((set, get) => ({
   toggleRuler() {
     const ed = get().editor;
     set({ editor: { ...ed, rulerVisible: !ed.rulerVisible } });
+  },
+
+  toggleToolbar() {
+    const ed = get().editor;
+    set({ editor: { ...ed, toolbarHidden: !ed.toolbarHidden } });
   },
 
   setActivePage(pageId) {

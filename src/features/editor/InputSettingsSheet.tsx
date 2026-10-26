@@ -1,61 +1,42 @@
 'use client';
-// InputSettingsSheet — "Pen & input" settings opened from the editor top bar.
-// Lets the user customize:
-//   • THE PEN MODEL — a registry of every major stylus (Apple Pencil, Samsung
-//     S Pen, Wacom/EMR, Surface/MPP, USI, and the Android-vendor pens:
-//     Xiaomi Smart Pen, Huawei M-Pencil, Honor Magic Pencil, OnePlus Stylo,
-//     OPPO/vivo/realme pens, Lenovo Tab Pen, Pixel Pen…). Auto-detection
-//     combines platform + report signals + device markers; the user can
-//     always pick their exact pen to pin the label and capability hints;
-//   • stylus hardware buttons (barrel / barrel-2 / eraser end) and the pen
-//     double-tap — routed through the pen engine's barrel-bit auto-mapping,
-//     so "the pen button" works whichever bit the vendor reports (2/4/8/16);
-//   • a LIVE pen-engine card: the detected pen's family, its real
-//     capabilities (pressure / tilt / hover / report rate), the adaptive
-//     pressure calibration (compressed digitizer ranges are remapped onto
-//     the full 0–1 so light/heavy response is correct) and which hardware
-//     buttons have actually been observed on THIS pen;
-//   • finger gestures (double tap, two-finger tap);
-//   • finger drawing + stylus-only mode (same settings as the toolbar).
+// InputSettingsSheet — the editor's quick "Pen & input" sheet: the live pen
+// card, the core barrel/eraser/tip bindings (per-pattern), finger gestures and
+// the finger-drawing / stylus-only switches. The FULL pen management interface
+// (test pad, per-trigger patterns incl. press-while-writing, the sourced pen
+// database with confidence levels, and runtime DB updates) lives in
+// PenManagerSheet — opened from here or from Settings → Electronic pens.
+import { useState } from 'react';
 import { useSyncExternalStore } from 'react';
-import { Hand, Pencil, PenLine, Smartphone, Zap } from 'lucide-react';
-import { getPenInfo, subscribePen, barrelMap, PEN_MODELS, setPenProfile } from '@/lib/nanote/penengine';
+import { Database, Hand, Pencil, PenLine, Smartphone, Zap } from 'lucide-react';
+import { getPenInfo, subscribePen, barrelMap } from '@/lib/nanote/penengine';
 import { useApp, useT } from '@/lib/nanote/store';
-import type { FingerAction, PenAction } from '@/lib/nanote/types';
+import type { FingerAction, PenAction, PenShortcutPrefs } from '@/lib/nanote/types';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Switch } from '@/components/ui/switch';
-import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
+import { PenManagerSheet } from './PenManagerSheet';
 
 const PEN_ACTIONS: PenAction[] = [
   'none', 'eraserHold', 'eraserToggle', 'pen', 'highlighter', 'laser',
   'lasso', 'text', 'shape', 'pan', 'undo', 'redo', 'pagePrev', 'pageNext',
+  'colorNext', 'widthUp', 'widthDown', 'zoomIn', 'zoomOut', 'toggleToolbar', 'quickExport',
 ];
 const FINGER_ACTIONS: FingerAction[] = ['zoom', 'undo', 'redo', 'eraserToggle', 'pen', 'none'];
 
-/** group the pen registry by vendor for the model selector */
-const PEN_VENDORS: { vendor: string; models: typeof PEN_MODELS }[] = (() => {
-  const order: string[] = [];
-  const by = new Map<string, typeof PEN_MODELS>();
-  for (const m of PEN_MODELS) {
-    if (!by.has(m.vendor)) { by.set(m.vendor, []); order.push(m.vendor) }
-    by.get(m.vendor)!.push(m);
-  }
-  return order.map((vendor) => ({ vendor, models: by.get(vendor)! }));
-})();
-
 export function InputSettingsSheet({ open, onOpenChange }: { open: boolean; onOpenChange: (v: boolean) => void }) {
-  const { t, lang } = useT();
+  const { t } = useT();
   const penShortcuts = useApp((s) => s.settings.penShortcuts);
   const fingerGestures = useApp((s) => s.settings.fingerGestures);
   const fingerDrawing = useApp((s) => s.settings.fingerDrawing);
   const stylusOnly = useApp((s) => s.settings.stylusOnly);
-  const penProfileId = useApp((s) => s.settings.penProfileId) ?? 'auto';
   const setSettings = useApp((s) => s.setSettings);
 
   // live pen profile from the pen engine (updates while the sheet is open)
   const pen = useSyncExternalStore(subscribePen, getPenInfo);
   const bmap = barrelMap();
+  const [manageOpen, setManageOpen] = useState(false);
 
   const penLabel = (a: PenAction) => t(`input.action.${a}`);
   const fingerLabel = (a: FingerAction) => t(`input.action.${a}`);
@@ -72,271 +53,253 @@ export function InputSettingsSheet({ open, onOpenChange }: { open: boolean; onOp
   ];
   const calibrating = pen.detected && pen.pressure && pen.pressureCeil - pen.pressureFloor < 0.88;
 
-  const changePenProfile = (id: string) => {
-    setPenProfile(id);
-    void setSettings({ penProfileId: id });
-  };
+  const patch = (next: PenShortcutPrefs) => void setSettings({ penShortcuts: next });
 
   return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent
-        side="bottom"
-        className="mx-auto max-h-[85dvh] max-w-2xl overflow-y-auto nanote-scroll rounded-t-2xl p-0"
-      >
-        <SheetHeader className="border-b border-border px-4 py-3">
-          <SheetTitle className="flex items-center gap-2 text-base">
-            <Pencil className="h-4 w-4" /> {t('input.title')}
-          </SheetTitle>
-        </SheetHeader>
+    <>
+      <Sheet open={open} onOpenChange={onOpenChange}>
+        <SheetContent
+          side="bottom"
+          className="mx-auto max-h-[85dvh] max-w-2xl overflow-y-auto nanote-scroll rounded-t-2xl p-0"
+        >
+          <SheetHeader className="border-b border-border px-4 py-3">
+            <SheetTitle className="flex items-center gap-2 text-base">
+              <Pencil className="h-4 w-4" /> {t('input.title')}
+            </SheetTitle>
+          </SheetHeader>
 
-        <div className="space-y-5 p-4 pb-24">
-          {/* ------------------------------------------------ pen & hardware buttons */}
-          <section aria-label={t('input.penSection')}>
-            <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold text-muted-foreground">
-              <Pencil className="h-4 w-4" /> {t('input.penSection')}
-            </h3>
+          <div className="space-y-5 p-4 pb-24">
+            {/* ------------------------------------------------ pen & hardware buttons */}
+            <section aria-label={t('input.penSection')}>
+              <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold text-muted-foreground">
+                <Pencil className="h-4 w-4" /> {t('input.penSection')}
+              </h3>
 
-            {/* ---------- live pen-engine card: what the app detected */}
-            <div className="mb-3 rounded-xl border border-border bg-card p-3">
-              <div className="flex items-center gap-2">
-                <span
-                  className={cn(
-                    'flex h-8 w-8 shrink-0 items-center justify-center rounded-full',
-                    pen.detected ? 'bg-primary/15 text-primary' : 'bg-muted text-muted-foreground',
-                  )}
-                  aria-hidden
-                >
-                  <PenLine className="h-4 w-4" />
-                </span>
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-semibold">
-                    {pen.detected ? pen.label : t('input.detectedPen')}
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    {pen.detected
-                      ? [
-                          pen.rateHz >= 60 ? `${pen.rateHz} Hz` : null,
-                        ].filter(Boolean).join(' · ') || t('input.pen.engine')
-                      : t('input.noPenYet')}
-                  </p>
+              {/* ---------- live pen-engine card: what the app detected */}
+              <div className="mb-3 rounded-xl border border-border bg-card p-3">
+                <div className="flex items-center gap-2">
+                  <span
+                    className={cn(
+                      'flex h-8 w-8 shrink-0 items-center justify-center rounded-full',
+                      pen.detected ? 'bg-primary/15 text-primary' : 'bg-muted text-muted-foreground',
+                    )}
+                    aria-hidden
+                  >
+                    <PenLine className="h-4 w-4" />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-semibold">
+                      {pen.detected ? pen.label : t('input.detectedPen')}
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      {pen.detected
+                        ? [pen.rateHz >= 60 ? `${pen.rateHz} Hz` : null].filter(Boolean).join(' · ') || t('input.pen.engine')
+                        : t('input.noPenYet')}
+                    </p>
+                  </div>
                 </div>
-              </div>
-              {pen.detected ? (
-                <div className="mt-2.5 flex flex-wrap gap-1.5" aria-label={t('input.pen.capabilities')}>
-                  {caps.map((c) => (
-                    <span
-                      key={c.label}
-                      className={cn(
-                        'rounded-full border px-2 py-0.5 text-[11px] font-medium',
-                        c.on
-                          ? 'border-primary/40 bg-primary/10 text-primary'
-                          : 'border-border bg-muted/60 text-muted-foreground/70 line-through',
-                      )}
-                    >
-                      {c.label}
-                    </span>
-                  ))}
-                  {pen.pressure ? (
-                    <span className="rounded-full border border-border bg-muted/60 px-2 py-0.5 text-[11px] font-medium tabular-nums text-muted-foreground">
-                      {calibrating
-                        ? `${t('input.pen.calibrated')} ${pen.pressureFloor.toFixed(2)}–${pen.pressureCeil.toFixed(2)} → 0–1`
-                        : '0–1'}
-                    </span>
-                  ) : null}
-                </div>
-              ) : null}
-              {pen.detected ? (
-                <div className="mt-2 border-t border-border pt-2">
-                  <p className="mb-1.5 text-[11px] font-medium text-muted-foreground">
-                    {t('input.pen.buttonsTitle')}
-                  </p>
-                  <div className="flex flex-wrap gap-1.5">
-                    {btns.map((b) => (
+                {pen.detected ? (
+                  <div className="mt-2.5 flex flex-wrap gap-1.5" aria-label={t('input.pen.capabilities')}>
+                    {caps.map((c) => (
                       <span
-                        key={b.label}
+                        key={c.label}
                         className={cn(
-                          'flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium',
-                          b.observed
-                            ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-                            : 'border-dashed border-border bg-muted/40 text-muted-foreground/70',
+                          'rounded-full border px-2 py-0.5 text-[11px] font-medium',
+                          c.on
+                            ? 'border-primary/40 bg-primary/10 text-primary'
+                            : 'border-border bg-muted/60 text-muted-foreground/70 line-through',
                         )}
                       >
-                        <Zap className="h-3 w-3" aria-hidden />
-                        {b.label}
-                        {b.observed ? ` · ${t('input.observed')}` : ''}
+                        {c.label}
                       </span>
                     ))}
+                    {pen.pressure ? (
+                      <span className="rounded-full border border-border bg-muted/60 px-2 py-0.5 text-[11px] font-medium tabular-nums text-muted-foreground">
+                        {calibrating
+                          ? `${t('input.pen.calibrated')} ${pen.pressureFloor.toFixed(2)}–${pen.pressureCeil.toFixed(2)} → 0–1`
+                          : '0–1'}
+                      </span>
+                    ) : null}
                   </div>
-                  {!pen.buttons ? (
-                    <p className="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
-                      {t('input.pen.noButtons')}
+                ) : null}
+                {pen.detected ? (
+                  <div className="mt-2 border-t border-border pt-2">
+                    <p className="mb-1.5 text-[11px] font-medium text-muted-foreground">
+                      {t('input.pen.buttonsTitle')}
                     </p>
-                  ) : null}
-                </div>
-              ) : null}
-            </div>
-
-            {/* ---------- pen model: auto-detect or pick the exact pen */}
-            <div className="mb-3 rounded-xl border border-border bg-card p-3">
-              <p className="mb-1.5 text-[11px] font-medium text-muted-foreground">{t('input.penModel')}</p>
-              <Select value={penProfileId} onValueChange={changePenProfile}>
-                <SelectTrigger className="h-9 w-full" aria-label={t('input.penModel')}>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent className="max-h-72">
-                  <SelectItem value="auto">
-                    {t('input.penModel.auto')}
-                    {pen.detected && penProfileId === 'auto' ? ` · ${pen.label}` : ''}
-                  </SelectItem>
-                  {PEN_VENDORS.map((g) => (
-                    <SelectGroup key={g.vendor}>
-                      <SelectLabel>{g.vendor}</SelectLabel>
-                      {g.models.map((m) => (
-                        <SelectItem key={m.id} value={m.id}>
-                          {lang === 'ar' ? m.nameAr : m.name}
-                        </SelectItem>
+                    <div className="flex flex-wrap gap-1.5">
+                      {btns.map((b) => (
+                        <span
+                          key={b.label}
+                          className={cn(
+                            'flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium',
+                            b.observed
+                              ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+                              : 'border-dashed border-border bg-muted/40 text-muted-foreground/70',
+                          )}
+                        >
+                          <Zap className="h-3 w-3" aria-hidden />
+                          {b.label}
+                          {b.observed ? ` · ${t('input.observed')}` : ''}
+                        </span>
                       ))}
-                    </SelectGroup>
-                  ))}
-                </SelectContent>
-              </Select>
-              <p className="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
-                {t('input.penModel.hint')}
+                    </div>
+                    {!pen.buttons ? (
+                      <p className="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
+                        {t('input.pen.noButtons')}
+                      </p>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+
+              {/* ---------- full pen management (DB + test pad + all patterns) */}
+              <Button
+                variant="outline"
+                className="mb-3 w-full justify-start gap-2 rounded-xl"
+                onClick={() => { setManageOpen(true); onOpenChange(false) }}
+                aria-label={t('pens.manage')}
+              >
+                <Database className="h-4 w-4" /> {t('pens.manage')}
+              </Button>
+
+              <div className="space-y-2.5 rounded-xl border border-border bg-card p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-sm font-medium">{t('settings.fingerDrawing')}</span>
+                  <Switch
+                    checked={fingerDrawing}
+                    onCheckedChange={(v) => void setSettings({ fingerDrawing: v })}
+                    aria-label={t('settings.fingerDrawing')}
+                  />
+                </div>
+                <p className="text-xs leading-relaxed text-muted-foreground">{t('settings.fingerDrawing.hint')}</p>
+
+                <div className="flex items-center justify-between gap-3 border-t border-border pt-3">
+                  <span className="text-sm font-medium">{t('settings.stylusOnly')}</span>
+                  <Switch
+                    checked={stylusOnly}
+                    onCheckedChange={(v) => void setSettings({ stylusOnly: v })}
+                    aria-label={t('settings.stylusOnly')}
+                  />
+                </div>
+                <p className="text-xs leading-relaxed text-muted-foreground">{t('settings.stylusOnly.hint')}</p>
+              </div>
+
+              {/* ---------- core bindings (quick access; all patterns in Manage) */}
+              <div className="mt-3 space-y-2.5">
+                <Row label={t('pens.pattern.press')} observed={(pen.buttons & bmap.primary) !== 0}>
+                  <ActionSelect
+                    value={penShortcuts.barrel.press}
+                    ariaLabel={t('input.barrel')}
+                    onChange={(a) => patch({ ...penShortcuts, barrel: { ...penShortcuts.barrel, press: a } })}
+                    penLabel={penLabel}
+                  />
+                </Row>
+                <Row label={t('pens.pattern.double')} observed={(pen.buttons & bmap.primary) !== 0}>
+                  <ActionSelect
+                    value={penShortcuts.barrel.double}
+                    ariaLabel={t('input.barrel')}
+                    onChange={(a) => patch({ ...penShortcuts, barrel: { ...penShortcuts.barrel, double: a } })}
+                    penLabel={penLabel}
+                  />
+                </Row>
+                <Row label={t('pens.pattern.long')} observed={(pen.buttons & bmap.primary) !== 0}>
+                  <ActionSelect
+                    value={penShortcuts.barrel.long}
+                    ariaLabel={t('input.barrel')}
+                    onChange={(a) => patch({ ...penShortcuts, barrel: { ...penShortcuts.barrel, long: a } })}
+                    penLabel={penLabel}
+                  />
+                </Row>
+                <Row label={t('input.eraser')} observed={(pen.buttons & 32) !== 0}>
+                  <ActionSelect
+                    value={penShortcuts.eraser.press}
+                    ariaLabel={t('input.eraser')}
+                    onChange={(a) => patch({ ...penShortcuts, eraser: { ...penShortcuts.eraser, press: a } })}
+                    penLabel={penLabel}
+                  />
+                </Row>
+                <Row label={t('input.doubleTap')} observed>
+                  <ActionSelect
+                    value={penShortcuts.doubleTap}
+                    ariaLabel={t('input.doubleTap')}
+                    onChange={(a) => patch({ ...penShortcuts, doubleTap: a })}
+                    penLabel={penLabel}
+                  />
+                </Row>
+              </div>
+              <p className="mt-2 flex items-start gap-1.5 text-[11px] leading-relaxed text-muted-foreground">
+                <Smartphone className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                {t('input.devicesHint')}
               </p>
-            </div>
+            </section>
 
-            <div className="space-y-3 rounded-xl border border-border bg-card p-3">
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-sm font-medium">{t('settings.fingerDrawing')}</span>
-                <Switch
-                  checked={fingerDrawing}
-                  onCheckedChange={(v) => void setSettings({ fingerDrawing: v })}
-                  aria-label={t('settings.fingerDrawing')}
-                />
+            {/* ------------------------------------------------ finger gestures */}
+            <section aria-label={t('input.fingerSection')}>
+              <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold text-muted-foreground">
+                <Hand className="h-4 w-4" /> {t('input.fingerSection')}
+              </h3>
+              <div className="space-y-2.5 rounded-xl border border-border bg-card p-3">
+                <Row label={t('input.fingerDoubleTap')}>
+                  <Select
+                    value={fingerGestures.doubleTap}
+                    onValueChange={(v) => void setSettings({ fingerGestures: { ...fingerGestures, doubleTap: v as FingerAction } })}
+                  >
+                    <SelectTrigger className="h-9 w-44" aria-label={t('input.fingerDoubleTap')}>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {FINGER_ACTIONS.map((a) => (
+                        <SelectItem key={a} value={a}>{fingerLabel(a)}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </Row>
+                <Row label={t('input.twoFingerTap')}>
+                  <Select
+                    value={fingerGestures.twoFingerTap}
+                    onValueChange={(v) => void setSettings({ fingerGestures: { ...fingerGestures, twoFingerTap: v as FingerAction } })}
+                  >
+                    <SelectTrigger className="h-9 w-44" aria-label={t('input.twoFingerTap')}>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {FINGER_ACTIONS.map((a) => (
+                        <SelectItem key={a} value={a}>{fingerLabel(a)}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </Row>
               </div>
-              <p className="text-xs leading-relaxed text-muted-foreground">{t('settings.fingerDrawing.hint')}</p>
+              <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">{t('input.gesturesHint')}</p>
+            </section>
+          </div>
+        </SheetContent>
+      </Sheet>
 
-              <div className="flex items-center justify-between gap-3 border-t border-border pt-3">
-                <span className="text-sm font-medium">{t('settings.stylusOnly')}</span>
-                <Switch
-                  checked={stylusOnly}
-                  onCheckedChange={(v) => void setSettings({ stylusOnly: v })}
-                  aria-label={t('settings.stylusOnly')}
-                />
-              </div>
-              <p className="text-xs leading-relaxed text-muted-foreground">{t('settings.stylusOnly.hint')}</p>
-            </div>
+      {/* full management sheet (database, test pad, every pattern) */}
+      <PenManagerSheet open={manageOpen} onOpenChange={setManageOpen} />
+    </>
+  );
+}
 
-            <div className="mt-3 space-y-2.5">
-              <Row label={t('input.barrel')} observed={(pen.buttons & bmap.primary) !== 0}>
-                <Select
-                  value={penShortcuts.barrel}
-                  onValueChange={(v) => void setSettings({ penShortcuts: { ...penShortcuts, barrel: v as PenAction } })}
-                >
-                  <SelectTrigger className="h-9 w-44" aria-label={t('input.barrel')}>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {PEN_ACTIONS.map((a) => (
-                      <SelectItem key={a} value={a}>{penLabel(a)}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </Row>
-              <Row label={t('input.barrel2')} observed={bmap.secondary != null && (pen.buttons & bmap.secondary) !== 0}>
-                <Select
-                  value={penShortcuts.barrel2}
-                  onValueChange={(v) => void setSettings({ penShortcuts: { ...penShortcuts, barrel2: v as PenAction } })}
-                >
-                  <SelectTrigger className="h-9 w-44" aria-label={t('input.barrel2')}>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {PEN_ACTIONS.map((a) => (
-                      <SelectItem key={a} value={a}>{penLabel(a)}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </Row>
-              <Row label={t('input.eraser')} observed={(pen.buttons & 32) !== 0}>
-                <Select
-                  value={penShortcuts.eraser ?? 'eraserHold'}
-                  onValueChange={(v) => void setSettings({ penShortcuts: { ...penShortcuts, eraser: v as PenAction } })}
-                >
-                  <SelectTrigger className="h-9 w-44" aria-label={t('input.eraser')}>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {PEN_ACTIONS.map((a) => (
-                      <SelectItem key={a} value={a}>{penLabel(a)}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </Row>
-              <Row label={t('input.doubleTap')} observed>
-                <Select
-                  value={penShortcuts.doubleTap}
-                  onValueChange={(v) => void setSettings({ penShortcuts: { ...penShortcuts, doubleTap: v as PenAction } })}
-                >
-                  <SelectTrigger className="h-9 w-44" aria-label={t('input.doubleTap')}>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {PEN_ACTIONS.map((a) => (
-                      <SelectItem key={a} value={a}>{penLabel(a)}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </Row>
-            </div>
-            <p className="mt-2 flex items-start gap-1.5 text-[11px] leading-relaxed text-muted-foreground">
-              <Smartphone className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              {t('input.devicesHint')}
-            </p>
-          </section>
-
-          {/* ------------------------------------------------ finger gestures */}
-          <section aria-label={t('input.fingerSection')}>
-            <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold text-muted-foreground">
-              <Hand className="h-4 w-4" /> {t('input.fingerSection')}
-            </h3>
-            <div className="space-y-2.5 rounded-xl border border-border bg-card p-3">
-              <Row label={t('input.fingerDoubleTap')}>
-                <Select
-                  value={fingerGestures.doubleTap}
-                  onValueChange={(v) => void setSettings({ fingerGestures: { ...fingerGestures, doubleTap: v as FingerAction } })}
-                >
-                  <SelectTrigger className="h-9 w-44" aria-label={t('input.fingerDoubleTap')}>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {FINGER_ACTIONS.map((a) => (
-                      <SelectItem key={a} value={a}>{fingerLabel(a)}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </Row>
-              <Row label={t('input.twoFingerTap')}>
-                <Select
-                  value={fingerGestures.twoFingerTap}
-                  onValueChange={(v) => void setSettings({ fingerGestures: { ...fingerGestures, twoFingerTap: v as FingerAction } })}
-                >
-                  <SelectTrigger className="h-9 w-44" aria-label={t('input.twoFingerTap')}>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {FINGER_ACTIONS.map((a) => (
-                      <SelectItem key={a} value={a}>{fingerLabel(a)}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </Row>
-            </div>
-            <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">{t('input.gesturesHint')}</p>
-          </section>
-        </div>
-      </SheetContent>
-    </Sheet>
+function ActionSelect({ value, onChange, ariaLabel, penLabel }: {
+  value: PenAction;
+  onChange: (a: PenAction) => void;
+  ariaLabel: string;
+  penLabel: (a: PenAction) => string;
+}) {
+  return (
+    <Select value={value} onValueChange={(v) => onChange(v as PenAction)}>
+      <SelectTrigger className="h-9 w-44" aria-label={ariaLabel}>
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent className="max-h-64">
+        {PEN_ACTIONS.map((a) => (
+          <SelectItem key={a} value={a}>{penLabel(a)}</SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
   );
 }
 
@@ -348,7 +311,6 @@ function Row({ label, observed, children }: { label: string; observed?: boolean;
         {observed === true ? (
           <span
             className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500"
-            title="detected on this pen"
             aria-label="detected on this pen"
           />
         ) : null}

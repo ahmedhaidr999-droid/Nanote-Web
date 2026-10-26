@@ -36,7 +36,7 @@
 //     In windowed mode the page edge is drawn INTO the bitmap at a constant
 //     1-device-pixel width and a pointer-events-none frame div carries the
 //     page shadow.
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '@/lib/nanote/store';
 import { renderPage } from '@/lib/nanote/render';
 import { preloadPageImages, resolveImage, imageNatural } from '@/lib/nanote/images';
@@ -381,10 +381,13 @@ export default function PageCanvas({
 
   // content changes → full paint (doc/image load, undo/redo, bucket change,
   // vector bg arrival, highlighter opacity, audio sync). `win` IS a dep: the
-  // zoom-settle pass moves the render window and the fresh slice must paint —
-  // the original omitted it, so the canvas kept its old bitmap stretched into
-  // the new box (the pixelated-ink bug at any zoom change).
-  useEffect(() => {
+  // zoom-settle pass moves the render window and the fresh slice must paint.
+  // LAYOUT EFFECT, CRITICAL: the canvas box (left/top/width/height) and its
+  // BITMAP must update in the SAME commit — before the browser paints. A
+  // plain useEffect runs AFTER the paint, so one frame showed the OLD window
+  // bitmap stretched into the NEW box = the ink visibly JUMPED positions right
+  // after each zoom (the "zooming moves my writing" bug).
+  useLayoutEffect(() => {
     void requestPaint(true);
   }, [requestPaint, rasterTick, vectorTick, win]);
 
@@ -395,7 +398,7 @@ export default function PageCanvas({
   // (undefined) after a paintFromDoc identity change guarantees one paint
   // whenever the doc/content changed, so nothing ever ends up stale.
   const lastHiddenSigRef = useRef<string | null | undefined>(undefined);
-  useEffect(() => {
+  useLayoutEffect(() => {
     lastHiddenSigRef.current = undefined; // content may have changed — repaint once
     return onRepaint(() => {
       const hidden = getHiddenIds(page.id) ?? null;

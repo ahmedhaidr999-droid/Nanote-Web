@@ -17,6 +17,7 @@
 //   • a subscribe/useSyncExternalStore bus for React.
 import { useSyncExternalStore } from 'react';
 import { pageAtWorldY, getVp, type PageLayout } from './viewport';
+import { glyphBand } from '@/lib/nanote/pdftext';
 
 // ---------------------------------------------------------------- types
 export interface CaretPoint { node: Node; offset: number }
@@ -33,6 +34,7 @@ export interface TextSel {
   anchor: CaretPoint;
   focus: CaretPoint;
   picked?: boolean;  // fresh long-press/tap word pick → rects pop in once
+  tight?: boolean;   // rects are glyph-band tight (PDF baseline metrics present)
   startPt: { x: number; y: number } | null; // world-space anchor of the start drag handle
   endPt: { x: number; y: number } | null;   // …and of the end handle (document order)
 }
@@ -228,6 +230,87 @@ function mergeLineRects(rects: SelRect[]): SelRect[] {
   return lines;
 }
 
+/**
+ * TIGHT glyph-band rects — the "selection is bigger than the text" fix.
+ * The DOM span boxes span the full em (line-height), but the VISIBLE ink of
+ * the selected characters is usually far shorter: a word like "more" only
+ * reaches x-height, "yes" adds one descender, "Type" the cap height. For each
+ * text-node FRAGMENT of the range we read the parent span's PDF-derived
+ * baseline (data-b) + em size (data-f), classify the fragment's characters
+ * (glyphBand) and emit a rect that hugs the real ink — so the selection
+ * indicator, the highlighter band and the underline all match the text and
+ * never cross into the line above or below.
+ * Returns null when any fragment lacks the PDF metrics (pre-basline cache)
+ * — the caller then falls back to the legacy full-em rects.
+ */
+function tightFragments(range: Range, scale: number): { pageId: string; rects: SelRect[] }[] | null {
+  const out = new Map<string, SelRect[]>();
+  // enumerate the range's text-node fragments
+  const frags: { node: Text; start: number; end: number }[] = [];
+  const root = range.commonAncestorContainer;
+  if (root.nodeType === Node.TEXT_NODE) {
+    const t = root as Text;
+    let s = 0, e = (t.data ?? '').length;
+    if (range.startContainer === t) s = range.startOffset;
+    if (range.endContainer === t) e = range.endOffset;
+    if (range.startContainer === t && range.endContainer === t) { s = range.startOffset; e = range.endOffset }
+    if (e > s) frags.push({ node: t, start: s, end: e });
+  } else {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let n: Node | null;
+    while ((n = walker.nextNode())) {
+      const t = n as Text;
+      let s = 0, e = (t.data ?? '').length;
+      if (t === range.startContainer) s = range.startOffset;
+      if (t === range.endContainer) e = range.endOffset;
+      if (e > s) frags.push({ node: t, start: s, end: e });
+    }
+  }
+  if (!frags.length) return null;
+  for (const frag of frags) {
+    const span = frag.node.parentElement;
+    if (!span) return null;
+    const bAttr = span.getAttribute('data-b');
+    const fAttr = span.getAttribute('data-f');
+    const pageDiv = (span.closest('[data-pagetext]') as HTMLElement | null);
+    if (bAttr == null || fAttr == null || !pageDiv) return null; // legacy spans → fallback
+    const b = +bAttr, f = Math.max(1, +fAttr);
+    // fragment client rect (union of its sub-range rects)
+    let r: { x: number; y: number; width: number; height: number } | null = null;
+    try {
+      const sub = document.createRange();
+      sub.setStart(frag.node, frag.start);
+      sub.setEnd(frag.node, frag.end);
+      for (const cr of sub.getClientRects()) {
+        if (!r) r = { x: cr.x, y: cr.y, width: cr.width, height: cr.height };
+        else {
+          const x0 = Math.min(r.x, cr.x), y0 = Math.min(r.y, cr.y);
+          r = { x: x0, y: y0, width: Math.max(r.x + r.width, cr.x + cr.width) - x0, height: Math.max(r.y + r.height, cr.y + cr.height) - y0 };
+        }
+      }
+    } catch { return null }
+    if (!r) return null;
+    // client → page-local (the page div already carries the world transform)
+    const pd = pageDiv.getBoundingClientRect();
+    const px = (r.x - pd.left) / scale;
+    const pw = r.width / scale;
+    // the ink band of THIS fragment's characters
+    const band = glyphBand(frag.node.data.slice(frag.start, frag.end));
+    const top = b - band.asc * f;
+    const bottom = b + band.desc * f;
+    const pageId = pageDiv.dataset.pagetext ?? '';
+    let list = out.get(pageId);
+    if (!list) { list = []; out.set(pageId, list) }
+    list.push({ x: px, y: top, w: pw, h: Math.max(1, bottom - top) });
+  }
+  const byPage: { pageId: string; rects: SelRect[] }[] = [];
+  for (const [pageId, rects] of out) {
+    const merged = mergeLineRects(rects);
+    if (merged.length) byPage.push({ pageId, rects: merged });
+  }
+  return byPage.length ? byPage : null;
+}
+
 /** Client point of a caret via its collapsed range rect — the drag handles
  *  ride ~0.73em down the line, just above the baseline like native grips.
  *  Null when the browser reports no measurable rect for the caret. */
@@ -277,13 +360,67 @@ export function setSelectionFromCarets(anchor: CaretPoint, focus: CaretPoint, pi
   const text = range.toString();
   if (!text.trim()) { clearTextSel(); return null }
 
+  const { scale } = getVp();
+
+  // TIGHT glyph-band rects first (the indicator + highlight hug the real
+  // ink); falls back to the legacy full-em boxes when the spans carry no
+  // PDF baseline metrics (old cached text layers)
+  const tight = tightFragments(range, scale);
+  let top = Infinity, bottom = -Infinity, cxSum = 0, nLines = 0;
+  const byPage = new Map<string, PageRects>();
+
+  if (tight) {
+    for (const { pageId, rects } of tight) {
+      const layout = layouts.find((l) => l.id === pageId);
+      if (!layout) continue;
+      let entry = byPage.get(pageId);
+      if (!entry) { entry = { pageId, rects: [] }; byPage.set(pageId, entry) }
+      for (const r of rects) {
+        const wy = layout.y + r.y;
+        top = Math.min(top, wy);
+        bottom = Math.max(bottom, wy + r.h);
+        cxSum += r.x + r.w / 2;
+        nLines += 1;
+        entry.rects.push(r);
+      }
+    }
+  }
+  if (nLines > 0) {
+    const next0: TextSel = {
+      top, bottom, cx: cxSum / nLines,
+      byPage: [...byPage.values()],
+      text, anchor, focus, picked,
+      tight: true,
+      startPt: null, endPt: null,
+    };
+    // drag-handle anchors stay where they were (caret-based — see below)
+    const anchorFirst = compareCarets(anchor, focus) <= 0;
+    const sC = anchorFirst ? anchor : focus;
+    const eC = anchorFirst ? focus : anchor;
+    const mirrorRect = mirror.getBoundingClientRect();
+    const toWorld = (p: { x: number; y: number } | null) =>
+      p ? { x: (p.x - mirrorRect.x) / scale, y: (p.y - mirrorRect.y) / scale } : null;
+    next0.startPt = toWorld(caretClientPoint(sC));
+    next0.endPt = toWorld(caretClientPoint(eC));
+    if (!next0.startPt || !next0.endPt) {
+      const f = next0.byPage[0]?.rects[0];
+      const l = next0.byPage[next0.byPage.length - 1]?.rects.slice(-1)[0];
+      const fl = layouts.find((x) => x.id === next0.byPage[0]?.pageId);
+      const ll = layouts.find((x) => x.id === next0.byPage[next0.byPage.length - 1]?.pageId);
+      if (f && fl) next0.startPt = next0.startPt ?? { x: f.x, y: fl.y + f.y + f.h * 0.73 };
+      if (l && ll) next0.endPt = next0.endPt ?? { x: l.x + l.w, y: ll.y + l.y + l.h * 0.73 };
+    }
+    state = next0;
+    notify();
+    return next0;
+  }
+
+  // -------- legacy path (no PDF baseline metrics on the spans) --------
   const clientRects = Array.from(range.getClientRects(), (r) => ({ x: r.x, y: r.y, w: r.width, h: r.height }));
   if (!clientRects.length) { clearTextSel(); return null }
 
   const mirrorRect = mirror.getBoundingClientRect();
-  const { scale } = getVp();
-  let top = Infinity, bottom = -Infinity, cxSum = 0;
-  const byPage = new Map<string, PageRects>();
+  top = Infinity; bottom = -Infinity; cxSum = 0;
   const merged = mergeLineRects(clientRects);
   for (const r of merged) {
     const wx = (r.x - mirrorRect.x) / scale;

@@ -120,30 +120,92 @@ export type LaserMode = 'normal' | 'timed';
 /** actions a stylus hardware button / gesture can perform */
 export type PenAction =
   | 'none' | 'eraserHold' | 'eraserToggle' | 'pen' | 'highlighter' | 'laser'
-  | 'lasso' | 'text' | 'shape' | 'pan' | 'undo' | 'redo' | 'pagePrev' | 'pageNext';
+  | 'lasso' | 'text' | 'shape' | 'pan' | 'undo' | 'redo' | 'pagePrev' | 'pageNext'
+  // pen-DB v2 actions (Settings → Electronic pens)
+  | 'colorNext'   // cycle the ink palette of the current tool
+  | 'widthUp' | 'widthDown' // thicker / thinner stroke
+  | 'zoomIn' | 'zoomOut'
+  | 'toggleToolbar' // show/hide the tool dock
+  | 'quickExport';   // export the current page as PNG (quick capture)
 /** actions a finger tap gesture can perform */
 export type FingerAction = 'none' | 'zoom' | 'undo' | 'redo' | 'eraserToggle' | 'pen';
 
+/**
+ * One physical pen control, bindable per EVENT PATTERN:
+ *   press        — single press while HOVERING (no tip contact)
+ *   pressWriting — single press while the tip is WRITING (contact); defaults
+ *                  to `press` when unset — one binding covers both contexts
+ *   double       — two quick presses
+ *   long         — held ≥ 650 ms (releases back to the previous tool)
+ */
+export interface PenTriggerBinding {
+  press: PenAction;
+  pressWriting?: PenAction;
+  double: PenAction;
+  long: PenAction;
+}
+
 export interface PenShortcutPrefs {
-  barrel: PenAction;    // primary side button held during contact (Wacom/S Pen/Surface/USI)
-  barrel2: PenAction;   // secondary side button (3-button styluses)
-  doubleTap: PenAction; // quick double-tap of the pen tip (works on every stylus)
-  eraser: PenAction;    // dedicated eraser end/button (Surface & MPP pens, bit 32)
+  barrel: PenTriggerBinding;      // primary side button (Wacom/S Pen/Surface/USI/Xiaomi…)
+  barrel2: PenTriggerBinding;     // secondary side button (3-button styluses)
+  doubleTap: PenAction;           // quick double-tap of the pen tip (every stylus)
+  eraser: PenTriggerBinding;      // dedicated eraser end/button (Surface & MPP pens, bit 32)
 }
 export interface FingerGesturePrefs {
   doubleTap: FingerAction;    // one-finger double tap
   twoFingerTap: FingerAction; // quick two-finger tap (no pinch movement)
 }
 export const PEN_SHORTCUTS_DEFAULT: PenShortcutPrefs = {
-  barrel: 'eraserHold',
-  barrel2: 'undo',
+  barrel: { press: 'eraserHold', double: 'eraserToggle', long: 'none' },
+  barrel2: { press: 'undo', double: 'redo', long: 'none' },
   doubleTap: 'eraserToggle',
-  eraser: 'eraserHold',
+  eraser: { press: 'eraserHold', double: 'none', long: 'none' },
 };
 export const FINGER_GESTURES_DEFAULT: FingerGesturePrefs = {
   doubleTap: 'zoom',
   twoFingerTap: 'undo',
 };
+
+/**
+ * Migrate a persisted penShortcuts object to the current schema. v1 stored a
+ * flat { barrel: PenAction, barrel2, doubleTap, eraser } — strings; v2 stores
+ * per-pattern bindings. Old values map to the `press` pattern of each trigger.
+ * Unknown fields are dropped; missing fields fall back to the defaults.
+ */
+export function migratePenShortcuts(raw: unknown): PenShortcutPrefs {
+  const out: PenShortcutPrefs = {
+    barrel: { ...PEN_SHORTCUTS_DEFAULT.barrel },
+    barrel2: { ...PEN_SHORTCUTS_DEFAULT.barrel2 },
+    doubleTap: PEN_SHORTCUTS_DEFAULT.doubleTap,
+    eraser: { ...PEN_SHORTCUTS_DEFAULT.eraser },
+  };
+  if (!raw || typeof raw !== 'object') return out;
+  const r = raw as Record<string, unknown>;
+  const fix = (v: unknown): PenAction | null => (typeof v === 'string' ? (v as PenAction) : null);
+  const mergeTrigger = (key: 'barrel' | 'barrel2' | 'eraser') => {
+    const val = r[key];
+    if (typeof val === 'string') {
+      // v1 shape — a single action on the trigger's press
+      const a = fix(val);
+      if (a) (out[key] as PenTriggerBinding).press = a;
+      return;
+    }
+    if (val && typeof val === 'object') {
+      const b = val as Record<string, unknown>;
+      const tgt = out[key] as PenTriggerBinding;
+      const p = fix(b.press); if (p) tgt.press = p;
+      const pw = fix(b.pressWriting); if (pw) tgt.pressWriting = pw;
+      const d = fix(b.double); if (d) tgt.double = d;
+      const l = fix(b.long); if (l) tgt.long = l;
+    }
+  };
+  mergeTrigger('barrel');
+  mergeTrigger('barrel2');
+  mergeTrigger('eraser');
+  const dt = fix(r.doubleTap);
+  if (dt) out.doubleTap = dt;
+  return out;
+}
 
 export interface Settings {
   theme: ThemeMode;
@@ -283,6 +345,11 @@ export interface ImageEl {
   flipH?: boolean;            // mirror horizontally (survives the NINK JSON section)
   flipV?: boolean;            // mirror vertically
   cornerRadius?: number; // px in page-space; 0/undefined = sharp corners
+  /** crop window into the source image, normalized 0..1 of the natural bitmap
+   * ({x,y} top-left in source pixels; {w,h} fractions of the natural size).
+   * undefined = show the whole image. Set by the crop tool — the element box
+   * then frames exactly the cropped region. */
+  crop?: { x: number; y: number; w: number; h: number };
   z: number;
 }
 
@@ -302,7 +369,8 @@ export function emptyDoc(): PageDoc { return { version: 1, elements: [], sync: {
 
 // ---------------------------------------------------------------- pdf text layer (cached, regenerable from the stored original)
 /** One pdf.js text item positioned in ink-space (page units, y-down from page top). */
-export interface PdfTextItem { str: string; x: number; y: number; w: number; h: number }
+export interface PdfTextItem { str: string; x: number; y: number; w: number; h: number; /** glyph baseline in page-local ink px (y-down) — powers the tight
+     * glyph-band selection rects; undefined on cached pre-v1.6 items */ b?: number }
 export interface PdfTextRec { pageId: string; items: PdfTextItem[]; updatedAt: number }
 
 // ---------------------------------------------------------------- palettes

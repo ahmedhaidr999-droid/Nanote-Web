@@ -42,6 +42,8 @@ const PageText = memo(function PageText({ pageId, layoutY, pageH, pageW, items }
         <span
           key={i}
           dir="ltr"
+          data-b={it.b != null ? it.b : undefined}
+          data-f={it.h}
           style={{
             position: 'absolute',
             left: it.x, top: it.y, width: it.w, height: it.h,
@@ -271,15 +273,23 @@ export function TextLayer({ layouts, pageW, notebookId }: {
         const els: ShapeEl[] = rects.map((r) => {
           const el: ShapeEl = kind === 'highlight'
             ? {
+                // TIGHT rects already hug the visible glyph ink (character-aware
+                // band) — ±1 hair only, never the old full-em box that crossed
+                // into the lines above/below. Legacy fallback rects keep the
+                // small breathing margin.
                 kind: 'shape', id: uid(), shape: 'rect',
                 x: r.x, y: r.y - 1, w: r.w, h: r.h + 2,
                 stroke: '#FFD84D', strokeWidth: 0.001, fill: '#FFD84D59', z,
               }
             : {
                 kind: 'shape', id: uid(), shape: 'line',
-                // the pdf.js text box spans ascent→baseline, so a clean
-                // underline sits just BELOW the box (over the descender zone)
-                x: r.x, y: r.y + r.h + Math.max(2, r.h * 0.1), w: r.w, h: 0,
+                // underline position: with the TIGHT band the rect bottom sits
+                // just under the baseline (or under the descenders) — one unit
+                // down is the typographic underline spot; the legacy path keeps
+                // the old below-the-box offset (its box bottom = baseline).
+                x: r.x,
+                y: sel.tight ? r.y + r.h + 1 : r.y + r.h + Math.max(2, r.h * 0.1),
+                w: r.w, h: 0,
                 stroke: '#E5484D', strokeWidth: 2.5, fill: null, z,
               };
           z += 1;

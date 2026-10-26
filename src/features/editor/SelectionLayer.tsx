@@ -3,13 +3,13 @@
 // lasso selection. Drags (move/scale/rotate) preview on the live overlay and
 // commit as a single undoable command.
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Copy, Scissors, ClipboardPaste, Trash2, CopyPlus, Palette, X, RotateCw, RotateCcw, FlipHorizontal, FlipVertical, BringToFront, SendToBack, Image as ImageIcon, Squircle } from 'lucide-react';
+import { Copy, Scissors, ClipboardPaste, Trash2, CopyPlus, Palette, X, RotateCw, RotateCcw, FlipHorizontal, FlipVertical, BringToFront, SendToBack, Image as ImageIcon, Squircle, Crop, Check } from 'lucide-react';
 import { toast } from 'sonner';
 import { useApp, useT } from '@/lib/nanote/store';
 import { PageElement, PageDoc, TextEl, ImageEl } from '@/lib/nanote/types';
 import { drawStroke, drawText, drawShape, drawImageEl } from '@/lib/nanote/render';
 import { resolveImage, imageNatural } from '@/lib/nanote/images';
-import { elementBBox, transformElement, unionBBox } from '@/lib/nanote/geometry';
+import { elementBBox, imageLocalPoint, resizeImageCorner, transformElement, unionBBox } from '@/lib/nanote/geometry';
 import { cn } from '@/lib/utils';
 import { Slider } from '@/components/ui/slider';
 import {
@@ -20,9 +20,12 @@ import { ColorPopover } from './ColorPopover';
 
 type Drag =
   | { kind: 'move'; startWorld: { x: number; y: number }; dx: number; dy: number }
-  | { kind: 'resize'; corner: 'nw' | 'ne' | 'sw' | 'se'; startWorld: { x: number; y: number }; startBBox: { x0: number; y0: number; x1: number; y1: number }; sx: number; sy: number }
+  | { kind: 'resize'; corner: 'nw' | 'ne' | 'sw' | 'se'; startWorld: { x: number; y: number }; startBBox: { x0: number; y0: number; x1: number; y1: number }; sx: number; sy: number; startEl: ImageEl | null; previewEl: ImageEl | null }
   | { kind: 'rotate'; startAngle: number; rotation: number }
   | null;
+
+/** crop window in IMAGE-LOCAL coordinates (top-left based, 0..el.w × 0..el.h) */
+interface CropRect { x0: number; y0: number; x1: number; y1: number }
 
 export function SelectionLayer({
   layouts,
@@ -45,6 +48,7 @@ export function SelectionLayer({
   const cornerPageRef = useRef<string | null>(null);   // page whose ids are hidden for the preview
   const cornersAnchorRef = useRef<HTMLDivElement>(null); // toggle button wrapper (outside-click ignore)
   const [imgOptsOpen, setImgOptsOpen] = useState(false);
+  const [cropState, setCropState] = useState<{ forId: string; rect: CropRect } | null>(null);
   const imgOptsAnchorRef = useRef<HTMLDivElement>(null); // toggle button wrapper (outside-click ignore)
 
   const activePageLayout = useMemo(
@@ -81,11 +85,15 @@ export function SelectionLayer({
             const moved = transformElement(el, { dx: drag.dx, dy: drag.dy });
             drawTransformed(ctx, moved, gamma);
           } else if (drag.kind === 'resize') {
-            const moved = transformElement(el, {
-              sx: drag.sx, sy: drag.sy,
-              ox: drag.startBBox.x0, oy: drag.startBBox.y0,
-            });
-            drawTransformed(ctx, moved, gamma);
+            if (drag.previewEl && el.kind === 'image') {
+              drawTransformed(ctx, drag.previewEl, gamma); // exact rotated resize preview
+            } else {
+              const moved = transformElement(el, {
+                sx: drag.sx, sy: drag.sy,
+                ox: drag.startBBox.x0, oy: drag.startBBox.y0,
+              });
+              drawTransformed(ctx, moved, gamma);
+            }
           } else if (drag.kind === 'rotate') {
             if (el.kind === 'image' && selectedEls.length === 1) {
               drawTransformed(ctx, { ...el, rotation: drag.rotation }, gamma);
@@ -132,17 +140,110 @@ export function SelectionLayer({
   const isImageOnly = selectedEls.length === 1 && selectedEls[0].kind === 'image';
   const interactive = tool === 'lasso' || tool === 'image';
 
+
+  // ---------------------------------------------------------------- crop session
+  const startCrop = () => {
+    if (!imgEl) return;
+    setImgOptsOpen(false);
+    setCornersOpen(false);
+    setCropState({ forId: imgEl.id, rect: { x0: 0, y0: 0, x1: imgEl.w, y1: imgEl.h } });
+  };
+
+  const dragCropCorner = (e: React.PointerEvent, corner: 'nw' | 'ne' | 'sw' | 'se') => {
+    if (!imgEl || !cropRect || !activePageLayout) return;
+    e.stopPropagation();
+    try { (e.target as HTMLElement).setPointerCapture(e.pointerId) } catch { /* pointer gone */ }
+    const host = (e.currentTarget as HTMLElement).closest('[data-viewport]') as HTMLElement;
+    const rect = host.getBoundingClientRect();
+    const minW = Math.max(12, imgEl.w * 0.04);
+    const minH = Math.max(12, imgEl.h * 0.04);
+    const onMove = (ev: PointerEvent) => {
+      const v = getVp();
+      const px = ev.clientX - rect.left, py = ev.clientY - rect.top;
+      const world = { x: (px - v.tx) / v.scale, y: (py - v.ty) / v.scale };
+      // world → image-local (image coords are PAGE-LOCAL: shift world y by the page origin)
+      const lp = imageLocalPoint(imgEl, world.x, world.y - activePageLayout.y);
+      const lx = lp.x + imgEl.w / 2;
+      const ly = lp.y + imgEl.h / 2;
+      setCropState((cs) => {
+        const r = cs && cs.forId === imgEl.id ? cs.rect : null;
+        if (!r || !cs) return cs;
+        let { x0, y0, x1, y1 } = r;
+        if (corner === 'nw' || corner === 'sw') x0 = Math.min(Math.max(0, lx), x1 - minW);
+        else x1 = Math.max(Math.min(imgEl.w, lx), x0 + minW);
+        if (corner === 'nw' || corner === 'ne') y0 = Math.min(Math.max(0, ly), y1 - minH);
+        else y1 = Math.max(Math.min(imgEl.h, ly), y0 + minH);
+        return { forId: cs.forId, rect: { x0, y0, x1, y1 } };
+      });
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  };
+
+  /** Apply the crop window: the visible region becomes the image's new bounds
+   * (a normalized source-rect `crop` on the element — undoable, lossless). */
+  const applyCrop = () => {
+    if (!imgEl || !cropRect || !selection) return;
+    const nat = imageNatural(imgEl.imageId) ?? { w: imgEl.w, h: imgEl.h };
+    // current source window (existing crop or the whole bitmap)
+    let s0 = 0, s1 = nat.w, t0 = 0, t1 = nat.h;
+    if (imgEl.crop) {
+      s0 = imgEl.crop.x * nat.w; t0 = imgEl.crop.y * nat.h;
+      s1 = s0 + imgEl.crop.w * nat.w; t1 = t0 + imgEl.crop.h * nat.h;
+    }
+    const sw = Math.max(1, s1 - s0), sh = Math.max(1, t1 - t0);
+    // cover-fit transform of the source window into the element box
+    const s = Math.max(Math.abs(imgEl.w) / sw, Math.abs(imgEl.h) / sh);
+    const ox = (Math.abs(imgEl.w) - sw * s) / 2;
+    const oy = (Math.abs(imgEl.h) - sh * s) / 2;
+    // element-local crop window → natural source pixels
+    const su0 = s0 + (cropRect.x0 - ox) / s, su1 = s0 + (cropRect.x1 - ox) / s;
+    const sv0 = t0 + (cropRect.y0 - oy) / s, sv1 = t0 + (cropRect.y1 - oy) / s;
+    // new element box = the world-space rect of the local crop window
+    const newW = Math.max(1, cropRect.x1 - cropRect.x0);
+    const newH = Math.max(1, cropRect.y1 - cropRect.y0);
+    const cx = imgEl.x + imgEl.w / 2, cy = imgEl.y + imgEl.h / 2;
+    const midX = (cropRect.x0 + cropRect.x1) / 2 - imgEl.w / 2;
+    const midY = (cropRect.y0 + cropRect.y1) / 2 - imgEl.h / 2;
+    const cos = Math.cos(imgEl.rotation), sin = Math.sin(imgEl.rotation);
+    const ncx = cx + midX * cos - midY * sin;
+    const ncy = cy + midX * sin + midY * cos;
+    const after: ImageEl = {
+      ...imgEl,
+      x: ncx - newW / 2, y: ncy - newH / 2, w: newW, h: newH,
+      crop: {
+        x: Math.max(0, su0 / nat.w),
+        y: Math.max(0, sv0 / nat.h),
+        w: Math.min(1, (su1 - su0) / nat.w),
+        h: Math.min(1, (sv1 - sv0) / nat.h),
+      },
+    };
+    if (after.crop!.x <= 0.001 && after.crop!.y <= 0.001 && after.crop!.w >= 0.999 && after.crop!.h >= 0.999) {
+      delete after.crop; // degenerate full-frame crop → drop the field
+    }
+    useApp.getState().patchElements(selection.pageId, [{ id: imgEl.id, before: imgEl, after }], 'image');
+    setCropState(null);
+    requestRepaint();
+    toast.success(t('tool.image.crop.done', 'Cropped', 'تم القص'));
+  };
+
   // ---------------------------------------------------------------- drag handling
   const startDrag = (e: React.PointerEvent, kind: 'move' | 'resize' | 'rotate', corner?: 'nw' | 'ne' | 'sw' | 'se') => {
     if (!selection || !bbox || !activePageLayout) return;
+    if (cropping && kind !== 'move') return; // the crop session owns the gestures
     e.stopPropagation();
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    try { (e.target as HTMLElement).setPointerCapture(e.pointerId) } catch { /* pointer gone */ }
     const host = (e.currentTarget as HTMLElement).closest('[data-viewport]') as HTMLElement;
     const rect = host.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
     const world = { x: (sx - vp.tx) / vp.scale, y: (sy - vp.ty) / vp.scale };
+    const startEl = kind === 'resize' && singleImage && imgEl ? imgEl : null;
     if (kind === 'move') dragRef.current = { kind: 'move', startWorld: world, dx: 0, dy: 0 };
-    if (kind === 'resize' && corner) dragRef.current = { kind: 'resize', corner, startWorld: world, startBBox: bbox, sx: 1, sy: 1 };
+    if (kind === 'resize' && corner) dragRef.current = { kind: 'resize', corner, startWorld: world, startBBox: bbox, sx: 1, sy: 1, startEl, previewEl: startEl };
     if (kind === 'rotate') {
       const img = selectedEls[0] as Extract<PageElement, { kind: 'image' }>;
       const cx = img.x + img.w / 2, cy = img.y + img.h / 2;
@@ -153,12 +254,20 @@ export function SelectionLayer({
     const onMove = (ev: PointerEvent) => {
       const drag = dragRef.current;
       if (!drag) return;
+      const v = getVp(); // live viewport — never a stale snapshot mid-gesture
       const px = ev.clientX - rect.left, py = ev.clientY - rect.top;
-      const w = { x: (px - vp.tx) / vp.scale, y: (py - vp.ty) / vp.scale };
+      const w = { x: (px - v.tx) / v.scale, y: (py - v.ty) / v.scale };
       if (drag.kind === 'move') {
         drag.dx = w.x - drag.startWorld.x;
         drag.dy = w.y - drag.startWorld.y;
       } else if (drag.kind === 'resize') {
+        if (drag.startEl) {
+          // single image: exact corner-anchored, rotation-aware, aspect-locked
+          // by default (Shift = free), clamped to min/max side bounds — the
+          // opposite corner stays GLUED to the screen (the old AABB scaling
+          // visibly swam rotated images around)
+          drag.previewEl = resizeImageCorner(drag.startEl, drag.corner, w, { free: ev.shiftKey });
+        }
         const b = drag.startBBox;
         const wSpan = Math.max(8, b.x1 - b.x0);
         const hSpan = Math.max(8, b.y1 - b.y0);
@@ -189,13 +298,18 @@ export function SelectionLayer({
       const els = doc.elements.filter((el) => selection.ids.includes(el.id));
       const changed =
         (drag.kind === 'move' && (Math.abs(drag.dx) > 0.5 || Math.abs(drag.dy) > 0.5)) ||
-        (drag.kind === 'resize' && (Math.abs(drag.sx - 1) > 0.01 || Math.abs(drag.sy - 1) > 0.01)) ||
+        (drag.kind === 'resize' && (drag.previewEl
+          ? (drag.previewEl.w !== drag.startEl!.w || drag.previewEl.h !== drag.startEl!.h || drag.previewEl.x !== drag.startEl!.x || drag.previewEl.y !== drag.startEl!.y)
+          : (Math.abs(drag.sx - 1) > 0.01 || Math.abs(drag.sy - 1) > 0.01))) ||
         (drag.kind === 'rotate');
       if (!changed) { setHiddenIds(selection.pageId, null); requestRepaint(); return }
       const patches = els.map((el) => {
         let after: PageElement;
         if (drag.kind === 'move') after = transformElement(el, { dx: drag.dx, dy: drag.dy });
-        else if (drag.kind === 'resize') after = transformElement(el, { sx: drag.sx, sy: drag.sy, ox: drag.startBBox.x0, oy: drag.startBBox.y0 });
+        else if (drag.kind === 'resize') {
+          if (drag.previewEl && el.kind === 'image') after = drag.previewEl as PageElement;
+          else after = transformElement(el, { sx: drag.sx, sy: drag.sy, ox: drag.startBBox.x0, oy: drag.startBBox.y0 });
+        }
         else after = { ...el } as PageElement;
         if (drag.kind === 'rotate' && el.kind === 'image') {
           after = { ...(after as Extract<PageElement, { kind: 'image' }>), rotation: drag.rotation } as PageElement;
@@ -222,11 +336,87 @@ export function SelectionLayer({
     ? { x: rotC.x + Math.cos(imgEl.rotation) * (boxH / 2 + 34), y: rotC.y + Math.sin(imgEl.rotation) * (boxH / 2 + 34) }
     : null;
 
+  // the crop session belongs to ONE image id — selecting anything else ends it
+  const cropRect = cropState && imgEl && cropState.forId === imgEl.id ? cropState.rect : null;
+  const cropping = !!cropRect && !!imgEl;
+
   const barTop = tl.y - 52 < 8 ? br.y + 12 : tl.y - 52;
+
+  // ---- crop overlay (rotated frame riding the image, dim outside the window)
+  const cropOverlay = (() => {
+    if (!cropping || !imgEl || !cropRect || !rotC) return null;
+    const sc = vp.scale;
+    const imgW = imgEl.w * sc, imgH = imgEl.h * sc;
+    const cw = (cropRect.x1 - cropRect.x0) * sc;
+    const ch = (cropRect.y1 - cropRect.y0) * sc;
+    const cx0 = cropRect.x0 * sc, cy0 = cropRect.y0 * sc;
+    const cornerAt = (c: 'nw' | 'ne' | 'sw' | 'se') => ({
+      left: (c === 'nw' || c === 'sw' ? cx0 : cx0 + cw) - 14,
+      top: (c === 'nw' || c === 'ne' ? cy0 : cy0 + ch) - 14,
+    });
+    return (
+      <div
+        className="absolute z-20"
+        style={{
+          left: rotC.x, top: rotC.y,
+          width: 0, height: 0,
+          transform: `rotate(${imgEl.rotation}rad)`,
+          pointerEvents: 'none',
+        }}
+        aria-label={t('tool.image.crop', 'Crop image', 'قص الصورة')}
+      >
+        {/* dim everything outside the crop window (huge box-shadow = the hole) */}
+        <div
+          className="absolute bg-transparent"
+          style={{
+            left: -imgW / 2 + cx0, top: -imgH / 2 + cy0, width: Math.max(4, cw), height: Math.max(4, ch),
+            boxShadow: '0 0 0 9999px rgba(9,14,26,0.45)',
+            border: '1.6px solid #1E6FF2',
+            pointerEvents: 'none',
+          }}
+        />
+        {/* rule-of-thirds grid */}
+        <div className="absolute" style={{ left: -imgW / 2 + cx0, top: -imgH / 2 + cy0, width: cw, height: ch, pointerEvents: 'none' }}>
+          <div className="absolute top-0 bottom-0 w-px bg-white/25" style={{ left: cw / 3 }} />
+          <div className="absolute top-0 bottom-0 w-px bg-white/25" style={{ left: (2 * cw) / 3 }} />
+          <div className="absolute left-0 right-0 h-px bg-white/25" style={{ top: ch / 3 }} />
+          <div className="absolute left-0 right-0 h-px bg-white/25" style={{ top: (2 * ch) / 3 }} />
+        </div>
+        {/* corner handles (drag to frame the crop) */}
+        {(['nw', 'ne', 'sw', 'se'] as const).map((c) => {
+          const pos = cornerAt(c);
+          return (
+            <div
+              key={c}
+              role="button"
+              tabIndex={0}
+              aria-label={`${t('tool.image.crop', 'Crop image', 'قص الصورة')} · ${c}`}
+              className="absolute h-7 w-7 rounded-full border-2 border-white bg-primary shadow-ink-1"
+              style={{ left: pos.left, top: pos.top, pointerEvents: 'auto', cursor: `${c}-resize`, touchAction: 'none' }}
+              onPointerDown={(e) => dragCropCorner(e, c)}
+            />
+          );
+        })}
+      </div>
+    );
+  })();
 
   return (
     <>
-      {/* action bar */}
+      {/* crop Apply/Cancel bar (replaces the normal bar during a crop session) */}
+      {cropping ? (
+        <div
+          className="absolute z-40 flex items-center gap-1 rounded-full border border-border bg-card/95 p-1 shadow-ink-2 backdrop-blur"
+          style={{ left: Math.max(8, Math.min(tl.x, window.innerWidth - 260)), top: Math.max(8, barTop), pointerEvents: 'auto' }}
+          dir="ltr"
+          role="toolbar"
+          aria-label={t('tool.image.crop', 'Crop image', 'قص الصورة')}
+        >
+          <span className="px-2 text-xs font-medium text-muted-foreground">{t('tool.image.crop', 'Crop image', 'قص الصورة')}</span>
+          <SBtn label={t('common.cancel')} onClick={() => setCropState(null)}><X className="h-4 w-4 text-destructive" /></SBtn>
+          <SBtn label={t('common.apply', 'Apply', 'تطبيق')} onClick={applyCrop}><Check className="h-4 w-4 text-emerald-600" /></SBtn>
+        </div>
+      ) : (
       <div
         className="absolute z-30 flex items-center gap-0.5 rounded-full border border-border bg-card/95 p-1 shadow-ink-2 backdrop-blur"
         style={{ left: Math.max(8, Math.min(tl.x, window.innerWidth - 320)), top: Math.max(8, barTop), pointerEvents: 'auto' }}
@@ -257,6 +447,7 @@ export function SelectionLayer({
                 imgEl={imgEl}
                 doc={doc}
                 anchorRef={imgOptsAnchorRef}
+                onCrop={startCrop}
                 onClose={() => setImgOptsOpen(false)}
               />
             )}
@@ -279,16 +470,24 @@ export function SelectionLayer({
             )}
           </div>
         )}
+        {singleImage && imgEl && (
+          <SBtn label={t('tool.image.crop', 'Crop image', 'قص الصورة')} onClick={startCrop}><Crop className="h-4 w-4" /></SBtn>
+        )}
         <SBtn label={t('lasso.delete')} onClick={() => useApp.getState().deleteSelection()}><Trash2 className="h-4 w-4 text-destructive" /></SBtn>
         <SBtn label={t('lasso.clear')} onClick={() => useApp.getState().setSelection(null)}><X className="h-4 w-4" /></SBtn>
       </div>
+      )}
+
+      {/* crop overlay (dim + grid + corner handles) */}
+      {cropOverlay}
 
       {/* box + handles */}
+      {!cropping && (
       <div
         className="absolute z-20 rounded-[3px]"
         style={{
           left: tl.x, top: tl.y, width: Math.max(6, boxW), height: Math.max(6, boxH),
-          border: `1.6px dashed ${getVp().scale ? '#1E6FF2' : '#1E6FF2'}`,
+          border: `1.6px dashed #1E6FF2`,
           pointerEvents: interactive ? 'auto' : 'none',
           cursor: interactive ? 'move' : 'default',
           touchAction: 'none',
@@ -309,9 +508,10 @@ export function SelectionLayer({
           />
         ))}
       </div>
+      )}
 
       {/* rotate handle for single image */}
-      {interactive && rotHandle && singleImage && (
+      {interactive && !cropping && rotHandle && singleImage && (
         <div
           className="absolute z-20 flex h-8 w-8 items-center justify-center rounded-full border-2 border-white bg-primary text-white shadow-ink-1"
           style={{ left: rotHandle.x - 16, top: rotHandle.y - 16, pointerEvents: 'auto', cursor: 'grab', touchAction: 'none' }}
@@ -357,11 +557,12 @@ function patchImage(el: ImageEl, patch: Partial<ImageEl>) {
 
 /** image quick options — one-tap transforms (rotate ±90°, flips, z-order) */
 function ImageOptionsPopover({
-  imgEl, doc, anchorRef, onClose,
+  imgEl, doc, anchorRef, onCrop, onClose,
 }: {
   imgEl: ImageEl;
   doc: PageDoc;
   anchorRef: React.RefObject<HTMLDivElement | null>;
+  onCrop: () => void;
   onClose: () => void;
 }) {
   const { t } = useT();
@@ -386,6 +587,7 @@ function ImageOptionsPopover({
     { label: t('tool.image.rotate90ccw'), icon: <RotateCcw className="h-4 w-4" />, run: () => act({ rotation: normRad(imgEl.rotation - Math.PI / 2) }) },
     { label: t('tool.image.flipH'), icon: <FlipHorizontal className="h-4 w-4" />, run: () => act({ flipH: !imgEl.flipH }) },
     { label: t('tool.image.flipV'), icon: <FlipVertical className="h-4 w-4" />, run: () => act({ flipV: !imgEl.flipV }) },
+    { label: t('tool.image.crop', 'Crop image', 'قص الصورة'), icon: <Crop className="h-4 w-4" />, run: () => { onClose(); onCrop() } },
     { label: t('tool.image.front'), icon: <BringToFront className="h-4 w-4" />, run: () => act({ z: doc.elements.reduce((m, e) => Math.max(m, e.z), 0) + 1 }) },
     { label: t('tool.image.back'), icon: <SendToBack className="h-4 w-4" />, run: () => act({ z: doc.elements.reduce((m, e) => Math.min(m, e.z), 0) - 1 }) },
   ];

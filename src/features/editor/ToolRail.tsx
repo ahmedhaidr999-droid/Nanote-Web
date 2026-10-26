@@ -46,6 +46,7 @@ interface Anchor { x: number; y: number; w: number; h: number }
 export function ToolRail({ pageW }: { pageW: number }) {
   const { t, isRTL } = useT();
   const tool = useApp((s) => s.editor.tool);
+  const toolbarHidden = useApp((s) => s.editor.toolbarHidden);
   const lastPen = useApp((s) => s.editor.lastPen);
   const leftHanded = useApp((s) => s.settings.leftHanded);
   const fingerDrawing = useApp((s) => s.settings.fingerDrawing);
@@ -90,9 +91,18 @@ export function ToolRail({ pageW }: { pageW: number }) {
     const z = doc.elements.reduce((acc, e) => Math.max(acc, e.z), 0) + 1;
     const targetW = pageW * 0.5;
     const ih = targetW * (h / w);
+    // place at the CENTER of the current viewport so the user sees the image
+    // land where they are looking (the old fixed x/y hid it off-screen after
+    // any pan/zoom away from the page top)
+    const vp = getVp();
+    const host = typeof document !== 'undefined' ? document.querySelector('[data-viewport]') : null;
+    const cw = host ? (host as HTMLElement).clientWidth : 800;
+    const ch = host ? (host as HTMLElement).clientHeight : 600;
+    const vx = (cw / 2 - vp.tx) / vp.scale;
+    const vy = (ch / 2 - vp.ty) / vp.scale;
     const imgElId = uid();
     st.addElements(pageId, [{
-      kind: 'image', id: imgElId, x: pageW * 0.22, y: 120, w: targetW, h: ih, imageId: id, rotation: 0, z,
+      kind: 'image', id: imgElId, x: vx - targetW / 2, y: vy - ih / 2, w: targetW, h: ih, imageId: id, rotation: 0, z,
     }]);
     // the image's edit options appear IMMEDIATELY: size handles, rotate arrow
     // and the action bar show around the fresh image; tapping empty space
@@ -150,6 +160,16 @@ export function ToolRail({ pageW }: { pageW: number }) {
         }}
       />
 
+      {/* pen-shortcut "toggle toolbar" hides the whole dock; a small floating
+          pill stays so touch users can bring it back (the shortcut toggles too) */}
+      {toolbarHidden ? (
+        <button
+          type="button"
+          aria-label={t('tool.showToolbar', 'Show toolbar', 'إظهار شريط الأدوات')}
+          onClick={() => useApp.getState().toggleToolbar()}
+          className="absolute bottom-4 left-1/2 z-30 h-3.5 w-10 -translate-x-1/2 rounded-full border border-border bg-card/80 shadow-ink-1 backdrop-blur"
+        />
+      ) : (
       <div
         ref={wrapRef}
         dir="ltr"
@@ -256,6 +276,7 @@ export function ToolRail({ pageW }: { pageW: number }) {
           <PenPopover railPos={railPos} railOnRight={railOnRight} anchor={anchor} />
         )}
       </div>
+      )}
 
       <AudioPanel open={audioOpen} onOpenChange={setAudioOpen} />
     </>

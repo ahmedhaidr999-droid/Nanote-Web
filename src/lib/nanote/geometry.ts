@@ -160,6 +160,66 @@ export function strokeIntersectsCircle(s: StrokeEl, cx: number, cy: number, r: n
   return distToStroke(s, cx, cy) <= r;
 }
 
+/** point → image-local coordinates (undo rotation about the image center);
+ *  top-left based (±w/2, ±h/2 around the center) — used by the crop tool. */
+export function imageLocalPoint(el: ImageEl, x: number, y: number): { x: number; y: number } {
+  let lx = x - (el.x + el.w / 2);
+  let ly = y - (el.y + el.h / 2);
+  if (el.rotation) {
+    const c = Math.cos(-el.rotation), s = Math.sin(-el.rotation);
+    const rx = lx * c - ly * s;
+    const ry = lx * s + ly * c;
+    lx = rx; ly = ry;
+  }
+  return { x: lx, y: ly };
+}
+
+/**
+ * Corner-anchored image resize that is EXACT under rotation and stays inside
+ * sane bounds — the fix for "resizing moves the image randomly":
+ *   • the OPPOSITE corner stays glued to the screen while you drag;
+ *   • the pointer vector is measured in the IMAGE's rotated frame;
+ *   • the aspect ratio is LOCKED by default (visible content never re-crops
+ *     itself mid-drag); `free` (Shift) unlocks;
+ *   • size clamps: sides never collapse below `minSide` world units and
+ *     never explode beyond `maxSide` (the "default resize bounds").
+ */
+export function resizeImageCorner(
+  el: ImageEl,
+  corner: 'nw' | 'ne' | 'sw' | 'se',
+  p: { x: number; y: number },       // world pointer
+  opts: { free?: boolean; minSide?: number; maxSide?: number } = {},
+): ImageEl {
+  const min = opts.minSide ?? 12;
+  const max = opts.maxSide ?? 4096;
+  const cx = el.x + el.w / 2, cy = el.y + el.h / 2;
+  const w0 = Math.max(1, Math.abs(el.w)), h0 = Math.max(1, Math.abs(el.h));
+  const sx = corner === 'nw' || corner === 'sw' ? -1 : 1;
+  const sy = corner === 'nw' || corner === 'ne' ? -1 : 1;
+  // opposite corner = the anchor, fixed in world space
+  const cos = Math.cos(el.rotation || 0), sin = Math.sin(el.rotation || 0);
+  const ax = cx - (sx * w0 / 2) * cos + (sy * h0 / 2) * sin;
+  const ay = cy - (sx * w0 / 2) * sin - (sy * h0 / 2) * cos;
+  // pointer vector from the anchor, rotated into the image's local frame
+  const vx = p.x - ax, vy = p.y - ay;
+  const lx = vx * cos + vy * sin;
+  const ly = -vx * sin + vy * cos;
+  let w1 = Math.abs(lx), h1 = Math.abs(ly);
+  if (!opts.free) {
+    const sw = Math.min(max / w0, Math.max(min / w0, w1 / w0));
+    const sh = Math.min(max / h0, Math.max(min / h0, h1 / h0));
+    const s = Math.abs(lx) / w0 > Math.abs(ly) / h0 ? sw : sh;
+    w1 = w0 * s; h1 = h0 * s;
+  } else {
+    w1 = Math.min(max, Math.max(min, w1));
+    h1 = Math.min(max, Math.max(min, h1));
+  }
+  const ox = sx * w1 / 2, oy = sy * h1 / 2;
+  const ncx = ax + ox * cos - oy * sin;
+  const ncy = ay + ox * sin + oy * cos;
+  return { ...el, x: ncx - w1 / 2, y: ncy - h1 / 2, w: w1, h: h1 };
+}
+
 export function elementIntersectsCircle(el: PageElement, cx: number, cy: number, r: number): boolean {
   if (el.kind === 'stroke') return strokeIntersectsCircle(el, cx, cy, r);
   const b = elementBBox(el, r);

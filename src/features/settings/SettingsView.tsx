@@ -39,8 +39,10 @@ import {
   Sun,
   TriangleAlert,
   Upload,
+  Pencil,
 } from 'lucide-react';
 import { useApp, useT } from '@/lib/nanote/store';
+import { PenManagerSheet } from '@/features/editor/PenManagerSheet';
 import * as db from '@/lib/nanote/idb';
 import type { StorageStats } from '@/lib/nanote/idb';
 import { downloadBlob, fmtBytes } from '@/lib/nanote/util';
@@ -226,6 +228,7 @@ export default function SettingsView() {
   const [restoring, setRestoring] = useState(false);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [version, setVersion] = useState('');
+  const [pensOpen, setPensOpen] = useState(false); // «الأقلام الإلكترونية» manager
   const fileRef = useRef<HTMLInputElement>(null);
 
   // installed version (APK versionName on Android) — loaded once on mount
@@ -415,6 +418,23 @@ export default function SettingsView() {
                   ]}
                 />
               </div>
+            </div>
+          </Section>
+
+          {/* ------------------------------------------------ 2b · electronic pens */}
+          <Section title={t('pens.title')}>
+            <div className="space-y-2">
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                {t('input.penModel.hint')}
+              </p>
+              <Button
+                variant="outline"
+                className="w-full justify-start gap-2 rounded-xl"
+                onClick={() => setPensOpen(true)}
+                aria-label={t('pens.manage')}
+              >
+                <Pencil className="size-4 shrink-0" /> {t('pens.manage')}
+              </Button>
             </div>
           </Section>
 
@@ -686,6 +706,8 @@ export default function SettingsView() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+      {/* «الأقلام الإلكترونية» — full pen management (DB, test pad, bindings) */}
+      <PenManagerSheet open={pensOpen} onOpenChange={setPensOpen} />
     </main>
   );
 }

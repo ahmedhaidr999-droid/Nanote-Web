@@ -176,9 +176,19 @@ export function drawImageEl(ctx: CanvasRenderingContext2D, el: ImageEl, opts: Re
   ctx.translate(cx, cy);
   if (el.rotation) ctx.rotate(el.rotation);
   if (el.flipH || el.flipV) ctx.scale(el.flipH ? -1 : 1, el.flipV ? -1 : 1);
-  // cover-fit the source into the element box
-  const s = Math.max(Math.abs(el.w) / nat.w, Math.abs(el.h) / nat.h);
-  const dw = nat.w * s, dh = nat.h * s;
+  // source window: the crop tool stores a normalized rect into the natural
+  // bitmap — draw exactly that region (cover-fit into the element box, which
+  // after a crop has the region's aspect ratio, so it fits exactly)
+  let sw = nat.w, sh = nat.h, sx = 0, sy = 0;
+  if (el.crop && el.crop.w > 0 && el.crop.h > 0) {
+    sx = Math.max(0, Math.min(nat.w - 1, el.crop.x * nat.w));
+    sy = Math.max(0, Math.min(nat.h - 1, el.crop.y * nat.h));
+    sw = Math.max(1, Math.min(nat.w - sx, el.crop.w * nat.w));
+    sh = Math.max(1, Math.min(nat.h - sy, el.crop.h * nat.h));
+  }
+  // cover-fit the (cropped) source into the element box
+  const s = Math.max(Math.abs(el.w) / sw, Math.abs(el.h) / sh);
+  const dw = sw * s, dh = sh * s;
   // rounded corners: clip the drawn box (page-space radius, clamped to half min side)
   const r = el.cornerRadius ?? 0;
   if (r > 0) {
@@ -194,7 +204,7 @@ export function drawImageEl(ctx: CanvasRenderingContext2D, el: ImageEl, opts: Re
     ctx.clip();
   }
   try {
-    ctx.drawImage(src, -dw / 2, -dh / 2, dw, dh);
+    ctx.drawImage(src, sx, sy, sw, sh, -dw / 2, -dh / 2, dw, dh);
   } catch { /* bad image */ }
   ctx.restore();
 }
@@ -271,7 +281,7 @@ export function renderPage(
   const optsWithPaper: RenderOpts = { ...opts, paperDark: isDarkHex(page.backgroundHex || '#FFFFFF') };
 
   const hide = opts.hideIds;
-  const els = doc.elements.filter((e) => !hide?.has(e.id) && (!infinite || elInWin(e, win)));
+  const els = doc.elements.filter((e) => !hide?.has(e.id) && elInWin(e, win));
 
   // 5) highlighter strokes first (draws BEHIND ink) — grouped by color and
   // filled as ONE merged path per color: overlapping passes of the same color
