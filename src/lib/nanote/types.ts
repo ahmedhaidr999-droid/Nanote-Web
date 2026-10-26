@@ -126,6 +126,7 @@ export interface Settings {
   // downloaded offline language packs from the in-app language library)
   translateEngine: TranslateEngine; // which engine the Translate button uses
   translateTarget: string;    // 'auto' (UI language) | ISO code ('ar','en','fr',…)
+  aiService: 'chatgpt' | 'gemini' | 'claude'; // the text-selection "Ask <AI>" target
   // ----- laser pointer (Notewise-style): normal fades ~1s; timed strokes
   // linger and all fade together N seconds after writing stops
   laserMode: LaserMode;
@@ -152,6 +153,7 @@ export const DEFAULT_SETTINGS: Settings = {
   shapeDetection: true,
   translateEngine: 'nanote',
   translateTarget: 'auto',
+  aiService: 'chatgpt',
   laserMode: 'normal',
   laserFadeSec: 3,
 };

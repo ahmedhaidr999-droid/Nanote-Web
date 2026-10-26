@@ -255,9 +255,22 @@ const hiddenIds = new Map<string, Set<string>>();
 export function getHiddenIds(pageId: string): Set<string> | undefined { return hiddenIds.get(pageId) }
 
 export function setHiddenIds(pageId: string, ids: Set<string> | null) {
+  const prev = hiddenIds.get(pageId) ?? null;
+  // content-change gate: identical sets never trigger the (expensive) page
+  // repaint — the eraser sweep calls this on every hit burst, and redundant
+  // full-page re-rasters were the "app turns heavy" killer on Android.
+  const same =
+    ids && prev
+      ? prev.size === ids.size && everyIn(prev, ids)
+      : !ids === !prev;
   if (ids) hiddenIds.set(pageId, ids);
   else hiddenIds.delete(pageId);
-  requestRepaint();
+  if (!same) requestRepaint();
+}
+
+function everyIn(a: Set<string>, b: Set<string>): boolean {
+  for (const x of b) if (!a.has(x)) return false;
+  return true;
 }
 
 // ---------------------------------------------------------------- live overlay painters + repaint channels

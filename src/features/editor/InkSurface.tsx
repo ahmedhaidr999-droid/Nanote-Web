@@ -35,7 +35,7 @@ import { drawImageEl, hiAlphaOf } from '@/lib/nanote/render';
 import { resolveImage, imageNatural } from '@/lib/nanote/images';
 import { recognizeShape, type RecognizedShape } from '@/lib/nanote/shapedetect';
 import {
-  elementInLasso, strokeIntersectsCircle, elementIntersectsCircle, strokeErasedByArea,
+  elementInLasso, strokeIntersectsCircle, elementIntersectsCircle,
   snapAngle, shapePath, pointInImage, transformElement,
 } from '@/lib/nanote/geometry';
 import {
@@ -84,7 +84,7 @@ type Mode =
   | { type: 'stroke'; pointerId: number; pageId: string; pageY: number; points: OP[]; tool: ToolId; color: string; width: number; startAbs: number; lastAbs: number; lastTs: number; minDist: number; pSmooth: number; straight: boolean; cached: Path2D | null; cachedUpTo: number; lockedShape: RecognizedShape | null; lastMoveAbs: number }
   | { type: 'laser'; pointerId: number; pageId: string; pageY: number; points: { x: number; y: number }[]; color: string; width: number; minDist: number }
   | { type: 'textpick'; pointerId: number; wordStart: CaretPoint | null; wordEnd: CaretPoint | null; anchor: CaretPoint; fromLongPress: boolean }
-  | { type: 'erase'; pointerId: number; pageId: string; pageY: number; path: { x: number; y: number }[]; removed: Set<string>; lastScreen: { x: number; y: number } }
+  | { type: 'erase'; pointerId: number; pageId: string; pageY: number; path: { x: number; y: number }[]; removed: Set<string>; lastScreen: { x: number; y: number }; done?: boolean; flushQueued?: boolean }
   | { type: 'lasso'; pointerId: number; pageId: string; pageY: number; poly: { x: number; y: number }[] }
   | { type: 'shape'; pointerId: number; pageId: string; pageY: number; ax: number; ay: number; bx: number; by: number }
   | { type: 'pan'; pointerId: number; lastX: number; lastY: number; rawX: number; rawY: number;
@@ -1012,6 +1012,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         modeRef.current = {
           type: 'erase', pointerId: e.pointerId, pageId: page.id, pageY: page.y,
           path: [pagePt], removed: new Set(), lastScreen: localPt(e),
+          done: false, flushQueued: false,
         };
         requestOverlayRepaint();
         return;
@@ -1165,31 +1166,45 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         const vp = getVp();
         const page = layouts.find((p) => p.id === m.pageId);
         if (!page) return;
+        const doc = st.editor.docs[m.pageId];
+        const r = st.editor.eraser.size / 2 / vp.scale;
+        let hit = false;
         for (const ev of coalescedOf(e)) {
           const el = localPt(ev);
           const world = screenToWorld(el.x, el.y);
           const pagePt = { x: clamp(world.x, 0, pageW), y: clamp(world.y - page.y, 0, page.h) };
-          m.path.push(pagePt);
           m.lastScreen = el;
-          const doc = st.editor.docs[m.pageId];
-          if (doc) {
-            const r = st.editor.eraser.size / 2 / vp.scale;
-            const removed = m.removed;
+          const prev = m.path[m.path.length - 1];
+          m.path.push(pagePt);
+          if (!doc || !doc.elements.length) continue;
+          // PERF: hit-test ONLY the segment the disc just travelled — old path
+          // points were already tested when they happened, and re-scanning the
+          // whole path on every event was O(n²) and froze/killed the app. The
+          // segment is sampled in ~r steps so fast swipes never skip strokes.
+          const d = Math.hypot(pagePt.x - prev.x, pagePt.y - prev.y);
+          const steps = 1 + Math.min(47, Math.floor(d / Math.max(r, 0.5)));
+          for (let s = 1; s <= steps; s++) {
+            const t = s / steps;
+            const x = prev.x + (pagePt.x - prev.x) * t;
+            const y = prev.y + (pagePt.y - prev.y) * t;
             for (const el2 of doc.elements) {
-              if (removed.has(el2.id)) continue;
-              if (st.editor.eraser.mode === 'stroke') {
-                if (el2.kind === 'stroke' && strokeIntersectsCircle(el2, pagePt.x, pagePt.y, r)) removed.add(el2.id);
-              } else {
-                if (el2.kind === 'stroke') {
-                  if (strokeErasedByArea(el2, m.path, r)) removed.add(el2.id);
-                } else {
-                  for (let i = 0; i < m.path.length; i += 2) {
-                    if (elementIntersectsCircle(el2, m.path[i].x, m.path[i].y, r)) { removed.add(el2.id); break }
-                  }
-                }
+              if (m.removed.has(el2.id)) continue;
+              if (el2.kind === 'stroke' ? strokeIntersectsCircle(el2, x, y, r) : elementIntersectsCircle(el2, x, y, r)) {
+                m.removed.add(el2.id);
+                hit = true;
               }
             }
-            setHiddenIds(m.pageId, new Set(removed));
+          }
+        }
+        if (hit) {
+          // rAF-coalesced preview repaint: at most ONE full page re-render per
+          // animation frame, and only when new elements were actually erased.
+          if (!m.flushQueued) {
+            m.flushQueued = true;
+            requestAnimationFrame(() => {
+              m.flushQueued = false;
+              if (!m.done && m.removed.size) setHiddenIds(m.pageId, new Set(m.removed));
+            });
           }
         }
         requestOverlayRepaint();
@@ -1353,6 +1368,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         return;
       }
       if (m.type === 'erase' && e.pointerId === m.pointerId) {
+        m.done = true; // cancel any queued preview flush
         if (m.removed.size) st.removeElements(m.pageId, [...m.removed]);
         setHiddenIds(m.pageId, null);
         modeRef.current = { type: 'none' };
@@ -1448,7 +1464,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         activeTypeRef.current = null;
         requestOverlayRepaint();
       }
-      if (m.type === 'erase' && e.pointerId === m.pointerId) { setHiddenIds(m.pageId, null); modeRef.current = { type: 'none' }; activeTypeRef.current = null }
+      if (m.type === 'erase' && e.pointerId === m.pointerId) { m.done = true; setHiddenIds(m.pageId, null); modeRef.current = { type: 'none' }; activeTypeRef.current = null }
       if (m.type === 'lasso' && e.pointerId === m.pointerId) { modeRef.current = { type: 'none' }; activeTypeRef.current = null }
       if (m.type === 'shape' && e.pointerId === m.pointerId) { modeRef.current = { type: 'none' }; activeTypeRef.current = null }
       if (m.type === 'pan' && e.pointerId === m.pointerId) {

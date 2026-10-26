@@ -14,25 +14,24 @@
 // the browser/WebView can never paint ITS selection handles or the Google
 // "Copy / Search" bubble on top of ours.
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { Copy, Highlighter, Languages, Loader2, Search, Underline, X } from 'lucide-react';
+import { Copy, Feather, Highlighter, Languages, MessagesSquare, Search, Sparkles, Underline } from 'lucide-react';
 import { toast } from 'sonner';
 import { useApp, useT } from '@/lib/nanote/store';
 import { ShapeEl } from '@/lib/nanote/types';
 import { uid } from '@/lib/nanote/util';
 import { ensurePdfText } from '@/lib/nanote/pdftext';
-import { translateOffline } from '@/lib/nanote/offlineTranslate';
-import { googleTranslateUrl, resolveTranslateTarget, translateOnline } from '@/lib/nanote/translate';
+import { resolveTranslateTarget } from '@/lib/nanote/translate';
+import { askAI, aiName, type AiService } from '@/lib/nanote/askai';
 import { cn } from '@/lib/utils';
 import {
   clearTextSel, extendSelToWord, getTextSel, setMirror, setSelLayouts, useTextSel, type SelRect,
 } from './textsel';
 import { getViewportSize, useVp, type PageLayout } from './viewport';
+import { TranslatePopup } from './TranslatePopup';
 
 const MAX_SPANS_PER_PAGE = 1200; // pathological pages (pure glyph soup) render no layer
 
 // ---------------------------------------------------------------- types
-interface TranslateState { status: 'loading' | 'ok'; text: string; offline?: 'builtin' | 'pack' | 'pack-pivot' }
-
 // ---------------------------------------------------------------- page subcomponent (memoized: vp changes never re-render spans)
 const PageText = memo(function PageText({ pageId, layoutY, pageH, pageW, items }: {
   pageId: string; layoutY: number; pageH: number; pageW: number; items: import('@/lib/nanote/types').PdfTextItem[];
@@ -105,7 +104,6 @@ export function TextLayer({ layouts, pageW, notebookId }: {
   const outerRef = useRef<HTMLDivElement>(null);
   const mirrorRef = useRef<HTMLDivElement>(null);
   const tbRef = useRef<HTMLDivElement>(null);
-  const popRef = useRef<HTMLDivElement>(null);
   const hStartRef = useRef<HTMLDivElement>(null);
   const hEndRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -113,9 +111,7 @@ export function TextLayer({ layouts, pageW, notebookId }: {
 
   const [items, setItems] = useState<Record<string, import('@/lib/nanote/types').PdfTextItem[] | null>>({});
   const loadingRef = useRef(new Set<string>());
-  const [translate, setTranslate] = useState<TranslateState | null>(null);
-
-  const translateRef = useRef(translate); translateRef.current = translate;
+  const [popup, setPopup] = useState<{ text: string; target: string } | null>(null);
   const unavailableWarnedRef = useRef(false);
   const hintShownRef = useRef(false);
   const sel = useTextSel();
@@ -171,7 +167,7 @@ export function TextLayer({ layouts, pageW, notebookId }: {
   const closeTranslate = useCallback(() => {
     abortRef.current?.abort();
     abortRef.current = null;
-    setTranslate(null);
+    setPopup(null);
   }, []);
 
   const clearSelectionUi = useCallback(() => {
@@ -242,7 +238,7 @@ export function TextLayer({ layouts, pageW, notebookId }: {
     const onDown = (e: PointerEvent) => {
       if (unavailableWarnedRef.current) return;
       const target = e.target as Node | null;
-      if (target && (tbRef.current?.contains(target) || popRef.current?.contains(target))) return;
+      if (target && tbRef.current?.contains(target)) return;
       const outer = outerRef.current;
       if (!outer) return;
       const rect = outer.getBoundingClientRect();
@@ -297,61 +293,22 @@ export function TextLayer({ layouts, pageW, notebookId }: {
 
   const doTranslate = useCallback(() => {
     if (!sel) return;
+    // BOTH engines translate inside the app now: the popup fetches Google's
+    // own web endpoints (or Nanote's online chain) and renders the result in
+    // our own window — the user is never redirected to translate.google.com.
     const st = useApp.getState();
-    const target = resolveTranslateTarget(st.settings);
+    setPopup({ text: sel.text, target: resolveTranslateTarget(st.settings) });
+  }, [sel]);
 
-    // ---- Google engine: pop up the Google Translate window with the text
-    if (st.settings.translateEngine === 'google') {
-      const url = googleTranslateUrl(sel.text, target);
-      const win = window.open(url, '_blank', 'noopener,noreferrer');
-      if (!win) toast.error(t('pdftext.translate.popupBlocked'));
-      return;
-    }
-
-    // ---- Nanote engine: INTERNET first (the LLM route, then the public web
-    // engine — real online MT inside the standalone APK), then the
-    // downloaded language pack, then the built-in dictionary last.
-    abortRef.current?.abort();
-    const ac = new AbortController();
-    abortRef.current = ac;
-    setTranslate({ status: 'loading', text: '' });
-    // hard timeout — a hung network must not freeze the card
-    const timer = setTimeout(() => {
-      if (abortRef.current === ac) ac.abort();
-    }, 12000);
-    void translateOnline(sel.text, target, ac.signal)
-      .then((r) => {
-        if (abortRef.current !== ac) return; // superseded
-        clearTimeout(timer);
-        if (ac.signal.aborted) return; // user cancelled / timed out
-        if (r) {
-          setTranslate({ status: 'ok', text: r.translation }); // online → no badge
-          return;
-        }
-        // both internet engines failed → downloaded pack / built-in dict
-        void translateOffline(sel.text, target).then((off) => {
-          if (abortRef.current !== ac) return;
-          if (off) {
-            setTranslate({ status: 'ok', text: off.translation, offline: off.via === 'builtin' ? 'builtin' : off.via });
-          } else {
-            setTranslate(null);
-            toast.error(t('pdftext.translate.error'));
-          }
-        });
-      })
-      .catch(async (e) => {
-        clearTimeout(timer);
-        if (abortRef.current !== ac) return;
-        console.warn('[nanote] online translation failed — offline pack fallback', e);
-        const off = await translateOffline(sel.text, target);
-        if (abortRef.current !== ac) return;
-        if (off) {
-          setTranslate({ status: 'ok', text: off.translation, offline: off.via === 'builtin' ? 'builtin' : off.via });
-        } else {
-          setTranslate(null);
-          toast.error(t('pdftext.translate.error'));
-        }
-      });
+  // Ask the configured AI (ChatGPT / Gemini / Claude) with the selected text
+  const doAskAI = useCallback(() => {
+    if (!sel) return;
+    const svc: AiService = useApp.getState().settings.aiService ?? 'chatgpt';
+    const name = aiName(svc);
+    clearTextSel();
+    void askAI(svc, sel.text).then(() => {
+      toast.success(t('pdftext.askAi.opened', 'Opened {name} — the text is copied', 'تم فتح {name} — تم نسخ النص').replace('{name}', name));
+    });
   }, [sel, t]);
 
   const doCopy = useCallback(async (text: string) => {
@@ -415,21 +372,7 @@ export function TextLayer({ layouts, pageW, notebookId }: {
     tb.style.top = `${Math.round(top)}px`;
   }, [sel, vp]);
 
-  useLayoutEffect(() => {
-    const tb = tbRef.current;
-    const pop = popRef.current;
-    const outer = outerRef.current;
-    if (!translate || !sel || !tb || !pop || !outer) return;
-    const ow = outer.clientWidth, oh = outer.clientHeight;
-    const pw = pop.offsetWidth, ph = pop.offsetHeight;
-    let left = tb.offsetLeft + tb.offsetWidth / 2 - pw / 2;
-    left = Math.max(8, Math.min(ow - pw - 8, left));
-    let top = tb.offsetTop - ph - 8;                        // above the toolbar
-    if (top < 8) top = tb.offsetTop + tb.offsetHeight + 8;  // → below it
-    top = Math.max(8, Math.min(oh - ph - 8, top));
-    pop.style.left = `${Math.round(left)}px`;
-    pop.style.top = `${Math.round(top)}px`;
-  }, [translate, sel, vp]);
+
 
   // drag handles follow the boundary carets through pan & zoom (44px grips
   // centered on the anchor point, regardless of the current zoom level)
@@ -509,8 +452,19 @@ export function TextLayer({ layouts, pageW, notebookId }: {
           <ToolBtn
             icon={<Languages className="h-4 w-4" />}
             label={translateEngine === 'google' ? t('pdftext.translate.google') : t('pdftext.translate')}
-            active={!!translate}
+            active={!!popup}
             onClick={doTranslate}
+          />
+          <ToolBtn
+            icon={
+              (useApp.getState().settings.aiService ?? 'chatgpt') === 'gemini'
+                ? <Sparkles className="h-4 w-4" />
+                : (useApp.getState().settings.aiService ?? 'chatgpt') === 'claude'
+                  ? <Feather className="h-4 w-4" />
+                  : <MessagesSquare className="h-4 w-4" />
+            }
+            label={t('pdftext.askAi', 'Ask {name}', 'اسأل {name}').replace('{name}', aiName(useApp.getState().settings.aiService ?? 'chatgpt'))}
+            onClick={doAskAI}
           />
           <ToolBtn
             icon={<Search className="h-4 w-4" />}
@@ -525,63 +479,8 @@ export function TextLayer({ layouts, pageW, notebookId }: {
         </div>
       )}
 
-      {sel && translate && (
-        <div
-          ref={popRef}
-          dir="ltr"
-          className="absolute max-w-xs rounded-2xl border border-border bg-card p-3 shadow-ink-2"
-          style={{ pointerEvents: 'auto', left: 0, top: 0 }}
-          role="dialog"
-          aria-label={t('pdftext.translated')}
-        >
-          <div className="mb-2 flex items-center gap-2">
-            <Languages className="h-4 w-4 text-primary" />
-            <span className="text-xs font-semibold text-muted-foreground">{t('pdftext.translated')}</span>
-            {translate.offline && (
-              <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
-                {translate.offline === 'builtin'
-                  ? t('pdftext.translate.offline')
-                  : t('pdftext.translate.offlinePack', 'Offline pack', 'حزمة بدون اتصال')}
-              </span>
-            )}
-            <button
-              type="button"
-              aria-label={t('common.close', 'Close', 'إغلاق')}
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={closeTranslate}
-              className="ms-auto flex h-6 w-6 items-center justify-center rounded-full hover:bg-accent"
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
-          </div>
-          {translate.status === 'loading' ? (
-            <div className="flex items-center gap-2 text-sm text-muted-foreground">
-              <Loader2 className="h-4 w-4 animate-spin" />
-              {t('pdftext.translating')}
-            </div>
-          ) : (
-            <>
-              <p
-                dir="auto"
-                className="nanote-scroll max-h-48 overflow-y-auto whitespace-pre-wrap text-sm leading-relaxed"
-                style={{ userSelect: 'none', WebkitUserSelect: 'none' }}
-              >
-                {translate.text}
-              </p>
-              <div className="mt-2 flex justify-end">
-                <button
-                  type="button"
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => void doCopy(translate.text)}
-                  className="flex h-7 items-center gap-1.5 rounded-full px-2.5 text-xs font-medium hover:bg-accent press-scale"
-                >
-                  <Copy className="h-3.5 w-3.5" />
-                  {t('pdftext.copy')}
-                </button>
-              </div>
-            </>
-          )}
-        </div>
+      {popup && (
+        <TranslatePopup text={popup.text} initialTarget={popup.target} onClose={closeTranslate} />
       )}
     </div>
   );

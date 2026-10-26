@@ -202,11 +202,23 @@ export default function PageCanvas({
   }, [requestPaint, rasterTick, vectorTick]);
 
   // transient repaints (eraser preview, selection drags hiding originals)
-  // — direct doc paint, never the cache (the render is intentionally partial)
-  useEffect(() => onRepaint(() => {
-    tokenRef.current++;
-    paintFromDoc();
-  }), [paintFromDoc]);
+  // — direct doc paint, never the cache (the render is intentionally partial).
+  // PERF: only the page whose hidden set actually changed re-renders — an
+  // erase sweep on page 3 must not re-raster pages 1 and 2 too. The sentinel
+  // (undefined) after a paintFromDoc identity change guarantees one paint
+  // whenever the doc/content changed, so nothing ever ends up stale.
+  const lastHiddenSigRef = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    lastHiddenSigRef.current = undefined; // content may have changed — repaint once
+    return onRepaint(() => {
+      const hidden = getHiddenIds(page.id) ?? null;
+      const sig = hidden ? `${hidden.size}:${[...hidden].join(',')}` : null;
+      if (sig === lastHiddenSigRef.current) return; // nothing new for THIS page
+      lastHiddenSigRef.current = sig;
+      tokenRef.current++;
+      paintFromDoc();
+    });
+  }, [page.id, paintFromDoc]);
 
   // ------------------------------------------------------------- zoom-aware raster
   // Only after the viewport has been idle for ~280ms do we consider
