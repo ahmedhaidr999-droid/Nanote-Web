@@ -120,13 +120,17 @@ export async function ensurePdfText(page: PageRow, notebook: NotebookRow): Promi
 
 /** Render one PDF page's content into `canvas` at ink-width × raster pixels.
  *  Returns false when there is no original (or rendering fails) — the caller
- *  then falls back to the stored raster PNG. */
+ *  then falls back to the stored raster PNG.
+ *  `win` (page-local slice) renders only that window — used by the zoomed-in
+ *  windowed page renderer so vector text stays razor-sharp at ANY zoom
+ *  without ever allocating a full-page bitmap at extreme rasters. */
 export async function renderPdfPageVector(
   page: PageRow,
   notebook: NotebookRow,
   canvas: HTMLCanvasElement,
   raster: number,
   pageW: number,
+  win?: { x0: number; y0: number; x1: number; y1: number },
 ): Promise<boolean> {
   const originalId = notebook.pdfOriginalId;
   if (!originalId || raster <= 0) return false;
@@ -137,15 +141,24 @@ export async function renderPdfPageVector(
     const vpBase = pdfPage.getViewport({ scale: 1 });
     const scale = (pageW * raster) / vpBase.width;
     const vp = pdfPage.getViewport({ scale });
-    const w = Math.max(2, Math.ceil(vp.width));
-    const h = Math.max(2, Math.ceil(vp.height));
+    let w = Math.max(2, Math.ceil(vp.width));
+    let h = Math.max(2, Math.ceil(vp.height));
+    let transform: number[] | undefined;
+    if (win) {
+      // slice: size the canvas to the window and translate the page render
+      // so the window rect lands at the canvas origin (pdf.js applies the
+      // render transform in device space)
+      w = Math.max(2, Math.ceil((win.x1 - win.x0) * raster));
+      h = Math.max(2, Math.ceil((win.y1 - win.y0) * raster));
+      transform = [1, 0, 0, 1, -win.x0 * raster, -win.y0 * raster];
+    }
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h }
     const ctx = canvas.getContext('2d');
     if (!ctx) return false;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.fillStyle = '#FFFFFF'; // transparent PDF pages must stay readable
     ctx.fillRect(0, 0, w, h);
-    await pdfPage.render({ canvas, viewport: vp }).promise;
+    await pdfPage.render({ canvas, viewport: vp, transform }).promise;
     return true;
   } catch (e) {
     console.warn(`[nanote] vector render failed for page index ${page.pageIndex}`, e);

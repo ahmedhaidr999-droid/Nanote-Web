@@ -14,6 +14,7 @@ import { translate, fmt } from './i18n';
 import { useCallback } from 'react';
 import { seedWelcomeNotebook } from './sample';
 import { recallPage, recallSession, rememberPage, rememberSession, clearSession } from './pagemem';
+import { setPenProfile } from './penengine';
 
 export type View =
   | { name: 'boot' }
@@ -301,6 +302,8 @@ export const useApp = create<AppState>((set, get) => ({
   async boot() {
     const settings = await db.loadSettings();
     set({ settings });
+    // manual pen profile override → pen engine (label + capability hints)
+    setPenProfile(settings.penProfileId ?? 'auto');
     try { await migrateTabsV2() } catch (e) { console.warn('[nanote] migration failed', e) }
     try { await db.purgeTrash() } catch (e) { console.warn('[nanote] purge failed', e) }
     // UNLIMITED STORAGE: ask the platform to mark our quota as persistent —

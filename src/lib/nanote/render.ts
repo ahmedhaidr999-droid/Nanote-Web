@@ -23,8 +23,10 @@ export interface RenderOpts {
   infinite?: boolean;
   /** vector-quality PDF background (re-rendered from the stored original at
    *  the CURRENT zoom — keeps text razor-sharp at high magnification,
-   *  Notewise-style) drawn instead of the stored raster PNG when present */
-  backgroundOverride?: { source: CanvasImageSource; w: number; h: number } | null;
+   *  Notewise-style) drawn instead of the stored raster PNG when present.
+   *  x/y/w/h place the source in PAGE-LOCAL units — full renders cover the
+   *  whole page box; windowed (zoomed-in) renders carry their own slice. */
+  backgroundOverride?: { source: CanvasImageSource; x: number; y: number; w: number; h: number } | null;
 }
 
 const isStroke = (e: { kind: string }): e is StrokeEl => e.kind === 'stroke';
@@ -239,7 +241,10 @@ export function renderPage(
   //    from the original PDF at the current zoom) wins when available
   //    (fixed pages only — infinite sheets have no PDF background)
   if (opts.backgroundOverride && !infinite) {
-    try { ctx.drawImage(opts.backgroundOverride.source, 0, 0, w, h) } catch { /* ignore */ }
+    try {
+      const bo = opts.backgroundOverride;
+      ctx.drawImage(bo.source, bo.x, bo.y, bo.w, bo.h);
+    } catch { /* ignore */ }
   } else if (page.backgroundImageId && opts.resolveImage && !infinite) {
     const src = opts.resolveImage(page.backgroundImageId);
     if (src) {

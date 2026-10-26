@@ -17,6 +17,48 @@ export function templateAccentColor(bgHex: string): string {
   return isDarkHex(bgHex) ? 'rgba(255,255,255,0.22)' : 'rgba(30,111,242,0.30)';
 }
 
+/**
+ * Seamless (infinity-paper) pattern fill — ONE canvas op instead of a loop
+ * over every cell. Why: at low zoom the render window spans tens of thousands
+ * of local units, and a per-cell dot/grid loop exploded into 1M+ arc() calls
+ * per repaint (multi-second freezes at 8% zoom). A repeat-pattern tile drawn
+ * at device resolution and mapped through pattern.setTransform fills the
+ * whole slice in O(bitmap) — at any zoom — while staying anchored to the
+ * ABSOLUTE local grid (the pattern origin is the CTM origin), so the pattern
+ * never shimmers between re-renders.
+ */
+function seamlessPatternFill(
+  ctx: CanvasRenderingContext2D,
+  cellLocal: number,
+  drawCell: (t: CanvasRenderingContext2D) => void,
+  fillRect: (c: CanvasRenderingContext2D) => void,
+): void {
+  const m = ctx.getTransform();
+  const raster = Math.abs(m.a) || 1; // current local→device scale
+  const px = Math.max(2, Math.ceil(cellLocal * raster));
+  const tile = document.createElement('canvas');
+  tile.width = px;
+  tile.height = px;
+  const tctx = tile.getContext('2d');
+  if (!tctx) return;
+  // draw ONE cell at (near-)device resolution, in local units
+  tctx.scale(px / cellLocal, px / cellLocal);
+  drawCell(tctx);
+  const pat = ctx.createPattern(tile, 'repeat');
+  if (!pat) return;
+  // map tile-bitmap px back to exact local units: tile covers cellLocal local
+  // units, so scale = cellLocal·raster / px per tile pixel — sharp at every
+  // zoom, no accumulated drift (the pattern transform composes with the CTM).
+  const s = (cellLocal * raster) / px;
+  try {
+    pat.setTransform(new DOMMatrix([s, 0, 0, s, 0, 0]));
+  } catch { /* very old engines: repeat unscaled — still seamless */ }
+  ctx.save();
+  ctx.fillStyle = pat;
+  fillRect(ctx);
+  ctx.restore();
+}
+
 export function drawTemplate(
   ctx: CanvasRenderingContext2D,
   template: TemplateId,
@@ -46,21 +88,65 @@ export function drawTemplate(
 
   switch (template) {
     case 'ruled': {
-      // lines anchored at y = 72 + k·32 in local space → seamless continuation
+      if (seamless) {
+        // lines every 32 local units, anchored at y ≡ 72 (mod 32) — the same
+        // absolute positions the loop produced, filled as ONE pattern op
+        const step = 32;
+        seamlessPatternFill(ctx, step, (t) => {
+          t.lineWidth = 1;
+          t.strokeStyle = line;
+          t.beginPath();
+          t.moveTo(-1, 72 % step);
+          t.lineTo(step + 1, 72 % step);
+          t.stroke();
+        }, (c) => c.fillRect(x0, y0, w - x0, h - y0));
+        break;
+      }
       const step = 32;
       const first = 72 + Math.ceil((y0 - 72) / step) * step;
-      const lastY = seamless ? h : h - 24;
-      for (let y = (seamless ? first : Math.max(72, first)); y < lastY; y += step) hline(y);
+      const lastY = h - 24;
+      for (let y = Math.max(72, first); y < lastY; y += step) hline(y);
       break;
     }
     case 'wideruled': {
+      if (seamless) {
+        const step = 48;
+        seamlessPatternFill(ctx, step, (t) => {
+          t.lineWidth = 1;
+          t.strokeStyle = line;
+          t.beginPath();
+          t.moveTo(-1, 80 % step);
+          t.lineTo(step + 1, 80 % step);
+          t.stroke();
+        }, (c) => c.fillRect(x0, y0, w - x0, h - y0));
+        break;
+      }
       const step = 48;
       const first = 80 + Math.ceil((y0 - 80) / step) * step;
-      const lastY = seamless ? h : h - 32;
+      const lastY = h - 32;
       for (let y = Math.max(80, first); y < lastY; y += step) hline(y);
       break;
     }
     case 'grid': {
+      if (seamless) {
+        // 24-unit square grid — one cell tile carries BOTH sides of each seam
+        // (a stroke straddling the tile edge is clipped to its inner half;
+        // drawing the line at 0 AND at s makes the two halves meet exactly)
+        const s = 24;
+        seamlessPatternFill(ctx, s, (t) => {
+          t.lineWidth = 1;
+          t.strokeStyle = line;
+          t.beginPath();
+          t.moveTo(0, -1); t.lineTo(0, s + 1); t.stroke();
+          t.beginPath();
+          t.moveTo(s, -1); t.lineTo(s, s + 1); t.stroke();
+          t.beginPath();
+          t.moveTo(-1, 0); t.lineTo(s + 1, 0); t.stroke();
+          t.beginPath();
+          t.moveTo(-1, s); t.lineTo(s + 1, s); t.stroke();
+        }, (c) => c.fillRect(x0, y0, w - x0, h - y0));
+        break;
+      }
       const s = 24;
       const fx = Math.ceil(x0 / s) * s;
       const fy = Math.ceil(y0 / s) * s;
@@ -69,6 +155,17 @@ export function drawTemplate(
       break;
     }
     case 'dotgrid': {
+      if (seamless) {
+        // dots every 24 units — one centered dot per pattern cell
+        const s = 24;
+        seamlessPatternFill(ctx, s, (t) => {
+          t.fillStyle = line;
+          t.beginPath();
+          t.arc(s / 2, s / 2, 1.7, 0, Math.PI * 2);
+          t.fill();
+        }, (c) => c.fillRect(x0, y0, w - x0, h - y0));
+        break;
+      }
       const s = 24;
       const fx = Math.ceil(x0 / s) * s;
       const fy = Math.ceil(y0 / s) * s;

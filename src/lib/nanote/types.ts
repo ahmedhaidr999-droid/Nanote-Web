@@ -173,6 +173,7 @@ export interface Settings {
   penShortcuts: PenShortcutPrefs;   // stylus hardware buttons + double-tap
   fingerGestures: FingerGesturePrefs; // finger tap gestures
   minimap: boolean;                 // infinity paper: show the mini overview map
+  penProfileId: string;             // manual pen model override ('auto' = detect)
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -201,6 +202,7 @@ export const DEFAULT_SETTINGS: Settings = {
   penShortcuts: PEN_SHORTCUTS_DEFAULT,
   fingerGestures: FINGER_GESTURES_DEFAULT,
   minimap: true,
+  penProfileId: 'auto',
 };
 
 // ---------------------------------------------------------------- offline language packs

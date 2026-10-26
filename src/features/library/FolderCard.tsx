@@ -54,8 +54,10 @@ export function FolderCard({
           className={cn(
             'flex items-center justify-center rounded-full text-muted-foreground transition-colors press-scale',
             'hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring',
+            // always visible — hover-revealed buttons are invisible on touch
+            // screens (the ⋯ occupied space and tapped fine but never showed)
             variant === 'grid'
-              ? 'absolute top-2 end-2 z-10 h-8 w-8 bg-background/85 opacity-0 shadow-ink-1 backdrop-blur group-hover:opacity-100 focus-visible:opacity-100'
+              ? 'absolute top-2 end-2 z-10 h-8 w-8 bg-background/85 shadow-ink-1 backdrop-blur'
               : 'h-9 w-9 shrink-0',
           )}
         >

@@ -1,23 +1,30 @@
 'use client';
 // InputSettingsSheet — "Pen & input" settings opened from the editor top bar.
 // Lets the user customize:
+//   • THE PEN MODEL — a registry of every major stylus (Apple Pencil, Samsung
+//     S Pen, Wacom/EMR, Surface/MPP, USI, and the Android-vendor pens:
+//     Xiaomi Smart Pen, Huawei M-Pencil, Honor Magic Pencil, OnePlus Stylo,
+//     OPPO/vivo/realme pens, Lenovo Tab Pen, Pixel Pen…). Auto-detection
+//     combines platform + report signals + device markers; the user can
+//     always pick their exact pen to pin the label and capability hints;
 //   • stylus hardware buttons (barrel / barrel-2 / eraser end) and the pen
-//     double-tap — works with every stylus the browser reports (Apple Pencil,
-//     Samsung S Pen, Surface Slim Pen, Wacom EMR, USI, Lenovo/LG…);
+//     double-tap — routed through the pen engine's barrel-bit auto-mapping,
+//     so "the pen button" works whichever bit the vendor reports (2/4/8/16);
 //   • a LIVE pen-engine card: the detected pen's family, its real
-//     capabilities (pressure / tilt / hover / report rate) and which hardware
-//     buttons have actually been observed on THIS pen — the app "reads" the
-//     pen and coordinates the shortcut mapping with it;
+//     capabilities (pressure / tilt / hover / report rate), the adaptive
+//     pressure calibration (compressed digitizer ranges are remapped onto
+//     the full 0–1 so light/heavy response is correct) and which hardware
+//     buttons have actually been observed on THIS pen;
 //   • finger gestures (double tap, two-finger tap);
 //   • finger drawing + stylus-only mode (same settings as the toolbar).
 import { useSyncExternalStore } from 'react';
 import { Hand, Pencil, PenLine, Smartphone, Zap } from 'lucide-react';
-import { getPenInfo, subscribePen } from '@/lib/nanote/penengine';
+import { getPenInfo, subscribePen, barrelMap, PEN_MODELS, setPenProfile } from '@/lib/nanote/penengine';
 import { useApp, useT } from '@/lib/nanote/store';
 import type { FingerAction, PenAction } from '@/lib/nanote/types';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Switch } from '@/components/ui/switch';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { cn } from '@/lib/utils';
 
 const PEN_ACTIONS: PenAction[] = [
@@ -26,16 +33,29 @@ const PEN_ACTIONS: PenAction[] = [
 ];
 const FINGER_ACTIONS: FingerAction[] = ['zoom', 'undo', 'redo', 'eraserToggle', 'pen', 'none'];
 
+/** group the pen registry by vendor for the model selector */
+const PEN_VENDORS: { vendor: string; models: typeof PEN_MODELS }[] = (() => {
+  const order: string[] = [];
+  const by = new Map<string, typeof PEN_MODELS>();
+  for (const m of PEN_MODELS) {
+    if (!by.has(m.vendor)) { by.set(m.vendor, []); order.push(m.vendor) }
+    by.get(m.vendor)!.push(m);
+  }
+  return order.map((vendor) => ({ vendor, models: by.get(vendor)! }));
+})();
+
 export function InputSettingsSheet({ open, onOpenChange }: { open: boolean; onOpenChange: (v: boolean) => void }) {
-  const { t } = useT();
+  const { t, lang } = useT();
   const penShortcuts = useApp((s) => s.settings.penShortcuts);
   const fingerGestures = useApp((s) => s.settings.fingerGestures);
   const fingerDrawing = useApp((s) => s.settings.fingerDrawing);
   const stylusOnly = useApp((s) => s.settings.stylusOnly);
+  const penProfileId = useApp((s) => s.settings.penProfileId) ?? 'auto';
   const setSettings = useApp((s) => s.setSettings);
 
   // live pen profile from the pen engine (updates while the sheet is open)
   const pen = useSyncExternalStore(subscribePen, getPenInfo);
+  const bmap = barrelMap();
 
   const penLabel = (a: PenAction) => t(`input.action.${a}`);
   const fingerLabel = (a: FingerAction) => t(`input.action.${a}`);
@@ -46,10 +66,16 @@ export function InputSettingsSheet({ open, onOpenChange }: { open: boolean; onOp
     { label: t('input.pen.hover'), on: pen.hover },
   ];
   const btns: { label: string; observed: boolean }[] = [
-    { label: t('input.barrel'), observed: (pen.buttons & 2) !== 0 },
-    { label: t('input.barrel2'), observed: (pen.buttons & 4) !== 0 },
+    { label: t('input.barrel'), observed: (pen.buttons & bmap.primary) !== 0 },
+    { label: t('input.barrel2'), observed: bmap.secondary != null && (pen.buttons & bmap.secondary) !== 0 },
     { label: t('input.eraser'), observed: (pen.buttons & 32) !== 0 },
   ];
+  const calibrating = pen.detected && pen.pressure && pen.pressureCeil - pen.pressureFloor < 0.88;
+
+  const changePenProfile = (id: string) => {
+    setPenProfile(id);
+    void setSettings({ penProfileId: id });
+  };
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
@@ -110,6 +136,13 @@ export function InputSettingsSheet({ open, onOpenChange }: { open: boolean; onOp
                       {c.label}
                     </span>
                   ))}
+                  {pen.pressure ? (
+                    <span className="rounded-full border border-border bg-muted/60 px-2 py-0.5 text-[11px] font-medium tabular-nums text-muted-foreground">
+                      {calibrating
+                        ? `${t('input.pen.calibrated')} ${pen.pressureFloor.toFixed(2)}–${pen.pressureCeil.toFixed(2)} → 0–1`
+                        : '0–1'}
+                    </span>
+                  ) : null}
                 </div>
               ) : null}
               {pen.detected ? (
@@ -143,6 +176,35 @@ export function InputSettingsSheet({ open, onOpenChange }: { open: boolean; onOp
               ) : null}
             </div>
 
+            {/* ---------- pen model: auto-detect or pick the exact pen */}
+            <div className="mb-3 rounded-xl border border-border bg-card p-3">
+              <p className="mb-1.5 text-[11px] font-medium text-muted-foreground">{t('input.penModel')}</p>
+              <Select value={penProfileId} onValueChange={changePenProfile}>
+                <SelectTrigger className="h-9 w-full" aria-label={t('input.penModel')}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="max-h-72">
+                  <SelectItem value="auto">
+                    {t('input.penModel.auto')}
+                    {pen.detected && penProfileId === 'auto' ? ` · ${pen.label}` : ''}
+                  </SelectItem>
+                  {PEN_VENDORS.map((g) => (
+                    <SelectGroup key={g.vendor}>
+                      <SelectLabel>{g.vendor}</SelectLabel>
+                      {g.models.map((m) => (
+                        <SelectItem key={m.id} value={m.id}>
+                          {lang === 'ar' ? m.nameAr : m.name}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
+                {t('input.penModel.hint')}
+              </p>
+            </div>
+
             <div className="space-y-3 rounded-xl border border-border bg-card p-3">
               <div className="flex items-center justify-between gap-3">
                 <span className="text-sm font-medium">{t('settings.fingerDrawing')}</span>
@@ -166,7 +228,7 @@ export function InputSettingsSheet({ open, onOpenChange }: { open: boolean; onOp
             </div>
 
             <div className="mt-3 space-y-2.5">
-              <Row label={t('input.barrel')} observed={(pen.buttons & 2) !== 0}>
+              <Row label={t('input.barrel')} observed={(pen.buttons & bmap.primary) !== 0}>
                 <Select
                   value={penShortcuts.barrel}
                   onValueChange={(v) => void setSettings({ penShortcuts: { ...penShortcuts, barrel: v as PenAction } })}
@@ -181,7 +243,7 @@ export function InputSettingsSheet({ open, onOpenChange }: { open: boolean; onOp
                   </SelectContent>
                 </Select>
               </Row>
-              <Row label={t('input.barrel2')} observed={(pen.buttons & 4) !== 0}>
+              <Row label={t('input.barrel2')} observed={bmap.secondary != null && (pen.buttons & bmap.secondary) !== 0}>
                 <Select
                   value={penShortcuts.barrel2}
                   onValueChange={(v) => void setSettings({ penShortcuts: { ...penShortcuts, barrel2: v as PenAction } })}

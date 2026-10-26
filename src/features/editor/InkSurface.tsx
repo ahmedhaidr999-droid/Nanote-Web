@@ -38,7 +38,7 @@ import { computeOutline, OP } from '@/lib/nanote/outline';
 import { drawImageEl, hiAlphaOf } from '@/lib/nanote/render';
 import { resolveImage, imageNatural } from '@/lib/nanote/images';
 import { recognizeShape, type RecognizedShape } from '@/lib/nanote/shapedetect';
-import { observePenEvent } from '@/lib/nanote/penengine';
+import { observePenEvent, normalizePenPressure, barrelMap } from '@/lib/nanote/penengine';
 import {
   elementInLasso, strokeIntersectsCircle, elementIntersectsCircle,
   snapAngle, shapePath, pointInImage, transformElement,
@@ -331,10 +331,13 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     return Math.min(1, Math.sqrt(t2 / (1 + t2)));
   };
 
-  /** stylus pressure → ink pressure; angled fountain/brush nibs widen. */
+  /** stylus pressure → ink pressure; angled fountain/brush nibs widen.
+   *  Raw digitizer pressure is normalized by the pen engine first (many pens
+   *  report a compressed 0.2–0.7 band; adaptive calibration maps it onto the
+   *  full range so light/heavy response is correct on every stylus). */
   const pressureOf = (e: PointerEvent, tool: ToolId): number => {
     if (e.pointerType === 'pen') {
-      let p = e.pressure > 0 ? clamp(e.pressure, 0.04, 1) : 0.5;
+      let p = e.pressure > 0.015 ? normalizePenPressure(e.pressure) : 0.5;
       if (tool === 'fountain' || tool === 'brush') p = clamp(p * (1 + 0.5 * tiltSinOf(e)), 0.04, 1);
       return p;
     }
@@ -697,13 +700,17 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
      *   • pressed at tip contact (button bits on pointerdown),
      *   • pressed mid-stroke (bits appear on the live pointermove stream),
      *   • the dedicated ERASER end/button (bit 32 — Surface / MPP pens).
-     * Releasing a momentary button (hold-to-erase) restores the previous tool.
-     * The pen engine samples every event, so the Pen & input settings can
-     * show which buttons this physical pen actually has.
+     * Which bit is "the barrel button" is pen-dependent (S Pen hover → 2,
+     * Surface/MPP → 4, some Android pens → 8/16): the pen engine locks the
+     * FIRST bit the physical pen actually reports as primary (see
+     * barrelMap()), so the user's Barrel shortcut fires no matter the vendor.
+     * observePenEvent runs BEFORE this on every event, so the very first
+     * press already routes through the freshly-locked bit. Releasing a
+     * momentary button (hold-to-erase) restores the previous tool.
      */
     const penButtonEdge = (e: PointerEvent) => {
       const prev = penBtnRef.current;
-      const cur = e.buttons & (1 | 2 | 4 | 32); // tip + barrel + second + eraser
+      const cur = e.buttons & (1 | 2 | 4 | 8 | 16 | 32); // tip + barrel bits + eraser
       if (cur === prev) return;
       penBtnRef.current = cur;
       const prefs = useApp.getState().settings.penShortcuts;
@@ -711,13 +718,16 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         pressed: (cur & b) !== 0 && (prev & b) === 0,
         released: (cur & b) === 0 && (prev & b) !== 0,
       });
-      const er = bit(32), b1 = bit(2), b2 = bit(4);
+      const map = barrelMap();
+      const er = bit(32), b1 = bit(map.primary), b2 = map.secondary ? bit(map.secondary) : null;
       if (er.pressed) { if (prefs.eraser && prefs.eraser !== 'none') applyPenAction(prefs.eraser); return }
       if (er.released) { restoreMomentaryTool(); return }
       if (b1.pressed) { if (prefs.barrel !== 'none') applyPenAction(prefs.barrel); return }
       if (b1.released) { restoreMomentaryTool(); return }
-      if (b2.pressed) { if (prefs.barrel2 !== 'none') applyPenAction(prefs.barrel2); return }
-      if (b2.released) { restoreMomentaryTool(); return }
+      if (b2) {
+        if (b2.pressed) { if (prefs.barrel2 !== 'none') applyPenAction(prefs.barrel2); return }
+        if (b2.released) { restoreMomentaryTool(); return }
+      }
     };
 
     // ================================================ app-owned text selection
@@ -1511,7 +1521,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         restoreMomentaryTool();
         // keep only bits that are still physically held after the lift so the
         // next press can never be swallowed by a stale mask
-        penBtnRef.current = e.buttons & (2 | 4 | 32);
+        penBtnRef.current = e.buttons & (2 | 4 | 8 | 16 | 32);
       }
 
       // two-finger tap (finger gesture): both touches released quickly and
