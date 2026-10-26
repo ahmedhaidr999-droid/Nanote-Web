@@ -8,10 +8,15 @@
 //     angled nib; hover shows a tracked cursor ring.
 //   • mouse           → writes (space / middle button / pan tool = pan).
 //   • touch           → navigates by default (one finger pan, two finger pinch,
-//     double-tap zoom). Draws ONLY when "finger drawing" is enabled — and
-//     never while a pen is in range (palm rejection: touches are ignored
-//     ENTIRELY — no draw and no pan — so the page can never drift under a
-//     resting hand), and never when the contact is palm-sized.
+//     double-tap → configurable gesture). Draws ONLY when "finger drawing" is
+//     enabled — never while the pen tip is writing, never while a
+//     hover-capable stylus floats in range, and never for palm-sized
+//     contacts. Palm rejection no longer locks touches for 3s after pen
+//     use: the finger responds ~150ms after the pen lifts.
+//   • stylus buttons  → barrel / barrel-2 / pen double-tap run the shortcuts
+//     configured in Settings → Pen & input (hold-to-erase, tool switch,
+//     undo/redo, page turn…). Works with every stylus that reports buttons
+//     (Wacom EMR, S Pen, Surface Slim, USI) plus our own double-tap detector.
 // Latency work: coalesced-event capture (all 240 Hz samples, not one/frame),
 // zoom-adaptive input decimation, two-tier live outline (cached Path2D head +
 // cheap recomputed tail), committed strokes linger on the overlay until the
@@ -26,9 +31,8 @@
 // native DOM selection, so no browser/WebView/Google selection UI can ever
 // appear on top of ours.
 import { useEffect, useRef } from 'react';
-import { toast } from 'sonner';
 import { useApp, useT } from '@/lib/nanote/store';
-import { StrokeEl, ToolId, TextEl, ImageEl } from '@/lib/nanote/types';
+import { EditorTool, FingerAction, PenAction, StrokeEl, ToolId, TextEl, ImageEl } from '@/lib/nanote/types';
 import { uid, clamp } from '@/lib/nanote/util';
 import { computeOutline, OP } from '@/lib/nanote/outline';
 import { drawImageEl, hiAlphaOf } from '@/lib/nanote/render';
@@ -45,8 +49,8 @@ import {
 import {
   Painter, addPainter, getVp, screenToWorld, worldToScreen, zoomAt, animateZoomTo, cancelZoomAnim,
   panBy, setVp, clampScale, requestOverlayRepaint, requestRepaint, setHiddenIds, snapToRuler,
-  markInteraction, markWheel,
-  type PageLayout, pageAtWorldY, axisBounds, VIEWPORT_PAD,
+  markInteraction, markWheel, worldBoundsOf,
+  type PageLayout, pageAtWorldY, axisBounds, VIEWPORT_PAD, scrollToPage,
   beginVpGesture, endVpGesture, vpAnimGen, animateVpTo,
 } from './viewport';
 
@@ -65,9 +69,13 @@ const SHAPE_DWELL_MS = 600;     // pen held still at stroke end → recognize a 
 const SHAPE_UNLOCK_PX = 18;     // movement after a shape snap that resumes freehand
 
 const AUTO_CONTINUE_PTS = 2400;   // very long strokes continue as a fresh stroke
-const PEN_IDLE_MS = 3000;         // pen "in range" window after last pen event
 const PALM_DRAW_PX = 50;          // touch contact axis (px) too big to draw with
 const PALM_NAV_PX = 75;           // touch contact axis (px) too big to even navigate
+const PEN_RANGE_MS = 450;        // hover-capable pen: no hover event this long → out of range
+const PEN_LINGER_MS = 150;        // after pen contact ends, reject touches this long (palm settling)
+const DBLTAP_GAP_MS = 450;        // pen double-tap: max gap between the two taps
+const DBLTAP_DIST_PX = 16;        // pen double-tap: max distance between the two taps
+const TWOFINGER_MS = 330;         // two-finger tap: both touches released within this window
 const TAIL_PTS = 26;              // live tail recomputed each frame (two-tier render)
 const HEAD_REBUILD = 18;          // rebuild cached head every N new points
 
@@ -254,10 +262,16 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
   const modeRef = useRef<Mode>({ type: 'none' });
   const pointersRef = useRef(new Map<number, { x: number; y: number; type: string }>());
   const penSeenRef = useRef(0);          // last time ANY pen event arrived (contact or hover)
+  const penDownRef = useRef(false);      // pen tip currently in contact
+  const penLastUpRef = useRef(0);        // last pen pointerup — palm-rejection linger anchor
+  const penHoverCapableRef = useRef(false); // stylus reports hover events (Apple Pencil 2 / S Pen / Surface)
+  const momentaryToolRef = useRef<EditorTool | null>(null); // tool restored after hold-to-erase
+  const pendingTapRef = useRef<{ m: Extract<Mode, { type: 'stroke' }>; timer: ReturnType<typeof setTimeout>; x: number; y: number; t: number } | null>(null);
+  const twoTapRef = useRef<{ t0: number; moved: boolean; fired: boolean } | null>(null);
+  const touchCountRef = useRef(0);       // tracked touches currently down
   const activeTypeRef = useRef<string | null>(null); // device class of the active gesture
   const hoverRef = useRef<{ x: number; y: number } | null>(null);
   const lingerRef = useRef<LingerItem[]>([]);
-  const palmToastRef = useRef(false);
   const spaceRef = useRef(false);
   const lastTapRef = useRef<{ t: number; x: number; y: number } | null>(null);
   const downInfoRef = useRef<{ x: number; y: number; t: number } | null>(null);
@@ -265,13 +279,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
   const holdTimerRef = useRef(0);  // image tool: pending long-press timer
   const dwellTimerRef = useRef<ReturnType<typeof setInterval> | null>(null); // shape detect dwell watcher
   const textHoldRef = useRef<{ timer: number; pointerId: number; x: number; y: number; pointerType: string } | null>(null); // pending text long-press
-  const { t, lang } = useT();
-  const langRef = useRef(lang);
-  const tRef = useRef(t);
-  useEffect(() => {
-    langRef.current = lang;
-    tRef.current = t;
-  }, [lang, t]);
+  const { t } = useT();
 
   // -------------------------------------------------- helpers
   const localPt = (e: PointerEvent | React.PointerEvent) => {
@@ -284,7 +292,30 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     return screenToWorld(l.x, l.y);
   };
 
-  const pageForWorld = (wy: number) => pageAtWorldY(layouts, wy);
+  const pageForWorld = (wy: number) => {
+    const hit = pageAtWorldY(layouts, wy);
+    if (hit) return hit;
+    // Infinity paper: the paper visually extends past the sheet's bookkeeping
+    // box (viewport-windowed rendering draws it everywhere) — starting a
+    // stroke just beyond the edge must still land on the nearest board, which
+    // then grows to cover the ink. The pan clamp keeps you within ~1.5 screens
+    // of content, so this distance stays small in practice.
+    if (!isInfinitePaper()) return null;
+    let best: PageLayout | null = null;
+    let bestD = Infinity;
+    for (const l of layouts) {
+      const top = l.y - l.padY;
+      const d = wy < top ? top - wy : wy - (top + l.h);
+      if (d < bestD) { bestD = d; best = l }
+    }
+    return best;
+  };
+
+  /** is the open notebook an infinity paper (endless canvas)? */
+  const isInfinitePaper = (): boolean => {
+    const st = useApp.getState();
+    return st.notebooks.find((n) => n.id === st.editor.notebookId)?.pageSize === 'infinite';
+  };
 
   /** sin of the stylus tilt angle from vertical (0 = upright, 1 = flat). */
   const tiltSinOf = (e: PointerEvent): number => {
@@ -308,22 +339,24 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     return 0.5; // mouse & finger
   };
 
-  const palmToast = () => {
-    if (palmToastRef.current) return;
-    palmToastRef.current = true;
-    toast.info(tRef.current('tool.palmReject'), { duration: 2600 });
-    setTimeout(() => { palmToastRef.current = false }, 15000);
-  };
-
-  /** touch pointer we refuse outright (palm rejection / oversized contact)? */
+  /**
+   * touch pointer we refuse outright (palm rejection / oversized contact)?
+   * The OLD rule ignored touches for a fixed 3s after ANY pen event, so
+   * flipping pages with a finger right after lifting the pen felt dead until
+   * the window elapsed. The new model rejects only when it can actually see
+   * the pen: palm-sized contacts, pen tip in contact, a hover-capable stylus
+   * floating in range, or within a tiny linger just after the pen lifts.
+   */
   const rejectTouch = (e: PointerEvent): boolean => {
     const contact = Math.max(e.width || 0, e.height || 0);
-    if (contact > PALM_NAV_PX) return true;                       // palm-sized — never
+    if (contact > PALM_NAV_PX) return true;   // palm-sized — never
     const now = performance.now();
-    if (activeTypeRef.current === 'pen') return true;             // writing right now
-    if (penSeenRef.current > 0 && now - penSeenRef.current < PEN_IDLE_MS) {
-      if (e.width === 0 || contact <= PALM_DRAW_PX) palmToast();  // explain only plausible fingers
-      return true;                                                // pen in range — palm/pause window
+    if (penDownRef.current) return true;      // pen tip is writing right now
+    if (penHoverCapableRef.current && penSeenRef.current > 0 && now - penSeenRef.current < PEN_RANGE_MS) {
+      return true;                            // stylus hovering in range — palm is resting
+    }
+    if (penLastUpRef.current > 0 && now - penLastUpRef.current < PEN_LINGER_MS) {
+      return true;                            // pen just lifted — palm still settling
     }
     return false;
   };
@@ -334,9 +367,6 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     const st = useApp.getState();
     if (e.pointerType !== 'touch') return false;
     if (Math.max(e.width || 0, e.height || 0) > PALM_DRAW_PX) return false;
-    // the laser pointer is used live with the finger even when "finger
-    // drawing" is off — it never persists anything (palm-size is still refused)
-    if (st.editor.tool === 'laser') return true;
     if (!st.settings.fingerDrawing) return false;
     if (st.settings.stylusOnly && penSeenRef.current > 0) return false; // pen-only mode
     return true;
@@ -562,14 +592,8 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     st.addElements(m.pageId, [el]);
     if (st.editor.activeRecording) st.noteStrokeTimes(el.id, m.startAbs, m.lastAbs);
     st.pushRecentColor(m.color);
-    // infinite page growth
-    const nb = st.notebooks.find((n) => n.id === st.editor.notebookId);
-    if (nb?.pageSize === 'infinite') {
-      const maxY = Math.max(...m.points.map((p) => p.y));
-      if (maxY > (page.height ?? 1123) - 140) {
-        void st.updatePage(m.pageId, { height: (page.height ?? 1123) + 512 });
-      }
-    }
+    // (infinity-paper growth now lives in the store's addElements — the sheet
+    // chases the content in ALL four directions from every commit path)
     if (!isFinal) {
       // auto-continue: restart the session from the last point
       const last = m.points[m.points.length - 1];
@@ -592,6 +616,59 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         e.button === 1 ||
         (e.pointerType === 'touch' && !canDrawWith(e) && st.editor.tool !== 'lasso' && st.editor.tool !== 'text')
       );
+    };
+
+    /** run a stylus hardware-button / gesture shortcut (Settings → Pen & input) */
+    const applyPenAction = (act: PenAction) => {
+      const st = useApp.getState();
+      switch (act) {
+        case 'none': return;
+        case 'eraserHold':
+          // momentary: erase while the button is held; the pen returns on lift
+          if (st.editor.tool !== 'eraser') {
+            momentaryToolRef.current = st.editor.tool;
+            st.setTool('eraser');
+          }
+          return;
+        case 'eraserToggle':
+          st.setTool(st.editor.tool === 'eraser' ? st.editor.lastPen : 'eraser');
+          return;
+        case 'pen': st.setTool(st.editor.lastPen); return;
+        case 'highlighter': case 'laser': case 'lasso': case 'text': case 'shape': case 'pan':
+          st.setTool(act); return;
+        case 'undo': st.undo(); return;
+        case 'redo': st.redo(); return;
+        case 'pagePrev': case 'pageNext': {
+          const idx = layouts.findIndex((l) => l.id === st.editor.activePageId);
+          if (idx < 0) return;
+          const next = layouts[act === 'pagePrev' ? Math.max(0, idx - 1) : Math.min(layouts.length - 1, idx + 1)];
+          if (next && next.id !== st.editor.activePageId) {
+            st.setActivePage(next.id);
+            scrollToPage(next, 0.4);
+          }
+          return;
+        }
+      }
+    };
+
+    /** run a finger tap-gesture shortcut (zoom by default; undo/redo/tool…) */
+    const applyFingerAction = (act: FingerAction, clientX: number, clientY: number) => {
+      const st = useApp.getState();
+      switch (act) {
+        case 'none': return;
+        case 'zoom': {
+          const vp = getVp();
+          const rect = host.getBoundingClientRect();
+          animateZoomTo(clientX - rect.left, clientY - rect.top, vp.scale > 1.4 ? 1 : 2.5, 260);
+          return;
+        }
+        case 'undo': st.undo(); return;
+        case 'redo': st.redo(); return;
+        case 'eraserToggle':
+          st.setTool(st.editor.tool === 'eraser' ? st.editor.lastPen : 'eraser');
+          return;
+        case 'pen': st.setTool(st.editor.lastPen); return;
+      }
     };
 
     // ================================================ app-owned text selection
@@ -690,8 +767,25 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     const startPan = (e: PointerEvent, l: { x: number; y: number }) => {
       cancelLocalScroll();               // any in-flight glide ends; the drag owns the viewport
       const vp = getVp();
-      const bx = axisBounds(pageW * vp.scale, host.clientWidth);
-      const by = axisBounds(worldHOfLayouts() * vp.scale, host.clientHeight);
+      let bx: { lock: boolean; min: number; max: number };
+      let by: { lock: boolean; min: number; max: number };
+      if (isInfinitePaper()) {
+        // endless sheet: bounds mirror clampVpToWorld's roam math — the full
+        // content rect (pads reach into negative quadrants) plus ~1.5 screens
+        // of free roam on every side, nothing ever hard-locks
+        const wb = worldBoundsOf(layouts, pageW);
+        const roam = Math.max(host.clientWidth, host.clientHeight) * 1.5;
+        const roamBounds = (content: number, container: number, origin: number) => {
+          const min = Math.min(container - content - VIEWPORT_PAD, VIEWPORT_PAD) - roam;
+          const max = Math.max(VIEWPORT_PAD, container - content + VIEWPORT_PAD * 4) + roam;
+          return { lock: false, min: min - origin, max: max - origin };
+        };
+        bx = roamBounds((wb.x1 - wb.x0) * vp.scale, host.clientWidth, wb.x0 * vp.scale);
+        by = roamBounds((wb.y1 - wb.y0) * vp.scale, host.clientHeight, wb.y0 * vp.scale);
+      } else {
+        bx = axisBounds(pageW * vp.scale, host.clientWidth);
+        by = axisBounds(worldHOfLayouts() * vp.scale, host.clientHeight);
+      }
       beginVpGesture();
       const rawX = Math.min(bx.max, Math.max(bx.min, vp.tx)); // spring into bounds if mid-settle
       const rawY = Math.min(by.max, Math.max(by.min, vp.ty));
@@ -714,7 +808,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         const chH = host.clientHeight;
         let best = targetTy, bestDist = Infinity;
         for (const l of layouts) {
-          const tyP = VIEWPORT_PAD - l.y * vp.scale;
+          const tyP = VIEWPORT_PAD - (l.y - l.padY) * vp.scale; // padded box top
           if (tyP < m.minY - 1 || tyP > m.maxY + 1) continue; // not reachable
           const d = Math.abs(tyP - fromTy);
           if (d < bestDist) { bestDist = d; best = tyP }
@@ -788,7 +882,11 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       m.minDist = clamp(0.7 / vp.scale, 0.25, 2.5); // ~0.7 screen px at any zoom
       const l = localPt(ev);
       const world = screenToWorld(l.x, l.y);
-      let px = clamp(world.x, -200, pageW + 200);
+      // infinity paper: ink runs freely in ALL directions (the sheet grows
+      // around it on commit — up/left via pads, right/down via width/height).
+      // Regular pages keep the old 200-unit overshoot margin.
+      const inf = isInfinitePaper();
+      let px = inf ? world.x : clamp(world.x, -200, page.w + 200);
       let py = world.y - page.y;
       const snapped = snapToRuler(world.x, world.y, 18 / vp.scale);
       if (snapped) { px = snapped.x; py = snapped.y - page.y }
@@ -824,8 +922,10 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       m.minDist = clamp(0.7 / vp.scale, 0.25, 2.5);
       const l = localPt(ev);
       const world = screenToWorld(l.x, l.y);
-      const px = clamp(world.x, -200, pageW + 200);
-      const py = world.y - page.y;
+      // endless sheet: the pointer roams free; fixed pages clamp to the box
+      const inf = isInfinitePaper();
+      const px = inf ? world.x : clamp(world.x, 0, page.w);
+      const py = inf ? world.y - page.y : clamp(world.y - page.y, 0, page.h);
       const last = m.points[m.points.length - 1];
       if (Math.hypot(px - last.x, py - last.y) >= m.minDist) m.points.push({ x: px, y: py });
     };
@@ -857,13 +957,49 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     };
 
     const onPointerDown = (e: PointerEvent) => {
-      if (e.pointerType === 'pen') penSeenRef.current = performance.now(); // pen contact
+      if (e.pointerType === 'pen') {
+        penSeenRef.current = performance.now();
+        penDownRef.current = true; // pen contact
+      }
 
       // ---- palm rejection gate (touches only; pens & mice always pass)
       if (e.pointerType === 'touch' && rejectTouch(e)) return;
 
+      // ---- stylus hardware buttons (barrel / barrel2) → configured shortcut.
+      // Wacom EMR, S Pen, Surface Slim and USI pens report held side buttons
+      // in pointer `buttons` (bit 2 = primary, bit 4 = secondary).
+      if (e.pointerType === 'pen') {
+        const prefs = useApp.getState().settings.penShortcuts;
+        const bAct = (e.buttons & 2) ? prefs.barrel : (e.buttons & 4) ? prefs.barrel2 : null;
+        if (bAct && bAct !== 'none') applyPenAction(bAct);
+        // pen double-tap (second half): a pending first tap exists and this
+        // press lands at the same spot quickly → drop the pending dot and run
+        // the configured action instead of drawing a second dot.
+        const pt = pendingTapRef.current;
+        if (
+          pt &&
+          performance.now() - pt.t < DBLTAP_GAP_MS &&
+          Math.hypot(e.clientX - pt.x, e.clientY - pt.y) < DBLTAP_DIST_PX
+        ) {
+          clearTimeout(pt.timer);
+          pendingTapRef.current = null;
+          modeRef.current = { type: 'none' };
+          activeTypeRef.current = null;
+          const dAct = useApp.getState().settings.penShortcuts.doubleTap;
+          if (dAct && dAct !== 'none') applyPenAction(dAct);
+          return; // consumed — no dot, no stroke, no long-press
+        }
+      }
+
       const rect = host.getBoundingClientRect();
       pointers.set(e.pointerId, { x: e.clientX - rect.left, y: e.clientY - rect.top, type: e.pointerType });
+
+      // finger-gesture bookkeeping: exactly two quick, still touches = a tap
+      if (e.pointerType === 'touch') {
+        touchCountRef.current += 1;
+        if (touchCountRef.current === 2) twoTapRef.current = { t0: performance.now(), moved: false, fired: false };
+        if (touchCountRef.current > 2) twoTapRef.current = null;
+      }
 
       if (pointers.size === 2) {
         // second touch → pinch (commit a finger stroke rather than dropping it)
@@ -1006,7 +1142,12 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       void st.ensureDoc(page.id);
       st.setActivePage(page.id);
 
-      const pagePt = { x: clamp(world.x, 0, pageW), y: clamp(world.y - page.y, 0, page.h) };
+      const inf = isInfinitePaper();
+      // fixed pages clamp tool contact into the page box; the endless sheet
+      // accepts coordinates anywhere (negative local coords included)
+      const pagePt = inf
+        ? { x: world.x, y: world.y - page.y }
+        : { x: clamp(world.x, 0, page.w), y: clamp(world.y - page.y, 0, page.h) };
 
       if (tool === 'eraser') {
         modeRef.current = {
@@ -1042,6 +1183,13 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       }
 
       if (tool === 'laser') {
+        // HARD GATE — the finger draws laser ONLY when finger-drawing is
+        // enabled (toolbar toggle / Settings). Pen & mouse always may;
+        // otherwise the touch pans & zooms and never leaves laser ink.
+        if (e.pointerType === 'touch' && !canDrawWith(e)) {
+          startPan(e, localPt(e));
+          return;
+        }
         // presentation pointer: transient overlay ink, nothing persists
         const ts = stEd.toolStates.laser;
         noteLaserActivity(); // snapshot mode + start the "still writing" clock
@@ -1086,7 +1234,13 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     };
 
     const onPointerMove = (e: PointerEvent) => {
-      if (e.pointerType === 'pen') penSeenRef.current = performance.now(); // hover keeps the pen "in range"
+      if (e.pointerType === 'pen') {
+        penSeenRef.current = performance.now(); // hover keeps the pen "in range"
+        // hover-capable stylus (tip not touching): while it floats near the
+        // display, touches stay rejected — the moment it leaves range the
+        // finger works again (Samsung Notes-style instant palm rejection)
+        if ((e.buttons & 1) === 0 && e.pressure === 0) penHoverCapableRef.current = true;
+      }
       const rect = host.getBoundingClientRect();
       const l = { x: e.clientX - rect.left, y: e.clientY - rect.top };
       const known = pointers.get(e.pointerId);
@@ -1115,6 +1269,10 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         markInteraction();
         const d = Math.hypot(a.x - b.x, a.y - b.y);
         const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+        // a real pinch/zoom is NOT a two-finger tap
+        if (twoTapRef.current && (Math.abs(d - m.d0) > 6 || Math.hypot(mid.x - m.mid0.x, mid.y - m.mid0.y) > 8)) {
+          twoTapRef.current.moved = true;
+        }
         const scale = clampScale(m.scale0 * (d / m.d0));
         const wx = (m.mid0.x - m.tx0) / m.scale0;
         const wy = (m.mid0.y - m.ty0) / m.scale0;
@@ -1133,6 +1291,8 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         while (m.samples.length > 2 && now - m.samples[0].t > SAMPLE_WINDOW) m.samples.shift();
         m.lastMoveT = now;
         applyPanRaw(m, m.rawX, m.rawY);
+        // dragging with two fingers down = a pan, not a two-finger tap
+        if (twoTapRef.current) twoTapRef.current.moved = true;
         return;
       }
 
@@ -1168,11 +1328,14 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         if (!page) return;
         const doc = st.editor.docs[m.pageId];
         const r = st.editor.eraser.size / 2 / vp.scale;
+        const inf = isInfinitePaper();
         let hit = false;
         for (const ev of coalescedOf(e)) {
           const el = localPt(ev);
           const world = screenToWorld(el.x, el.y);
-          const pagePt = { x: clamp(world.x, 0, pageW), y: clamp(world.y - page.y, 0, page.h) };
+          const pagePt = inf
+            ? { x: world.x, y: world.y - page.y }
+            : { x: clamp(world.x, 0, page.w), y: clamp(world.y - page.y, 0, page.h) };
           m.lastScreen = el;
           const prev = m.path[m.path.length - 1];
           m.path.push(pagePt);
@@ -1225,8 +1388,9 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         const world = screenToWorld(l.x, l.y);
         const page = layouts.find((p) => p.id === m.pageId);
         if (!page) return;
-        let bx = clamp(world.x, 0, pageW);
-        let by = clamp(world.y - page.y, 0, page.h);
+        const inf = isInfinitePaper();
+        let bx = inf ? world.x : clamp(world.x, 0, page.w);
+        let by = inf ? world.y - page.y : clamp(world.y - page.y, 0, page.h);
         const st = useApp.getState();
         const shape = st.editor.shape.type;
         if (shape === 'line' || shape === 'arrow') {
@@ -1269,10 +1433,9 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       const last = lastTapRef.current;
       const now = performance.now();
       if (last && now - last.t < 320 && Math.hypot(e.clientX - last.x, e.clientY - last.y) < 28) {
-        const vp = getVp();
-        const l = localPt(e);
-        animateZoomTo(l.x, l.y, vp.scale > 1.4 ? 1 : 2.5, 260);
         lastTapRef.current = null;
+        // configurable finger gesture — zoom by default, undo/redo/tool switch in Settings
+        applyFingerAction(useApp.getState().settings.fingerGestures.doubleTap, e.clientX, e.clientY);
       } else {
         lastTapRef.current = { t: now, x: e.clientX, y: e.clientY };
       }
@@ -1284,6 +1447,35 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       pointers.delete(e.pointerId);
       clearTextHold(); // gesture ended — no long-press can fire anymore
       const st = useApp.getState();
+
+      // pen lifted: hold-to-erase (barrel) restores the previous tool instantly
+      if (e.pointerType === 'pen') {
+        penDownRef.current = false;
+        penLastUpRef.current = performance.now();
+        const restore = momentaryToolRef.current;
+        if (restore) {
+          momentaryToolRef.current = null;
+          st.setTool(restore);
+        }
+      }
+
+      // two-finger tap (finger gesture): both touches released quickly and
+      // without turning into a pinch/pan → run the configured action
+      if (e.pointerType === 'touch' && known) {
+        touchCountRef.current = Math.max(0, touchCountRef.current - 1);
+        const two = twoTapRef.current;
+        if (two) {
+          if (touchCountRef.current > 1) {
+            twoTapRef.current = null;
+          } else if (touchCountRef.current === 0) {
+            twoTapRef.current = null;
+            if (!two.fired && !two.moved && performance.now() - two.t0 < TWOFINGER_MS) {
+              two.fired = true;
+              applyFingerAction(st.settings.fingerGestures.twoFingerTap, e.clientX, e.clientY);
+            }
+          }
+        }
+      }
 
       if (m.type === 'pinch') {
         if (m.ids.includes(e.pointerId)) modeRef.current = { type: 'none' };
@@ -1336,6 +1528,30 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       }
       if (m.type === 'stroke' && e.pointerId === m.pointerId) {
         stopDwellWatch();
+        // pen double-tap (first half): a quick motionless tap is held back for
+        // a moment; if a second tap lands at the same spot, the configured
+        // shortcut runs instead of committing two dots. Real writing commits
+        // normally — only taps are deferred.
+        if (
+          e.pointerType === 'pen' && quick &&
+          useApp.getState().settings.penShortcuts.doubleTap !== 'none'
+        ) {
+          const prev = pendingTapRef.current;
+          if (prev) clearTimeout(prev.timer);
+          const held: NonNullable<typeof pendingTapRef.current> = {
+            m, x: e.clientX, y: e.clientY, t: performance.now(),
+            timer: null as unknown as ReturnType<typeof setTimeout>,
+          };
+          held.timer = setTimeout(() => {
+            if (pendingTapRef.current === held) pendingTapRef.current = null;
+            void commitStroke(held.m, true);
+          }, DBLTAP_GAP_MS + 40);
+          pendingTapRef.current = held;
+          modeRef.current = { type: 'none' };
+          activeTypeRef.current = null;
+          requestOverlayRepaint();
+          return;
+        }
         if (m.lockedShape) {
           // draw & hold snapped a clean shape — commit it as a shape element
           // with the pen's color/width (Notewise-style)
@@ -1455,6 +1671,24 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     const onPointerUp = (e: PointerEvent) => { finishGesture(e) };
     const onPointerCancel = (e: PointerEvent) => {
       clearTextHold();
+      // same bookkeeping as a normal release (pen linger, finger tap counting) —
+      // a cancelled gesture must never leave stale state behind
+      if (e.pointerType === 'pen') {
+        penDownRef.current = false;
+        penLastUpRef.current = performance.now();
+        const restore = momentaryToolRef.current;
+        if (restore) { momentaryToolRef.current = null; useApp.getState().setTool(restore) }
+      }
+      if (e.pointerType === 'touch' && pointers.has(e.pointerId)) {
+        touchCountRef.current = Math.max(0, touchCountRef.current - 1);
+        if (touchCountRef.current <= 1) twoTapRef.current = null; // gesture stolen — cancel the tap window
+      }
+      const pending = pendingTapRef.current;
+      if (e.pointerType === 'pen' && pending) {
+        clearTimeout(pending.timer);
+        pendingTapRef.current = null;
+        void commitStroke(pending.m, true); // commit the held dot so nothing is lost
+      }
       const m = modeRef.current;
       if (m.type === 'stroke' && e.pointerId === m.pointerId) { stopDwellWatch(); modeRef.current = { type: 'none' }; activeTypeRef.current = null; requestOverlayRepaint() }
       if (m.type === 'laser' && e.pointerId === m.pointerId) {
@@ -1544,6 +1778,8 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       clearImgHold();
       clearTextHold();
       stopDwellWatch();
+      const pending = pendingTapRef.current;
+      if (pending) { clearTimeout(pending.timer); pendingTapRef.current = null }
       const mEnd = modeRef.current;
       if (mEnd.type === 'imgmove') setHiddenIds(mEnd.pageId, null);
       stopLaserLoop(); // fade loop + trail die with the surface

@@ -12,7 +12,7 @@
 //     momentum / rubber-band settle is in flight (the global clamp stands down
 //     so elastic overscroll is possible), then the clamp re-asserts.
 import { useSyncExternalStore } from 'react';
-import { MAX_ZOOM, MIN_ZOOM } from '@/lib/nanote/types';
+import { INFINITE_MAX_ZOOM, INFINITE_MIN_ZOOM, MAX_ZOOM, MIN_ZOOM } from '@/lib/nanote/types';
 
 export interface Vp { scale: number; tx: number; ty: number }
 
@@ -63,10 +63,37 @@ export function useVp(): Vp {
   return useSyncExternalStore(subscribeVp, getVp, getVp);
 }
 
-export const clampScale = (s: number) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, s));
+export const clampScale = (s: number) => Math.min(zoomMax, Math.max(zoomMin, s));
 
 export function getViewportSize() { return containerSize }
 export function setViewportSize(w: number, h: number) { containerSize = { w, h } }
+
+// ---------------------------------------------------------------- contextual zoom range
+// regular notebooks 50–800%; infinity paper gets a Concepts-style near-
+// unbounded 8%–2400% range.
+let zoomMin = MIN_ZOOM;
+let zoomMax = MAX_ZOOM;
+export function setZoomRange(min: number, max: number) {
+  zoomMin = Math.min(min, max);
+  zoomMax = Math.max(min, max);
+  const s1 = Math.min(zoomMax, Math.max(zoomMin, state.scale));
+  if (s1 !== state.scale) setVp({ scale: s1 });
+}
+export function setZoomRangeFor(infinite: boolean) {
+  setZoomRange(infinite ? INFINITE_MIN_ZOOM : MIN_ZOOM, infinite ? INFINITE_MAX_ZOOM : MAX_ZOOM);
+}
+
+/** the visible slice of the world (page-windowed rendering + culling) */
+export function visibleWorldRect(): { x0: number; y0: number; x1: number; y1: number } {
+  const { scale, tx, ty } = state;
+  const { w, h } = containerSize;
+  return {
+    x0: (0 - tx) / scale,
+    y0: (0 - ty) / scale,
+    x1: (w - tx) / scale,
+    y1: (h - ty) / scale,
+  };
+}
 
 /** zoom keeping the screen point (sx, sy) fixed */
 export function zoomAt(sx: number, sy: number, factor: number) {
@@ -178,14 +205,32 @@ export function axisBounds(content: number, container: number, pad = VIEWPORT_PA
  * Clamp the viewport to the world. Whenever a page fits the width it is
  * re-centered EXACTLY — the "pages drift left/right while flipping" bug is
  * impossible by construction. Stands down while a gesture owns the viewport.
+ *
+ * Infinity paper: the content rect may extend into negative quadrants
+ * (worldX0/worldY0 ≤ 0 — the sheet grows up/left via pads); panning roams
+ * freely ~1.5 screens beyond the content on every side, and nothing ever
+ * hard-locks (the endless sheet is never "fully visible").
  */
-export function clampVpToWorld(containerW: number, containerH: number, worldW: number, worldH: number) {
+export function clampVpToWorld(containerW: number, containerH: number, worldW: number, worldH: number, infinite = false, worldX0 = 0, worldY0 = 0) {
   if (gestureDepth > 0) return;
   const { scale } = state;
-  const bx = axisBounds(worldW * scale, containerW);
-  const by = axisBounds(worldH * scale, containerH);
-  const tx = Math.min(bx.max, Math.max(bx.min, state.tx));
-  const ty = Math.min(by.max, Math.max(by.min, state.ty));
+  const roam = infinite ? Math.max(containerW, containerH) * 1.5 : 0;
+  const bounds = (content: number, container: number, pad: number) => {
+    if (!infinite && content <= container + FIT_SLACK) {
+      const c = (container - content) / 2;
+      return { min: c, max: c };
+    }
+    const min = Math.min(container - content - pad, pad) - roam;
+    const max = Math.max(pad, container - content + pad * 4) + roam;
+    return { min, max };
+  };
+  // content-local translation (the content origin may sit at negative world coords)
+  const tx0 = state.tx + worldX0 * scale;
+  const ty0 = state.ty + worldY0 * scale;
+  const bx = bounds(worldW * scale, containerW, VIEWPORT_PAD);
+  const by = bounds(worldH * scale, containerH, VIEWPORT_PAD);
+  const tx = Math.min(bx.max, Math.max(bx.min, tx0)) - worldX0 * scale;
+  const ty = Math.min(by.max, Math.max(by.min, ty0)) - worldY0 * scale;
   if (tx !== state.tx || ty !== state.ty) setVp({ tx, ty });
 }
 
@@ -194,16 +239,28 @@ export function fitScaleOf(containerW: number, worldW: number) {
   return clampScale(Math.min((containerW - 48) / worldW, 1.25));
 }
 
-export function fitWidth(containerW: number, worldW: number) {
+export function fitWidth(containerW: number, worldW: number, worldX0 = 0, worldY0 = 0) {
   animGen++; // any in-flight touch momentum must stop when we re-fit
   const scale = fitScaleOf(containerW, worldW);
-  setVp({ scale, tx: (containerW - worldW * scale) / 2, ty: 24 });
+  setVp({ scale, tx: (containerW - worldW * scale) / 2 - worldX0 * scale, ty: 24 - worldY0 * scale });
 }
 
 /** animated "fit" (zoom-bar button) — glides to the fit position */
-export function animatedFit(containerW: number, worldW: number) {
+export function animatedFit(containerW: number, worldW: number, worldX0 = 0, worldY0 = 0) {
   const scale = fitScaleOf(containerW, worldW);
-  animateVpTo({ scale, tx: (containerW - worldW * scale) / 2, ty: 24 }, 260);
+  animateVpTo({ scale, tx: (containerW - worldW * scale) / 2 - worldX0 * scale, ty: 24 - worldY0 * scale }, 260);
+}
+
+/** fit a world-space rect (content bounds) into the viewport, centered */
+export function fitToBounds(b: { x0: number; y0: number; x1: number; y1: number }, containerW: number, containerH: number, maxScale = 1.5) {
+  const bw = Math.max(1, b.x1 - b.x0);
+  const bh = Math.max(1, b.y1 - b.y0);
+  const scale = clampScale(Math.min((containerW - 96) / bw, (containerH - 96) / bh, maxScale));
+  setVp({
+    scale,
+    tx: (containerW - bw * scale) / 2 - b.x0 * scale,
+    ty: (containerH - bh * scale) / 2 - b.y0 * scale,
+  });
 }
 
 export function resetVp(containerW: number, worldW: number) {
@@ -211,20 +268,60 @@ export function resetVp(containerW: number, worldW: number) {
 }
 
 // ---------------------------------------------------------------- page layout
-export interface PageLayout { id: string; y: number; w: number; h: number }
+export interface PageLayout {
+  id: string;
+  y: number;      // world Y of the page's local origin (0,0)
+  w: number;      // FULL padded box width (origWidth + padX)
+  h: number;      // FULL padded box height (origHeight + padY)
+  padX: number;   // how far the sheet extends LEFT of the origin (infinite)
+  padY: number;   // how far the sheet extends ABOVE the origin (infinite)
+}
 
-export function layoutPages(pages: { id: string; height: number }[], pageW: number): { layouts: PageLayout[]; worldH: number } {
+export function layoutPages(pages: { id: string; height: number; width?: number | null; padX?: number | null; padY?: number | null }[], pageW: number): { layouts: PageLayout[]; worldH: number } {
   let y = 0;
   const layouts: PageLayout[] = pages.map((p) => {
-    const entry = { id: p.id, y, w: pageW, h: p.height };
-    y += p.height + PAGE_GAP;
+    // per-page width + top/left pads (infinity paper grows in ALL directions
+    // while you write: right/down via width/height, up/left via pads)
+    const padX = p.padX ?? 0;
+    const padY = p.padY ?? 0;
+    const entry: PageLayout = { id: p.id, y, w: (p.width ?? pageW) + padX, h: p.height + padY, padX, padY };
+    // the pad grows the sheet UPWARD — reserve the space so stacked boards
+    // never overlap (consistent with height growth pushing later pages down)
+    y += p.height + padY + PAGE_GAP;
     return entry;
   });
   return { layouts, worldH: Math.max(0, y - PAGE_GAP) };
 }
 
+/** widest page in the stack (viewport clamp / fit width) — padded widths */
+export function worldWidthOf(layouts: PageLayout[], pageW: number): number {
+  let w = pageW;
+  for (const l of layouts) if (l.w - l.padX > w) w = l.w - l.padX;
+  return w;
+}
+
+/**
+ * Full world content rect (includes infinity-paper pads reaching into the
+ * negative quadrants). x0/y0 are ≤ 0; x1/y1 ≥ 0. Drives viewport clamping,
+ * fit-width and the minimap frame.
+ */
+export function worldBoundsOf(layouts: PageLayout[], pageW: number): { x0: number; y0: number; x1: number; y1: number } {
+  let x0 = 0, y0 = 0, x1 = pageW, y1 = 0;
+  for (const l of layouts) {
+    x0 = Math.min(x0, -l.padX);
+    y0 = Math.min(y0, l.y - l.padY);
+    x1 = Math.max(x1, l.w - l.padX);
+    y1 = Math.max(y1, l.y - l.padY + l.h);
+  }
+  if (!layouts.length) y1 = 0;
+  return { x0, y0, x1, y1 };
+}
+
 export function pageAtWorldY(layouts: PageLayout[], wy: number): PageLayout | null {
-  for (const l of layouts) if (wy >= l.y && wy <= l.y + l.h) return l;
+  for (const l of layouts) {
+    const top = l.y - l.padY;
+    if (wy >= top && wy <= top + l.h) return l;
+  }
   return null;
 }
 
@@ -234,7 +331,7 @@ export function pageAtWorldY(layouts: PageLayout[], wy: number): PageLayout | nu
  * Nearby pages get a short glide; far jumps swoosh past quickly.
  */
 export function scrollToPage(layout: PageLayout, offset = 0.3) {
-  const targetTy = containerSize.h * offset - layout.y * state.scale;
+  const targetTy = containerSize.h * offset - (layout.y - layout.padY) * state.scale;
   const dist = Math.abs(targetTy - state.ty);
   const dur = Math.min(520, 150 + dist * 0.08);
   animateVpTo({ ty: targetTy }, dur);

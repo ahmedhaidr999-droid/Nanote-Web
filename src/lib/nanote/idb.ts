@@ -3,7 +3,7 @@
 // IndexedDB is unavailable (e.g. storage blocked in an embedding context).
 import { openDB, IDBPDatabase } from 'idb';
 import {
-  DEFAULT_SETTINGS, LangPack, PageDoc, PageRow, PdfTextRec, RecordingRow, FolderRow, NotebookRow, Settings, TabRow, TagRow,
+  DEFAULT_SETTINGS, FINGER_GESTURES_DEFAULT, LangPack, PEN_SHORTCUTS_DEFAULT, PageDoc, PageRow, PdfTextRec, RecordingRow, FolderRow, NotebookRow, Settings, TabRow, TagRow,
   TRASH_RETENTION_MS,
 } from './types';
 import { encodeDoc, decodeDoc } from './ink';
@@ -121,6 +121,10 @@ export async function loadSettings(): Promise<Settings> {
   let s = { ...DEFAULT_SETTINGS };
   const stored = await getOne<Settings>('meta', 'settings');
   if (stored) s = { ...s, ...stored };
+  // nested safety for stylus-button / finger-gesture shortcut maps (older
+  // saves predate them) — booleans like `minimap` merge via the spread above
+  s.penShortcuts = { ...PEN_SHORTCUTS_DEFAULT, ...(s.penShortcuts ?? {}) };
+  s.fingerGestures = { ...FINGER_GESTURES_DEFAULT, ...(s.fingerGestures ?? {}) };
   return s;
 }
 

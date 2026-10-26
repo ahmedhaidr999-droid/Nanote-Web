@@ -16,19 +16,29 @@ async function renderToDataUrl(page: PageRow, pageW: number): Promise<string> {
   // decode every image the page references (backgrounds, templates, elements)
   // BEFORE rasterizing — otherwise PDF page thumbs render as blank paper.
   await preloadPageImages(page, doc);
-  const scale = THUMB_W / pageW;
-  const h = Math.max(40, Math.round(page.height * scale));
+  // full padded box (infinity paper grows in ALL directions: right/down via
+  // width/height, up/left via padX/padY)
+  const padX = page.padX ?? 0;
+  const padY = page.padY ?? 0;
+  const pw = (page.width ?? pageW) + padX;
+  const ph = page.height + padY;
+  const inf = useApp.getState().notebooks.find((n) => n.id === page.notebookId)?.pageSize === 'infinite';
+  const scale = THUMB_W / pw;
+  const h = Math.max(40, Math.round(ph * scale));
   const c = document.createElement('canvas');
   c.width = THUMB_W;
   c.height = h;
   const ctx = c.getContext('2d');
   if (!ctx) return '';
-  ctx.scale(scale, scale);
-  renderPage(ctx, page, doc, pageW, page.height, {
+  // draw the full padded box; local (-padX,-padY) maps to canvas (0,0)
+  ctx.setTransform(scale, 0, 0, scale, padX * scale, padY * scale);
+  renderPage(ctx, page, doc, pw - padX, ph - padY, {
     gamma: useApp.getState().settings.pressureCurve,
     highlighterOpacity: useApp.getState().settings.highlighterOpacity,
     resolveImage,
     imageNatural,
+    win: { x0: -padX, y0: -padY, x1: pw - padX, y1: ph - padY },
+    infinite: inf,
   });
   return c.toDataURL('image/png');
 }

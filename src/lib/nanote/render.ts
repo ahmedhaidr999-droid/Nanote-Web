@@ -3,8 +3,8 @@
 // onto any 2D context. Shared by the live editor canvas, thumbnails, PNG and PDF export.
 import { computeOutline, pathOutline } from './outline';
 import { drawTemplate } from './templates';
-import { shapePath } from './geometry';
-import { ImageEl, PageDoc, PageRow, StrokeEl, TextEl, ShapeEl, TEXT_FONTS } from './types';
+import { shapePath, elementBBox } from './geometry';
+import { ImageEl, PageDoc, PageElement, PageRow, StrokeEl, TextEl, ShapeEl, TEXT_FONTS } from './types';
 import { isDarkHex, withAlpha } from './util';
 
 export interface RenderOpts {
@@ -15,6 +15,12 @@ export interface RenderOpts {
   hideIds?: Set<string>;
   paperDark?: boolean;              // dark paper → highlighter blends differently
   highlighterOpacity?: number;      // 0..100 (%) — same-color overlaps never stack
+  /** infinity paper: render a slice of the endless sheet instead of the page
+   *  box; coordinates are page-local and may be negative. The background
+   *  pattern is drawn seamlessly across the slice. */
+  win?: { x0: number; y0: number; x1: number; y1: number };
+  /** true when the notebook is an infinity paper (seamless pattern, no edges) */
+  infinite?: boolean;
   /** vector-quality PDF background (re-rendered from the stored original at
    *  the CURRENT zoom — keeps text razor-sharp at high magnification,
    *  Notewise-style) drawn instead of the stored raster PNG when present */
@@ -60,6 +66,29 @@ function getOutline(stroke: StrokeEl, gamma: number): number[] {
 export function invalidateOutline(strokeId?: string) {
   if (strokeId) outlineCache.delete(strokeId);
   else outlineCache.clear();
+  bboxCache = new WeakMap();
+}
+
+// ---------------------------------------------------------------- element culling
+// cached bounding boxes (elements are immutable — replaced, never mutated),
+// used to skip elements outside the rendered slice: thousands of strokes stay
+// fast because only what is on screen gets drawn.
+let bboxCache = new WeakMap<PageElement, { x0: number; y0: number; x1: number; y1: number }>();
+
+function cachedBBox(el: PageElement): { x0: number; y0: number; x1: number; y1: number } {
+  let b = bboxCache.get(el);
+  if (!b) {
+    b = elementBBox(el);
+    bboxCache.set(el, b);
+  }
+  return b;
+}
+
+/** does this element intersect the slice? (margin covers stroke width) */
+function elInWin(el: PageElement, win: { x0: number; y0: number; x1: number; y1: number }): boolean {
+  const m = el.kind === 'stroke' ? Math.min(40, (el as StrokeEl).width) : 4;
+  const b = cachedBBox(el);
+  return b.x1 + m >= win.x0 && b.x0 - m <= win.x1 && b.y1 + m >= win.y0 && b.y0 - m <= win.y1;
 }
 
 // ---------------------------------------------------------------- stroke / element drawing
@@ -197,15 +226,21 @@ export function renderPage(
   h: number,
   opts: RenderOpts,
 ) {
-  // 1) paper
+  // infinity paper renders a slice of the endless sheet; fixed pages render
+  // their full box (win defaults to exactly that).
+  const win = opts.win ?? { x0: 0, y0: 0, x1: w, y1: h };
+  const infinite = opts.infinite ?? false;
+
+  // 1) paper — fills the whole slice (negative local coords included)
   ctx.fillStyle = page.backgroundHex || '#FFFFFF';
-  ctx.fillRect(0, 0, w, h);
+  ctx.fillRect(win.x0, win.y0, win.x1 - win.x0, win.y1 - win.y0);
 
   // 2) PDF/background image beneath everything — the vector override (rendered
   //    from the original PDF at the current zoom) wins when available
-  if (opts.backgroundOverride) {
+  //    (fixed pages only — infinite sheets have no PDF background)
+  if (opts.backgroundOverride && !infinite) {
     try { ctx.drawImage(opts.backgroundOverride.source, 0, 0, w, h) } catch { /* ignore */ }
-  } else if (page.backgroundImageId && opts.resolveImage) {
+  } else if (page.backgroundImageId && opts.resolveImage && !infinite) {
     const src = opts.resolveImage(page.backgroundImageId);
     if (src) {
       const nat = opts.imageNatural?.(page.backgroundImageId) ?? { w, h };
@@ -215,22 +250,23 @@ export function renderPage(
   }
 
   // 3) custom template image
-  if (page.customTemplateImageId && opts.resolveImage) {
+  if (page.customTemplateImageId && opts.resolveImage && !infinite) {
     const src = opts.resolveImage(page.customTemplateImageId);
     if (src) {
       try { ctx.drawImage(src, 0, 0, w, h) } catch { /* ignore */ }
     }
   }
 
-  // 4) paper template lines
-  drawTemplate(ctx, page.template, w, h, page.backgroundHex || '#FFFFFF');
+  // 4) paper template lines — seamless across the slice, anchored to the
+  //    absolute local grid so panning never breaks the pattern
+  drawTemplate(ctx, page.template, win.x1, win.y1, page.backgroundHex || '#FFFFFF', win.x0, win.y0, infinite);
 
   if (!doc) return;
 
   const optsWithPaper: RenderOpts = { ...opts, paperDark: isDarkHex(page.backgroundHex || '#FFFFFF') };
 
   const hide = opts.hideIds;
-  const els = doc.elements.filter((e) => !hide?.has(e.id));
+  const els = doc.elements.filter((e) => !hide?.has(e.id) && (!infinite || elInWin(e, win)));
 
   // 5) highlighter strokes first (draws BEHIND ink) — grouped by color and
   // filled as ONE merged path per color: overlapping passes of the same color

@@ -70,6 +70,9 @@ export interface NotebookRow {
   deletedAt: number | null;
   sortOrder: number;
   tagIds: string[];
+  // infinity paper: the exact pan/zoom the user left the notebook at, so
+  // reopening restores the same view (content coordinates never move).
+  lastVp?: { scale: number; tx: number; ty: number } | null;
 }
 
 export interface PageRow {
@@ -86,6 +89,13 @@ export interface PageRow {
   updatedAt: number;
   textIndex: string;  // searchable text-box content, maintained on save
   height: number;     // page height in page-units (fixed sizes; grows for infinite)
+  width?: number | null; // per-page width (null → the notebook's base size); infinite pages grow rightward
+  // infinity paper growth into the top/left quadrants: elements may sit at
+  // negative local coordinates; padX/padY record how far the sheet extends
+  // above/left of the original origin (bookkeeping for thumbnails, export,
+  // fit-content and the minimap — live rendering is viewport-windowed).
+  padX?: number | null;
+  padY?: number | null;
 }
 
 export interface RecordingRow {
@@ -105,6 +115,33 @@ export interface TagRow { id: string; name: string; colorHex: string }
 // ---------------------------------------------------------------- settings
 export type TranslateEngine = 'nanote' | 'google';
 export type LaserMode = 'normal' | 'timed';
+
+// -------------------------------------------------------------- pen & input shortcuts
+/** actions a stylus hardware button / gesture can perform */
+export type PenAction =
+  | 'none' | 'eraserHold' | 'eraserToggle' | 'pen' | 'highlighter' | 'laser'
+  | 'lasso' | 'text' | 'shape' | 'pan' | 'undo' | 'redo' | 'pagePrev' | 'pageNext';
+/** actions a finger tap gesture can perform */
+export type FingerAction = 'none' | 'zoom' | 'undo' | 'redo' | 'eraserToggle' | 'pen';
+
+export interface PenShortcutPrefs {
+  barrel: PenAction;    // primary side button held during contact (Wacom/S Pen/Surface/USI)
+  barrel2: PenAction;   // secondary side button (3-button styluses)
+  doubleTap: PenAction; // quick double-tap of the pen tip (works on every stylus)
+}
+export interface FingerGesturePrefs {
+  doubleTap: FingerAction;    // one-finger double tap
+  twoFingerTap: FingerAction; // quick two-finger tap (no pinch movement)
+}
+export const PEN_SHORTCUTS_DEFAULT: PenShortcutPrefs = {
+  barrel: 'eraserHold',
+  barrel2: 'undo',
+  doubleTap: 'eraserToggle',
+};
+export const FINGER_GESTURES_DEFAULT: FingerGesturePrefs = {
+  doubleTap: 'zoom',
+  twoFingerTap: 'undo',
+};
 
 export interface Settings {
   theme: ThemeMode;
@@ -131,6 +168,9 @@ export interface Settings {
   // linger and all fade together N seconds after writing stops
   laserMode: LaserMode;
   laserFadeSec: number;        // 1..10 seconds (timed mode)
+  penShortcuts: PenShortcutPrefs;   // stylus hardware buttons + double-tap
+  fingerGestures: FingerGesturePrefs; // finger tap gestures
+  minimap: boolean;                 // infinity paper: show the mini overview map
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -156,6 +196,9 @@ export const DEFAULT_SETTINGS: Settings = {
   aiService: 'chatgpt',
   laserMode: 'normal',
   laserFadeSec: 3,
+  penShortcuts: PEN_SHORTCUTS_DEFAULT,
+  fingerGestures: FINGER_GESTURES_DEFAULT,
+  minimap: true,
 };
 
 // ---------------------------------------------------------------- offline language packs
@@ -304,4 +347,10 @@ export const ERASER_DEFAULT = { mode: 'stroke' as EraserMode, size: 24 };
 export const TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 export const MIN_ZOOM = 0.5; // 50% max zoom-out — pages stay centered and readable
 export const MAX_ZOOM = 8;
+// Infinity paper (Concepts-style) — near-unbounded zoom range
+export const INFINITE_MIN_ZOOM = 0.08;
+export const INFINITE_MAX_ZOOM = 24;
+// infinity paper: growth step & margin when the sheet chases the pen
+export const INFINITE_GROW_STEP = 512;
+export const INFINITE_GROW_MARGIN = 140;
 export const UNDO_LIMIT = 200;

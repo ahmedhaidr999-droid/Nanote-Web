@@ -23,6 +23,13 @@ export function drawTemplate(
   w: number,
   h: number,
   bgHex: string,
+  // seamless (infinity paper): the pattern region is [x0..w] × [y0..h] in
+  // page-local coordinates and x0/y0 may be negative — pattern lines stay
+  // anchored to the absolute local grid so the background never breaks,
+  // no matter which slice of the endless sheet is being drawn.
+  x0 = 0,
+  y0 = 0,
+  seamless = false,
 ) {
   if (template === 'blank' || template === 'custom') return;
   const line = templateLineColor(bgHex);
@@ -32,32 +39,55 @@ export function drawTemplate(
   ctx.strokeStyle = line;
   ctx.fillStyle = line;
 
-  const hline = (y: number, x0 = 0, x1 = w) => { ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke() };
-  const vline = (x: number, y0 = 0, y1 = h) => { ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y1); ctx.stroke() };
+  // in seamless mode there are no page edges — pattern covers the full slice.
+  // on fixed pages keep the original margins so regular notebooks look identical.
+  const hline = (y: number, xa = x0, xb = w) => { ctx.beginPath(); ctx.moveTo(xa, y); ctx.lineTo(xb, y); ctx.stroke() };
+  const vline = (x: number, ya = y0, yb = h) => { ctx.beginPath(); ctx.moveTo(x, ya); ctx.lineTo(x, yb); ctx.stroke() };
 
   switch (template) {
-    case 'ruled':
-      for (let y = 72; y < h - 24; y += 32) hline(y);
+    case 'ruled': {
+      // lines anchored at y = 72 + k·32 in local space → seamless continuation
+      const step = 32;
+      const first = 72 + Math.ceil((y0 - 72) / step) * step;
+      const lastY = seamless ? h : h - 24;
+      for (let y = (seamless ? first : Math.max(72, first)); y < lastY; y += step) hline(y);
       break;
-    case 'wideruled':
-      for (let y = 80; y < h - 32; y += 48) hline(y);
+    }
+    case 'wideruled': {
+      const step = 48;
+      const first = 80 + Math.ceil((y0 - 80) / step) * step;
+      const lastY = seamless ? h : h - 32;
+      for (let y = Math.max(80, first); y < lastY; y += step) hline(y);
       break;
+    }
     case 'grid': {
       const s = 24;
-      for (let x = 0; x <= w; x += s) vline(x);
-      for (let y = 0; y <= h; y += s) hline(y);
+      const fx = Math.ceil(x0 / s) * s;
+      const fy = Math.ceil(y0 / s) * s;
+      for (let x = fx; x <= w; x += s) vline(x);
+      for (let y = fy; y <= h; y += s) hline(y);
       break;
     }
     case 'dotgrid': {
       const s = 24;
-      for (let x = s; x < w; x += s) for (let y = s; y < h; y += s) {
+      const fx = Math.ceil(x0 / s) * s;
+      const fy = Math.ceil(y0 / s) * s;
+      // fixed pages start one cell in (no dots on the page edge); the endless
+      // sheet has no edges — dots continue into negative space seamlessly.
+      const sx = seamless ? fx : Math.max(fx, s);
+      const sy = seamless ? fy : Math.max(fy, s);
+      for (let x = sx; x < w; x += s) for (let y = sy; y < h; y += s) {
         ctx.beginPath(); ctx.arc(x, y, 1.7, 0, Math.PI * 2); ctx.fill();
       }
       break;
     }
     case 'handwriting': {
       const group = 64;
-      for (let y = 96; y < h - 40; y += group) {
+      const g0 = Math.ceil((y0 - 96) / group);
+      const g1 = Math.floor(((seamless ? h : h - 40) - 96) / group);
+      for (let g = g0; g <= g1; g++) {
+        const y = 96 + g * group;
+        if (y < y0 - 32 || y > h + 40) continue;
         // baseline
         ctx.strokeStyle = accent;
         hline(y + 32);
@@ -73,9 +103,13 @@ export function drawTemplate(
     }
     case 'music': {
       const groupH = 128;
-      for (let base = 96; base + 4 * 14 < h - 40; base += groupH) {
+      const g0 = Math.ceil((y0 - 96) / groupH);
+      const g1 = Math.floor(((seamless ? h : h - 40) - 96) / groupH);
+      for (let g = g0; g <= g1; g++) {
+        const base = 96 + g * groupH;
+        if (base + 4 * 14 < y0 - 20 || base > h + 20) continue;
         ctx.strokeStyle = accent;
-        for (let i = 0; i < 5; i++) hline(base + i * 14, 48, w - 48);
+        for (let i = 0; i < 5; i++) hline(base + i * 14, seamless ? x0 : 48, seamless ? w : w - 48);
       }
       break;
     }
@@ -85,10 +119,13 @@ export function drawTemplate(
         const a = (angleDeg * Math.PI) / 180;
         const dirx = Math.cos(a), diry = Math.sin(a);
         const nx = -diry, ny = dirx;
-        const diag = Math.hypot(w, h);
-        const cx = w / 2, cy = h / 2;
-        const count = Math.ceil(diag / s);
-        for (let i = -count; i <= count; i++) {
+        const cx = (x0 + w) / 2, cy = (y0 + h) / 2;
+        const diag = Math.hypot(w - x0, h - y0);
+        const count = Math.ceil(diag / s) + 2;
+        // families stay anchored to the local grid: offset lines from the
+        // absolute origin, then clip the visible band to the slice
+        const baseOffset = Math.floor((x0 + y0) / s) * s;
+        for (let i = -count + Math.floor(baseOffset / s); i <= count + Math.floor(baseOffset / s); i++) {
           const ox = cx + nx * i * s, oy = cy + ny * i * s;
           ctx.beginPath();
           ctx.moveTo(ox - dirx * diag, oy - diry * diag);
@@ -105,11 +142,15 @@ export function drawTemplate(
     case 'daily': {
       // header
       ctx.strokeStyle = accent; ctx.lineWidth = 1.5;
-      ctx.beginPath(); ctx.moveTo(0, 64); ctx.lineTo(w, 64); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x0, 64); ctx.lineTo(w, 64); ctx.stroke();
       ctx.lineWidth = 1;
       // checkbox column + sections
       const secH = 110;
-      for (let y = 110; y + secH < h - 30; y += secH) {
+      const g0 = Math.ceil((y0 - 110) / secH);
+      const g1 = Math.floor(((seamless ? h : h - 30) - 110) / secH);
+      for (let g = g0; g <= g1; g++) {
+        const y = 110 + g * secH;
+        if (y + secH < y0 - 30 || y > h + 30) continue;
         ctx.strokeStyle = line;
         ctx.strokeRect(40, y, 18, 18);
         hline(y + secH - 26, 40, w - 40);
@@ -124,7 +165,7 @@ export function drawTemplate(
       hline(70, pad, w - pad);
       ctx.lineWidth = 1;
       ctx.strokeStyle = line;
-      for (let i = 0; i <= 7; i++) vline(pad + i * cw, 40, h - 30);
+      for (let i = 0; i <= 7; i++) vline(pad + i * cw, 40, seamless ? h : h - 30);
       hline(40, pad, w - pad);
       break;
     }

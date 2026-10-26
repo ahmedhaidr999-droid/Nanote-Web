@@ -1,10 +1,11 @@
 'use client';
-// Floating action button (bottom-end) — new notebook / new folder / import PDF.
-// Actions carry the current tab/folder context; PDF imports are moved into the
-// current folder (or tab) right after import.
+// Floating action button (bottom-end) — new notebook / new folder / import PDF /
+// infinity paper (Concepts-style endless canvas). Actions carry the current
+// tab/folder context; PDF imports are moved into the current folder (or tab)
+// right after import.
 import { useRef } from 'react';
 import { toast } from 'sonner';
-import { BookPlus, FileUp, FolderPlus, Plus } from 'lucide-react';
+import { BookPlus, FileUp, FolderPlus, Infinity as InfinityIcon, Plus } from 'lucide-react';
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
@@ -77,6 +78,25 @@ export function FabMenu({ activeTabId, activeFolderId, onNewFolder }: FabMenuPro
     }
   };
 
+  /** Create a Concepts-style infinite paper in the current tab/folder, then open it. */
+  const createInfinityPaper = async () => {
+    const st = useApp.getState();
+    const base = t('library.infinityPaper', 'Infinity paper', 'ورقة لا نهائية');
+    const count = st.notebooks.filter((n) => n.title === base).length;
+    const id = await st.createNotebook({
+      title: count ? `${base} ${count + 1}` : base,
+      folderId: activeFolderId,
+      tabId: activeTabId,
+      coverId: 'paper-white',
+      coverCustomId: null,
+      template: 'dotgrid',
+      pageSize: 'infinite',
+      backgroundHex: '#FFFFFF',
+    });
+    toast.success(t('library.infinityPaper.created', 'Infinity paper created — an endless sheet in every direction. Write, pan and zoom freely.', 'تم إنشاء الورقة اللانهائية — لوحة بلا حدود في كل الاتجاهات. اكتب وتنقّل وكبّر بحرية.'));
+    void useApp.getState().openEditor(id);
+  };
+
   return (
     <div className="fixed bottom-6 end-6 z-40 flex flex-col items-end">
       <input
@@ -112,6 +132,9 @@ export function FabMenu({ activeTabId, activeFolderId, onNewFolder }: FabMenuPro
               <FolderPlus aria-hidden /> {t('library.newFolder')}
             </DropdownMenuItem>
           ) : null}
+          <DropdownMenuItem onClick={() => void createInfinityPaper()}>
+            <InfinityIcon aria-hidden /> {t('library.infinityPaper', 'Infinity paper', 'ورقة لا نهائية')}
+          </DropdownMenuItem>
           <DropdownMenuItem onClick={() => fileRef.current?.click()}>
             <FileUp aria-hidden /> {t('library.importPdf')}
           </DropdownMenuItem>

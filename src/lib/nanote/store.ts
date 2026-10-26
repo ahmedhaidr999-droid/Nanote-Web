@@ -4,11 +4,12 @@
 import { create } from 'zustand';
 import * as db from './idb';
 import {
-  DEFAULT_SETTINGS, DEFAULT_TOOL_STATES, EditorTool, EraserMode, FolderRow, ImageEl, NotebookRow,
+  DEFAULT_SETTINGS, DEFAULT_TOOL_STATES, EditorTool, EraserMode, FolderRow, ImageEl, INFINITE_GROW_MARGIN, INFINITE_GROW_STEP, NotebookRow,
   PageDoc, PageElement, PageRow, PageSizeId, PdfTextRec, RecordingRow, Settings, ShapeType, StrokeEl, TabRow, TagRow,
   TemplateId, ToolId, ToolState, UNDO_LIMIT, emptyDoc,
 } from './types';
 import { uid } from './util';
+import { elementBBox } from './geometry';
 import { translate, fmt } from './i18n';
 import { useCallback } from 'react';
 import { seedWelcomeNotebook } from './sample';
@@ -22,7 +23,7 @@ export type View =
   | { name: 'editor'; notebookId: string }
   | { name: 'settings' };
 
-export interface Cmd { label: string; run(): void; revert(): void }
+export interface Cmd { label: string; run(): void; revert(): void; pages?: string[] }
 
 export interface TextDefaults {
   fontId: string; size: number; color: string; bold: boolean; italic: boolean; underline: boolean; align: 'start' | 'center' | 'end';
@@ -162,6 +163,11 @@ interface AppState {
   markDirty(pageId: string): void;
 
   updatePage(pageId: string, patch: Partial<PageRow>): Promise<void>;
+  /** infinity paper: grow the sheet so `els` (just added/moved) stay on paper —
+   *  in ALL four directions (up/left via pads, right/down via width/height). */
+  growInfinitePage(pageId: string, els: PageElement[]): Promise<void>;
+  /** persist the current pan/zoom on the notebook so reopening restores it */
+  saveNotebookVp(notebookId: string, vp: { scale: number; tx: number; ty: number }): Promise<void>;
   insertPage(afterIndex: number, template: TemplateId, backgroundHex?: string, backgroundImageId?: string | null, customTemplateImageId?: string | null): Promise<string>;
   deletePage(pageId: string): Promise<void>;
   duplicatePage(pageId: string): Promise<string>;
@@ -556,6 +562,8 @@ export const useApp = create<AppState>((set, get) => ({
       createdAt: now, updatedAt: now,
       textIndex: '',
       height: input.pageSize === 'infinite' ? 1123 : (input.pageSize === 'a4l' ? 794 : input.pageSize === 'letter' ? 1054 : 1123),
+      // infinity paper starts as a wide square canvas and keeps growing while you write
+      width: input.pageSize === 'infinite' ? 1123 : null,
     };
     await db.putPage(page);
     await db.putPageDoc(page.id, emptyDoc());
@@ -817,8 +825,11 @@ export const useApp = create<AppState>((set, get) => ({
   // ------------------------------------------------------------ doc mutation + undo
   pushCmd(cmd, pages) {
     const ed = get().editor;
-    const undoStack = [...ed.undoStack, cmd].slice(-UNDO_LIMIT);
-    cmd.run();
+    // remember the affected pages ON the command — undo()/redo() must re-mark
+    // them dirty or the reverted state would never persist (data loss on reload)
+    const full: Cmd = { ...cmd, pages };
+    const undoStack = [...ed.undoStack, full].slice(-UNDO_LIMIT);
+    full.run();
     set({ editor: { ...get().editor, undoStack, redoStack: [] } });
     for (const p of pages) get().markDirty(p);
   },
@@ -841,6 +852,10 @@ export const useApp = create<AppState>((set, get) => ({
     };
     if (undoable) get().pushCmd({ label: 'add', run: add, revert: remove }, [pageId]);
     else { add(); get().markDirty(pageId) }
+    // infinity paper: the sheet chases the content in ALL four directions —
+    // strokes, text, shapes, images and pastes can all grow it (up/left pads,
+    // right/down width/height). Covers every commit path in one place.
+    void get().growInfinitePage(pageId, els);
   },
 
   removeElements(pageId, ids) {
@@ -882,6 +897,9 @@ export const useApp = create<AppState>((set, get) => ({
       set({ editor: { ...get().editor, docs: { ...get().editor.docs, [pageId]: d }, docVersions: { ...get().editor.docVersions, [pageId]: (get().editor.docVersions[pageId] ?? 0) + 1 } } });
     };
     get().pushCmd({ label: label ?? 'patch', run: forward, revert: backward }, [pageId]);
+    // lasso moves / duplicates can drag content into fresh territory — the
+    // endless sheet grows to keep every element on paper
+    void get().growInfinitePage(pageId, patches.map((p) => p.after));
   },
 
   clearPage(pageId) {
@@ -994,6 +1012,9 @@ export const useApp = create<AppState>((set, get) => ({
     if (!ed.undoStack.length) return;
     const cmd = ed.undoStack[ed.undoStack.length - 1];
     cmd.revert();
+    // the reverted doc must reach disk — without this, undoing an erase and
+    // reloading brought the erased state back (real data loss)
+    for (const p of cmd.pages ?? []) get().markDirty(p);
     set({ editor: { ...get().editor, undoStack: ed.undoStack.slice(0, -1), redoStack: [...get().editor.redoStack, cmd] } });
   },
 
@@ -1002,6 +1023,7 @@ export const useApp = create<AppState>((set, get) => ({
     if (!ed.redoStack.length) return;
     const cmd = ed.redoStack[ed.redoStack.length - 1];
     cmd.run();
+    for (const p of cmd.pages ?? []) get().markDirty(p);
     set({ editor: { ...get().editor, redoStack: ed.redoStack.slice(0, -1), undoStack: [...get().editor.undoStack, cmd] } });
   },
 
@@ -1042,6 +1064,49 @@ export const useApp = create<AppState>((set, get) => ({
       pages: get().pages.map((p) => (p.id === pageId ? updated : p)),
       editor: { ...get().editor, pages: ed.pages.map((p) => (p.id === pageId ? updated : p)) },
     });
+  },
+
+  async growInfinitePage(pageId, els) {
+    const st = get();
+    const nb = st.notebooks.find((n) => n.id === st.editor.notebookId);
+    if (nb?.pageSize !== 'infinite' || !els.length) return;
+    const page = st.editor.pages.find((p) => p.id === pageId);
+    if (!page || page.notebookId !== nb.id) return;
+    // bounds of the freshly committed elements (existing content is already
+    // inside the sheet — checking only the newcomers keeps this O(new), so
+    // even huge documents grow instantly)
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const el of els) {
+      const b = elementBBox(el);
+      if (b.x0 < minX) minX = b.x0;
+      if (b.y0 < minY) minY = b.y0;
+      if (b.x1 > maxX) maxX = b.x1;
+      if (b.y1 > maxY) maxY = b.y1;
+    }
+    if (minX === Infinity) return;
+    const M = INFINITE_GROW_MARGIN;
+    const step = INFINITE_GROW_STEP;
+    const padX0 = page.padX ?? 0;
+    const padY0 = page.padY ?? 0;
+    const w0 = page.width ?? 1123;
+    const h0 = page.height ?? 1123;
+    const patch: Partial<PageRow> = {};
+    // up / left — the sheet extends past the origin into negative space
+    if (minY - M < -padY0) patch.padY = Math.max(padY0 + step, Math.ceil((-(minY - M)) / step) * step);
+    if (minX - M < -padX0) patch.padX = Math.max(padX0 + step, Math.ceil((-(minX - M)) / step) * step);
+    // down / right — classic growth, but sized to actually cover far runs
+    if (maxY + M > h0) patch.height = Math.max(h0 + step, Math.ceil((maxY + M) / step) * step);
+    if (maxX + M > w0) patch.width = Math.max(w0 + step, Math.ceil((maxX + M) / step) * step);
+    if (patch.padY !== undefined || patch.padX !== undefined || patch.height !== undefined || patch.width !== undefined) {
+      await get().updatePage(pageId, patch);
+    }
+  },
+
+  async saveNotebookVp(notebookId, vp) {
+    const nb = get().notebooks.find((x) => x.id === notebookId);
+    if (!nb) return;
+    await db.putNotebook({ ...nb, lastVp: vp });
+    set({ notebooks: get().notebooks.map((n) => (n.id === notebookId ? { ...n, lastVp: vp } : n)) });
   },
 
   async insertPage(afterIndex, template, backgroundHex, backgroundImageId, customTemplateImageId) {
