@@ -1,6 +1,6 @@
 // Nanote version — single source of truth for the shipped version.
 // CI asserts this matches package.json "version" before every release.
-export const APP_VERSION = '1.6.0';
+export const APP_VERSION = '1.6.1';
 
 // Where the signed APKs are published. The "Check for updates" row in
 // Settings opens this page (user-initiated only).

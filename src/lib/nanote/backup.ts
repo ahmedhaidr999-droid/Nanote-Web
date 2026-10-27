@@ -2,6 +2,7 @@
 // Format: JSON with a versioned header; binary ink payloads + blobs as base64.
 import * as db from './idb';
 import { decodeDoc, encodeDoc } from './ink';
+import { clearRasterCache } from './rastercache';
 import { FolderRow, NotebookRow, PageRow, RecordingRow, TabRow, TagRow, Settings } from './types';
 
 const MAGIC = 'NANOTE-BACKUP';
@@ -128,6 +129,9 @@ export async function restoreNanoteBackup(file: File): Promise<{ notebooks: numb
   if (payload.version > BACKUP_VERSION) throw new Error('version');
 
   await db.wipeAllData();
+  // restored pages reuse their original ids — drop every cached raster so a
+  // restore can never repaint the PRE-restore content from the cache
+  try { await clearRasterCache(); } catch { /* best effort */ }
 
   for (const f of payload.folders ?? []) await db.putFolder(f);
   for (const tb of payload.tabs ?? []) await db.putTab(tb);

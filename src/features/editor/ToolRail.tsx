@@ -7,10 +7,10 @@
 // for a stable icon order. Popovers are anchored to the measured button
 // position inside the outer wrapper (outside the scroll strip, so they are
 // never clipped) and flip to the correct side for every rail position.
-import { useRef, useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 import {
   PenLine, Pen, Brush, PenTool, Highlighter, Eraser, Lasso, Type, TextCursor, Shapes, ImagePlus,
-  Ruler as RulerIcon, Mic, Hand, Pointer, Trash2, Flashlight, Sparkles,
+  Ruler as RulerIcon, Mic, Hand, Pointer, Trash2, Flashlight, Sparkles, Sticker as StickerIcon,
 } from 'lucide-react';
 import { useApp, useT } from '@/lib/nanote/store';
 import {
@@ -23,6 +23,8 @@ import { Slider } from '@/components/ui/slider';
 import { Switch } from '@/components/ui/switch';
 import { toast } from 'sonner';
 import { ColorPopover } from './ColorPopover';
+import { StickerPopover } from './StickerPopover';
+import { placeImageElement } from './imageInsert';
 import { ruler, getVp } from './viewport';
 import { AudioPanel } from './AudioPanel';
 
@@ -85,31 +87,10 @@ export function ToolRail({ pageW }: { pageW: number }) {
     }
     const id = uid();
     await db.putImage({ id, w, h, name: file.name, createdAt: Date.now(), blob });
-    const pageId = st.editor.activePageId;
-    if (!pageId) return;
-    const doc = await st.ensureDoc(pageId);
-    const z = doc.elements.reduce((acc, e) => Math.max(acc, e.z), 0) + 1;
-    const targetW = pageW * 0.5;
-    const ih = targetW * (h / w);
-    // place at the CENTER of the current viewport so the user sees the image
-    // land where they are looking (the old fixed x/y hid it off-screen after
-    // any pan/zoom away from the page top)
-    const vp = getVp();
-    const host = typeof document !== 'undefined' ? document.querySelector('[data-viewport]') : null;
-    const cw = host ? (host as HTMLElement).clientWidth : 800;
-    const ch = host ? (host as HTMLElement).clientHeight : 600;
-    const vx = (cw / 2 - vp.tx) / vp.scale;
-    const vy = (ch / 2 - vp.ty) / vp.scale;
-    const imgElId = uid();
-    st.addElements(pageId, [{
-      kind: 'image', id: imgElId, x: vx - targetW / 2, y: vy - ih / 2, w: targetW, h: ih, imageId: id, rotation: 0, z,
-    }]);
-    // the image's edit options appear IMMEDIATELY: size handles, rotate arrow
-    // and the action bar show around the fresh image; tapping empty space
-    // applies the changes, hides them, and it comes back only when the image
-    // is re-selected (lasso or image-tool tap).
-    st.setTool('image');
-    st.setSelection({ pageId, ids: [imgElId] });
+    // shared placement: viewport-center (client-rect + page-offset aware),
+    // auto-select + image tool — identical to the sticker path
+    const elId = await placeImageElement({ imageId: id, w, h, pageW });
+    if (!elId) return;
     toast.success(t('tool.image.insert'));
   };
 
@@ -140,6 +121,7 @@ export function ToolRail({ pageW }: { pageW: number }) {
     { id: 'textselect', icon: TextCursor, label: t('tool.textselect') },
     { id: 'shape', icon: Shapes, label: t('tool.shape'), pop: true },
     { id: 'image', icon: ImagePlus, label: t('tool.image'), pop: true },
+    { id: 'sticker', icon: StickerIcon, label: t('tool.sticker'), pop: true },
     { id: 'pan', icon: Hand, label: t('tool.pan') },
   ];
 
@@ -205,6 +187,11 @@ export function ToolRail({ pageW }: { pageW: number }) {
                   if (tool !== 'image') setTool('image');
                   if (popover === 'image') setPopover(null);
                   else openPopoverFor('image', el);
+                } else if (item.id === 'sticker') {
+                  // 'sticker' is an insert picker, NOT a drawing tool — it never
+                  // becomes the active tool; it just toggles its picker popover
+                  if (popover === 'sticker') setPopover(null);
+                  else openPopoverFor('sticker', el);
                 } else if (item.id === 'textselect') {
                   setTool('textselect');
                   setPopover(null);
@@ -272,6 +259,11 @@ export function ToolRail({ pageW }: { pageW: number }) {
             <ImagePopoverBody onChoose={() => fileRef.current?.click()} />
           </Pop>
         )}
+        {anchor && popover === 'sticker' && (
+          <Pop railPos={railPos} railOnRight={railOnRight} anchor={anchor}>
+            <StickerPopover pageW={pageW} onClose={() => setPopover(null)} />
+          </Pop>
+        )}
         {anchor && popover === lastPen && (
           <PenPopover railPos={railPos} railOnRight={railOnRight} anchor={anchor} />
         )}
@@ -330,6 +322,24 @@ function Pop({
   anchor: Anchor;
 }) {
   const vertical = railPos === 'left' || railPos === 'right';
+  const cardRef = useRef<HTMLDivElement>(null);
+  // viewport clamp: a popover anchored to a button DEEP in a scrolled rail can
+  // easily extend past the bottom (or top) of a phone screen — the sticker
+  // picker measured 62px past the bottom at 390px. After mount, measure the
+  // card and imperatively shift it back inside the viewport (12px breathing
+  // room); taller than the screen → it scrolls internally instead of clipping.
+  // Direct DOM write (not setState) — the classic measure-and-adjust pattern
+  // that stays invisible to React and runs before the browser paints.
+  useLayoutEffect(() => {
+    const el = cardRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const vh = window.innerHeight || 800;
+    let dy = 0;
+    if (r.top < 12) dy = 12 - r.top;
+    else if (r.bottom > vh - 12) dy = Math.max(12 - r.top, vh - 12 - r.bottom);
+    el.style.transform = dy ? `translateY(${dy}px)` : '';
+  }, [anchor, children]);
   const style: React.CSSProperties = vertical
     ? {
         // side rail → panel sits beside the dock, top aligned with the button
@@ -344,11 +354,13 @@ function Pop({
       };
   return (
     <div
+      ref={cardRef}
       dir="ltr"
       onClick={(e) => e.stopPropagation()}
       className={cn(
         'absolute z-40 w-64 rounded-xl border border-border bg-card p-3 shadow-ink-2',
         !vertical && 'max-w-[calc(94vw-1.5rem)]',
+        'max-h-[calc(100dvh-1.5rem)] overflow-y-auto nanote-scroll',
       )}
       style={{ ...style, pointerEvents: 'auto' }}
     >

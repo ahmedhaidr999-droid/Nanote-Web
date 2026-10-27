@@ -5,7 +5,7 @@ export type ThemeMode = 'light' | 'dark' | 'system';
 
 // ---------------------------------------------------------------- tools
 export type ToolId = 'fountain' | 'ballpoint' | 'brush' | 'fineliner' | 'highlighter' | 'laser';
-export type EditorTool = ToolId | 'eraser' | 'lasso' | 'text' | 'shape' | 'image' | 'pan' | 'textselect';
+export type EditorTool = ToolId | 'eraser' | 'lasso' | 'text' | 'shape' | 'image' | 'sticker' | 'pan' | 'textselect';
 export type ShapeType = 'line' | 'arrow' | 'rect' | 'rrect' | 'ellipse' | 'triangle' | 'star';
 export type EraserMode = 'stroke' | 'area';
 
@@ -96,6 +96,11 @@ export interface PageRow {
   // fit-content and the minimap — live rendering is viewport-windowed).
   padX?: number | null;
   padY?: number | null;
+  /** persisted document revision — bumped on every save so the raster-cache
+   * key is STABLE across sessions (same content ⇒ same version). A session-only
+   * counter restarted at 0 every reload collided with stale cached rasters,
+   * repainting outdated page content after reopening a notebook. */
+  docRev?: number;
 }
 
 export interface RecordingRow {

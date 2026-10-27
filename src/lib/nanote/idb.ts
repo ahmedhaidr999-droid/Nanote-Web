@@ -146,6 +146,11 @@ export async function putMetaFlag(key: string, value: boolean) {
   await put('meta', { id: key, value } as unknown as { id: string });
 }
 
+/** Generic meta-store key access (used by the user-sticker catalog etc.). */
+export const getMeta = <T>(key: string) => getOne<T>('meta', key);
+export const putMeta = (key: string, value: unknown) =>
+  put('meta', { id: key, ...(value as object) } as unknown as { id: string });
+
 // ------------------------------------------------------------------ language packs (offline translation)
 
 export async function putLangPack(pack: LangPack): Promise<void> {

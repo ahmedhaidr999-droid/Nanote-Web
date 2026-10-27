@@ -43,6 +43,7 @@ import {
 } from 'lucide-react';
 import { useApp, useT } from '@/lib/nanote/store';
 import { PenManagerSheet } from '@/features/editor/PenManagerSheet';
+import { StickerSettingsContent } from '@/features/settings/StickerSettings';
 import * as db from '@/lib/nanote/idb';
 import type { StorageStats } from '@/lib/nanote/idb';
 import { downloadBlob, fmtBytes } from '@/lib/nanote/util';
@@ -436,6 +437,11 @@ export default function SettingsView() {
                 <Pencil className="size-4 shrink-0" /> {t('pens.manage')}
               </Button>
             </div>
+          </Section>
+
+          {/* ------------------------------------------------ 2c · stickers */}
+          <Section title={t('settings.stickers')}>
+            <StickerSettingsContent />
           </Section>
 
           {/* ------------------------------------------------ 3 · translation */}

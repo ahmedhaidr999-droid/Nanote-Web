@@ -3,7 +3,7 @@
 // most expensive thing the editor renders. Caching it in the browser's
 // Cache Storage makes re-opening notebooks and zoom settle-back instant and
 // keeps the main thread free during navigation.
-const CACHE_NAME = 'nanote-rasters-v1';
+const CACHE_NAME = 'nanote-rasters-v2';
 
 let cachePromise: Promise<Cache | null> | null = null;
 

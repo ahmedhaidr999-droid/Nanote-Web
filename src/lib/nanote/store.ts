@@ -203,7 +203,10 @@ async function persistDoc(get: () => AppState, pageId: string) {
       .filter((e): e is Extract<PageElement, { kind: 'text' }> => e.kind === 'text')
       .map((e) => e.text).join(' \n ');
     const labels = page.labels.map((l) => l.title).join(' ');
-    const updated: PageRow = { ...page, textIndex: `${textIndex} ${labels}`.trim(), updatedAt: Date.now() };
+    // persist the live doc revision with the page row — the raster cache keys
+    // off it, so it must survive reloads (see ensureDoc)
+    const docRev = Math.max(page.docRev ?? 0, get().editor.docVersions[pageId] ?? 0);
+    const updated: PageRow = { ...page, textIndex: `${textIndex} ${labels}`.trim(), updatedAt: Date.now(), docRev };
     await db.putPage(updated);
     // update in-memory copies
     const st = get();
@@ -784,10 +787,18 @@ export const useApp = create<AppState>((set, get) => ({
     if (editor.docs[pageId]) return editor.docs[pageId];
     const { doc, quarantined } = await db.getPageDoc(pageId);
     const resolved = doc ?? emptyDoc();
+    // Seed the in-session revision counter from the PERSISTED doc revision so
+    // the raster-cache key is stable across sessions (same content ⇒ same
+    // version). A session-only counter restarted at 0 on every reload collided
+    // with stale cached rasters from the PREVIOUS session and repainted
+    // outdated page content after reopening a notebook.
+    const page = editor.pages.find((p) => p.id === pageId) ?? get().pages.find((p) => p.id === pageId);
+    const rev = page?.docRev ?? 0;
     set({
       editor: {
         ...get().editor,
         docs: { ...get().editor.docs, [pageId]: resolved },
+        docVersions: { ...get().editor.docVersions, [pageId]: rev },
         quarantine: { ...get().editor.quarantine, [pageId]: quarantined },
       },
     });
