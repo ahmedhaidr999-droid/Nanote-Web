@@ -345,8 +345,11 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
     );
   }
 
+  // h-dvh standalone; max-h-full clamps into a Split Workspace pane whose
+  // definite pixel height is smaller than the viewport (the panes size in px
+  // — the editor must never push pane B off screen).
   return (
-    <main className="flex h-dvh flex-col overflow-hidden bg-background" style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}>
+    <main className="flex h-dvh max-h-full flex-col overflow-hidden bg-background" style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}>
       {/* ------------------------------------------------ top bar */}
       <header className="z-40 flex h-14 shrink-0 items-center gap-1 border-b border-border bg-background/90 px-2 backdrop-blur">
         {isEmbedded() ? (

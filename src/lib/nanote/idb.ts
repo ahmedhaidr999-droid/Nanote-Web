@@ -10,7 +10,16 @@ import { encodeDoc, decodeDoc } from './ink';
 import { uid } from './util';
 
 const DB_NAME = 'nanote';
-const DB_VERSION = 3;
+// v4 — HEAL MIGRATION: store creation is now fully IDEMPOTENT (each store is
+// created only when missing, regardless of oldVersion). Mixed-version
+// installs could reach v3 with a DIFFERENT set of stores than this schema
+// expects (e.g. an install that ran a build whose v2 created 'pdftext' but
+// not 'tabs', then a build whose v3 created 'langpacks') — same version
+// number, missing stores, upgrade never runs, and boot()'s getAll() throws
+// NotFoundError forever. Bumping to v4 forces ONE upgrade pass on every
+// existing install, and the contains() guards heal whatever is missing
+// without touching existing data.
+const DB_VERSION = 4;
 
 export interface ImageBlob { id: string; blob: Blob; w: number; h: number; name: string; createdAt: number }
 export interface DocRec { pageId: string; data: ArrayBuffer }
@@ -45,38 +54,42 @@ async function get(): Promise<IDBPDatabase | null> {
   if (memoryMode) return null;
   if (!dbp) {
     dbp = openDB(DB_NAME, DB_VERSION, {
-      upgrade(db, oldVersion) {
+      upgrade(db) {
+        // IDEMPOTENT HEAL (v4): create every store this schema needs, only
+        // when missing — safe on fresh installs AND on any mixed-version
+        // database (data in existing stores is untouched).
         if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta');
-        if (oldVersion < 1) {
+        if (!db.objectStoreNames.contains('folders')) {
           const f = db.createObjectStore('folders', { keyPath: 'id' });
           f.createIndex('deletedAt', 'deletedAt');
+        }
+        if (!db.objectStoreNames.contains('notebooks')) {
           const nb = db.createObjectStore('notebooks', { keyPath: 'id' });
           nb.createIndex('folderId', 'folderId');
           nb.createIndex('deletedAt', 'deletedAt');
+        }
+        if (!db.objectStoreNames.contains('pages')) {
           const pg = db.createObjectStore('pages', { keyPath: 'id' });
           pg.createIndex('notebookId', 'notebookId');
-          db.createObjectStore('pagedocs', { keyPath: 'pageId' });
-          db.createObjectStore('thumbs', { keyPath: 'pageId' });
-          db.createObjectStore('images', { keyPath: 'id' });
-          db.createObjectStore('audio', { keyPath: 'id' });
+        }
+        if (!db.objectStoreNames.contains('pagedocs')) db.createObjectStore('pagedocs', { keyPath: 'pageId' });
+        if (!db.objectStoreNames.contains('thumbs')) db.createObjectStore('thumbs', { keyPath: 'pageId' });
+        if (!db.objectStoreNames.contains('images')) db.createObjectStore('images', { keyPath: 'id' });
+        if (!db.objectStoreNames.contains('audio')) db.createObjectStore('audio', { keyPath: 'id' });
+        if (!db.objectStoreNames.contains('recordings')) {
           const rc = db.createObjectStore('recordings', { keyPath: 'id' });
           rc.createIndex('pageId', 'pageId');
-          db.createObjectStore('tags', { keyPath: 'id' });
-          db.createObjectStore('quarantined', { keyPath: 'id' });
         }
-        // v2: tabs (top-level library groupings) + cached PDF text layers.
-        // NOTE: runs for fresh (v0) installs too — skipping it left brand-new
-        // databases without 'tabs'/'pdftext', and boot()'s listTabs() then
-        // threw NotFoundError and the app never finished booting.
-        if (oldVersion < 2) {
+        if (!db.objectStoreNames.contains('tags')) db.createObjectStore('tags', { keyPath: 'id' });
+        if (!db.objectStoreNames.contains('quarantined')) db.createObjectStore('quarantined', { keyPath: 'id' });
+        // v2: tabs (top-level library groupings) + cached PDF text layers
+        if (!db.objectStoreNames.contains('tabs')) {
           const tb = db.createObjectStore('tabs', { keyPath: 'id' });
           tb.createIndex('deletedAt', 'deletedAt');
-          db.createObjectStore('pdftext', { keyPath: 'pageId' });
         }
-        // v3: downloaded offline translation language packs (Settings → Languages).
-        if (oldVersion < 3) {
-          db.createObjectStore('langpacks', { keyPath: 'code' });
-        }
+        if (!db.objectStoreNames.contains('pdftext')) db.createObjectStore('pdftext', { keyPath: 'pageId' });
+        // v3: downloaded offline translation language packs (Settings → Languages)
+        if (!db.objectStoreNames.contains('langpacks')) db.createObjectStore('langpacks', { keyPath: 'code' });
       },
     }).catch((e) => { memoryMode = true; console.warn('[nanote] IndexedDB unavailable, using memory store', e); return null });
   }

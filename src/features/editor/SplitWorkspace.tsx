@@ -11,7 +11,7 @@
 // small control cluster: swap panes, flip orientation, close pane B.
 // Cross-pane transfers (clipboard sync, send-selection, drag-to-edge) run
 // over the splitbus postMessage protocol.
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ArrowRightLeft, Columns2, Rows2, X } from 'lucide-react';
 import { useApp, useT } from '@/lib/nanote/store';
 import { PageElement } from '@/lib/nanote/types';
@@ -39,6 +39,45 @@ export function SplitWorkspace({ children, notebookA }: { children: React.ReactN
   const open = split.open && !!split.notebookB && split.notebookB !== notebookA;
   const vertical = split.orientation === 'vertical';
   const ratio = liveRatio ?? split.ratio;
+
+  // -------------------------------------------------- definite pane sizing (px)
+  // WHY PIXELS: pane heights as PERCENTAGES collapse to auto in the horizontal
+  // orientation — the split container's own height is flex-derived (indefinite
+  // for percentage resolution), so `height: 66%` fell back to the pane's
+  // content height (the editor's h-dvh), pushing pane B entirely BELOW the
+  // viewport (the "horizontal split shows one pane" bug). Measuring the
+  // container and sizing BOTH panes in exact pixels is definite at every
+  // level: the editor clamps into pane A (h-dvh max-h-full) and pane B's
+  // iframe (h-full) resolves against a real height.
+  const [boxSize, setBoxSize] = useState({ w: 0, h: 0 });
+  useLayoutEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    let raf = 0;
+    const measure = () => {
+      raf = 0;
+      const r = el.getBoundingClientRect();
+      setBoxSize((s) => (Math.abs(s.w - r.width) < 1 && Math.abs(s.h - r.height) < 1 ? s : { w: r.width, h: r.height }));
+    };
+    const schedule = () => { if (!raf) raf = requestAnimationFrame(measure) };
+    const ro = new ResizeObserver(schedule);
+    ro.observe(el);
+    measure();
+    return () => {
+      ro.disconnect();
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [open]);
+  const DIVIDER_PX = 10; // w-2.5 / h-2.5 separator thickness
+  const paneA = {
+    w: vertical ? Math.round((boxSize.w - DIVIDER_PX) * ratio) : boxSize.w,
+    h: vertical ? boxSize.h : Math.round((boxSize.h - DIVIDER_PX) * ratio),
+  };
+  const paneB = {
+    // the DIVIDER sits on the split axis only — the cross axis is full-size
+    w: vertical ? Math.max(24, boxSize.w - DIVIDER_PX - paneA.w) : boxSize.w,
+    h: vertical ? boxSize.h : Math.max(24, boxSize.h - DIVIDER_PX - paneA.h),
+  };
 
   // -------------------------------------------------- outgoing: parent → child
   const send = useCallback((msg: SplitMessage) => {
@@ -136,13 +175,11 @@ export function SplitWorkspace({ children, notebookA }: { children: React.ReactN
       // scale the frozen iframe to visually fill pane B at the new ratio —
       // compositor-only (the embedded document never re-lays-out)
       if (iframeEl && b0.w > 4 && b0.h > 4) {
-        const hostR = host.getBoundingClientRect();
-        const divider = 10; // w-2.5 / h-2.5 separator thickness (px)
         if (vertical) {
-          const bw = Math.max(24, hostR.width - k * hostR.width - divider);
+          const bw = Math.max(24, boxSize.w - k * (boxSize.w - DIVIDER_PX));
           iframeEl.style.transform = `scaleX(${bw / b0.w})`;
         } else {
-          const bh = Math.max(24, hostR.height - k * hostR.height - divider);
+          const bh = Math.max(24, boxSize.h - k * (boxSize.h - DIVIDER_PX));
           iframeEl.style.transform = `scaleY(${bh / b0.h})`;
         }
       }
@@ -172,21 +209,30 @@ export function SplitWorkspace({ children, notebookA }: { children: React.ReactN
   };
 
   if (!open) {
-    // single pane — children keep their exact tree position (no remount)
-    return <div className="flex min-h-0 flex-1 flex-col">{children}</div>;
+    // single pane — children keep their exact tree position (no remount).
+    // The wrapper gets the measured pixel size so the editor's max-h-full
+    // clamp has a definite reference (same definite-sizing rule as the panes).
+    return (
+      <div ref={containerRef} className="flex min-h-0 flex-1 flex-col" style={boxSize.w > 0 ? { width: boxSize.w, height: boxSize.h } : undefined}>
+        {children}
+      </div>
+    );
   }
 
   return (
     <div
       ref={containerRef}
-      className={cn('flex min-h-0 min-w-0 flex-1', vertical ? 'flex-row' : 'flex-col')}
+      className={cn('flex min-h-0 min-w-0 flex-1 overflow-hidden', vertical ? 'flex-row' : 'flex-col')}
       dir="ltr"
     >
-      {/* pane A — the live editor (pointer-dead while the divider drags) */}
+      {/* pane A — the live editor (pointer-dead while the divider drags).
+          Exact PIXEL size: percentage heights collapse to auto against the
+          flex-derived container height (pane B ended up below the viewport). */}
       <div
-        className="relative flex min-h-0 min-w-0 flex-col"
+        className="relative flex min-h-0 min-w-0 flex-col overflow-hidden"
         style={{
-          ...(vertical ? { width: `${ratio * 100}%` } : { height: `${ratio * 100}%` }),
+          width: Math.max(24, paneA.w),
+          height: Math.max(24, paneA.h),
           ...(dragging ? { pointerEvents: 'none' } : null),
         }}
       >
@@ -244,10 +290,14 @@ export function SplitWorkspace({ children, notebookA }: { children: React.ReactN
         </div>
       </div>
 
-      {/* pane B — embedded instance. FROZEN at its drag-start pixel size while
-          the divider moves (no document reflow mid-drag); clipped by the
-          wrapper's overflow-hidden until the release reflow. */}
-      <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden bg-background">
+      {/* pane B — embedded instance, exact PIXEL size (definite for the
+          iframe's h-full). FROZEN at its drag-start pixel size while the
+          divider moves (no document reflow mid-drag) and scaled by a
+          compositor transform until the release reflow. */}
+      <div
+        className="relative min-h-0 min-w-0 overflow-hidden bg-background"
+        style={{ width: Math.max(24, paneB.w), height: Math.max(24, paneB.h) }}
+      >
         <iframe
           ref={iframeRef}
           key={split.notebookB ?? 'b'}
