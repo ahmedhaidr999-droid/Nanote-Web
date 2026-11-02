@@ -20,12 +20,14 @@
 //   • DB UPDATE — fetches /api/pen-db and merges newer records at runtime
 //     (the knowledge base updates without an app update).
 import { useSyncExternalStore, useEffect, useMemo, useRef, useState } from 'react';
-import { Check, Database, PenLine, Pencil, RefreshCw, Search, Zap } from 'lucide-react';
+import { Activity, Check, Database, PenLine, Pencil, RefreshCw, Search, Trash2, Zap } from 'lucide-react';
 import { toast } from 'sonner';
 import {
   barrelMap, getPenInfo, PEN_MODELS, penSpecById, setPenProfile, subscribePen,
-  subscribePenSamples, type PenSample,
+  subscribePenSamples, type PenSample, subscribePenLog, getPenLog, clearPenLog,
+  simulatePenButton, isPenRouterActive, type PenLogEntry,
 } from '@/lib/nanote/penengine';
+import { bitmapBudgetInfo } from '@/lib/nanote/canvasbudget';
 import {
   getPenDbVersion, getPenSpecs, mergePenDb, eventsForSpec,
   type Confidence, type StylusSpec,
@@ -134,6 +136,14 @@ export function PenManagerSheet({ open, onOpenChange }: { open: boolean; onOpenC
             <p className="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
               {t('pens.testPad.hint')}
             </p>
+          </section>
+
+          {/* ------------------------------------------------ diagnostics (live event monitor) */}
+          <section aria-label={t('pens.diag.title', 'Diagnostics', 'التشخيص')}>
+            <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold text-muted-foreground">
+              <Activity className="h-4 w-4" /> {t('pens.diag.title', 'Diagnostics', 'التشخيص')}
+            </h3>
+            <StylusDiagnostics penLabel={penLabel} />
           </section>
 
           {/* ------------------------------------------------ bindings */}
@@ -705,4 +715,138 @@ function SpecField({ label, value }: { label: string; value: string }) {
       <span className="min-w-0 truncate text-xs font-medium" title={value}>{value}</span>
     </div>
   );
+}
+
+// ---------------------------------------------------------------- diagnostics
+/** StylusDiagnostics — the live "why don't my pen buttons work" debugger.
+ *  Shows the complete shortcut chain as it happens:
+ *    raw pointer event (down/move/up/cancel/hover, decimated)
+ *    → button pattern recognized (bit + press/double/long, hover vs writing)
+ *    → binding matched → action EXECUTED
+ *  plus the engine snapshot (identified pen, report rate, pressure
+ *  calibration, observed button bits, primary/secondary mapping), the
+ *  router status (shortcuts only fire while a notebook is open) and the
+ *  device render budget. The SIMULATE button fires a synthetic barrel
+ *  press through the exact same engine pipeline — proving the chain works
+ *  even before touching the hardware.
+ */
+function StylusDiagnostics({ penLabel }: { penLabel: (a: PenAction) => string }) {
+  const { t } = useT();
+  const pen = useSyncExternalStore(subscribePen, getPenInfo);
+  const entries = useSyncExternalStore(subscribePenLog, getPenLog);
+  const routerOn = useSyncExternalStore(subscribeIsRouterActive, isPenRouterActive);
+  const bmap = barrelMap();
+  const budget = bitmapBudgetInfo();
+  const logRef = useRef<HTMLDivElement>(null);
+  const prefs = useApp((s) => s.settings.penShortcuts);
+  const shortcutsOn = useApp((s) => s.settings.penShortcutsOn);
+
+  // keep the newest entry in view
+  useEffect(() => {
+    const el = logRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [entries]);
+
+  const kindStyle: Record<string, string> = {
+    down: 'border-primary/40 bg-primary/10 text-primary',
+    up: 'border-border bg-muted/50 text-foreground',
+    move: 'border-border bg-muted/40 text-muted-foreground',
+    hover: 'border-border bg-muted/40 text-muted-foreground',
+    cancel: 'border-warning/40 bg-warning/10 text-warning',
+    button: 'border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400',
+    action: 'border-emerald-500/50 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+    info: 'border-border bg-muted/40 text-muted-foreground',
+  };
+
+  const snapshot: { label: string; value: string }[] = [
+    { label: t('pens.diag.router', 'Shortcut router', 'محرك الاختصارات'), value: routerOn ? t('pens.diag.routerOn', 'active (notebook open)', 'نشط (دفتر مفتوح)') : t('pens.diag.routerOff', 'idle — open a notebook', 'خامل — افتح دفتراً') },
+    { label: t('pens.diag.shortcuts', 'Shortcuts enabled', 'الاختصارات مفعّلة'), value: shortcutsOn ? t('common.on', 'On', 'مفعّل') : t('common.off', 'Off', 'معطّل') },
+    { label: t('pens.diag.pen', 'Detected pen', 'القلم المكتشف'), value: pen.detected ? `${pen.label} · ${pen.rateHz || '—'} Hz` : t('input.noPenYet') },
+    { label: t('pens.diag.bits', 'Button bits seen', 'بتات الأزرار المرصودة'), value: pen.buttons ? `0b${pen.buttons.toString(2)} (primary=${bmap.primary}${bmap.secondary ? `, secondary=${bmap.secondary}` : ''})` : '—' },
+    { label: t('pens.diag.pressure', 'Pressure calibration', 'معايرة الضغط'), value: pen.pressure ? `${pen.pressureFloor.toFixed(2)}–${pen.pressureCeil.toFixed(2)} → 0–1` : '—' },
+    { label: t('pens.diag.budget', 'Render budget', 'ميزانية الرسم'), value: `${(budget.areaPx / 1e6).toFixed(1)} MPx · ${budget.memoryGB} GB${budget.embedded ? ' · split' : ''}` },
+  ];
+
+  const boundAction = prefs.barrel.press !== 'none' ? penLabel(prefs.barrel.press) : null;
+
+  return (
+    <div className="space-y-3">
+      {/* engine snapshot */}
+      <div className="grid grid-cols-1 gap-x-4 gap-y-1.5 rounded-xl border border-border bg-card p-3 text-xs sm:grid-cols-2">
+        {snapshot.map((s) => (
+          <SpecField key={s.label} label={s.label} value={s.value} />
+        ))}
+      </div>
+
+      {/* simulate + clear */}
+      <div className="flex flex-wrap items-center gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-8 gap-1.5 rounded-full px-3 text-xs"
+          onClick={() => simulatePenButton(bmap.primary, 'press')}
+          disabled={!routerOn}
+          aria-label={t('pens.diag.simulate', 'Simulate barrel press', 'محاكاة ضغط الزر')}
+        >
+          <Zap className="h-3.5 w-3.5" /> {t('pens.diag.simulate', 'Simulate barrel press', 'محاكاة ضغط الزر')}
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-8 gap-1.5 rounded-full px-3 text-xs"
+          onClick={() => clearPenLog()}
+          aria-label={t('pens.diag.clear', 'Clear log', 'مسح السجل')}
+        >
+          <Trash2 className="h-3.5 w-3.5" /> {t('pens.diag.clear', 'Clear log', 'مسح السجل')}
+        </Button>
+        {boundAction && (
+          <span className="text-[11px] text-muted-foreground">
+            {t('pens.diag.bound', 'barrel press →', 'ضغط الزر ←')} <span className="font-medium text-foreground">{boundAction}</span>
+          </span>
+        )}
+      </div>
+
+      {/* live event log */}
+      <div
+        ref={logRef}
+        className="max-h-56 overflow-y-auto nanote-scroll rounded-xl border border-border bg-card p-2 font-mono text-[11px]"
+        role="log"
+        aria-label={t('pens.diag.log', 'Event log', 'سجل الأحداث')}
+        aria-live="polite"
+      >
+        {entries.length === 0 ? (
+          <p className="px-1 py-3 text-center text-[11px] text-muted-foreground">
+            {t('pens.diag.empty', 'Use the pen (or press its buttons) — every event the app receives appears here.', 'استخدم القلم أو اضغط أزراره — كل حدث يستقبله التطبيق يظهر هنا.')}
+          </p>
+        ) : (
+          <ul className="space-y-0.5">
+            {entries.slice(-40).map((e: PenLogEntry) => (
+              <li key={e.id} className="flex items-center gap-1.5 px-1 py-0.5">
+                <span className={cn('shrink-0 rounded border px-1 py-px text-[10px] font-semibold uppercase', kindStyle[e.kind] ?? kindStyle.info)}>
+                  {e.kind}
+                </span>
+                <span className="shrink-0 tabular-nums text-muted-foreground">{Math.round(e.t / 100) / 10}s</span>
+                <span className="min-w-0 truncate">
+                  {e.pointerType}
+                  {e.pointerId >= 0 ? `#${e.pointerId}` : ''}
+                  {' · btn='}{e.button}{' · bits='}{e.buttons}
+                  {e.pressure ? ` · p=${e.pressure.toFixed(2)}` : ''}
+                  {e.hover ? ' · hover' : ''}
+                  {e.note ? ` · ${e.note}` : ''}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      <p className="text-[11px] leading-relaxed text-muted-foreground">
+        {t('pens.diag.limit', 'Note: buttons the OS or pen vendor handles internally (e.g. some Bluetooth-launched actions) never reach apps and cannot be rebound.', 'ملاحظة: الأزرار التي يتعامل معها النظام أو الشركة المصنعة داخلياً لا تصل إلى التطبيقات ولا يمكن إعادة برمجتها.')}
+      </p>
+    </div>
+  );
+}
+
+function subscribeIsRouterActive(cb: () => void): () => void {
+  return subscribePen(cb); // engine emits on router-state changes too (cheap, same store cadence)
 }

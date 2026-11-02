@@ -16,6 +16,7 @@ import { ArrowRightLeft, Columns2, Rows2, X } from 'lucide-react';
 import { useApp, useT } from '@/lib/nanote/store';
 import { PageElement } from '@/lib/nanote/types';
 import { cn } from '@/lib/utils';
+import { markInteraction } from './viewport';
 import {
   onChildMessage, postToChild, receiveDroppedElements, registerParentSender,
   type SplitMessage,
@@ -95,22 +96,72 @@ export function SplitWorkspace({ children, notebookA }: { children: React.ReactN
   }, [open]);
 
   // -------------------------------------------------- divider drag
+  // PERF MODEL: pointermove fires up to 120+/s (stylus/tablet digitizers);
+  // every live ratio update re-lays-out BOTH panes. Three rules keep it jank-free:
+  //   1. ratio updates are rAF-COALESCED — at most one React render per frame;
+  //   2. pane B (iframe = a whole second document) is FROZEN at its drag-start
+  //      pixel size and merely clipped by the wrapper — the embedded document
+  //      never re-lays-out mid-drag (its ResizeObserver storm was the
+      //      "terrible stutter while resizing panes" killer); it reflows ONCE
+  //      on release;
+  //   3. pane A's page canvases are told the user is interacting (viewport bus
+  //      markInteraction) so no idle re-raster fires mid-drag.
+  const [frozenB, setFrozenB] = useState<{ w: number; h: number } | null>(null);
   const startDividerDrag = (e: React.PointerEvent) => {
     e.preventDefault();
     try { (e.target as HTMLElement).setPointerCapture(e.pointerId) } catch { /* gone */ }
     setDragging(true);
     const host = containerRef.current;
+    const iframeEl = iframeRef.current;
     if (!host) return;
+    // freeze pane B at its current pixel size; scale it via a compositor-only
+    // transform while the divider moves (no reflow inside the embedded doc)
+    let b0 = { w: 0, h: 0 };
+    if (iframeEl) {
+      const r = iframeEl.getBoundingClientRect();
+      if (r.width > 4 && r.height > 4) {
+        b0 = { w: r.width, h: r.height };
+        setFrozenB(b0);
+      }
+    }
+    let pending: number | null = null;
+    let latestK: number | null = null;
+    const applyK = () => {
+      pending = null;
+      if (latestK == null) return;
+      const k = latestK;
+      latestK = null;
+      setLiveRatio(k);
+      markInteraction(); // suppress pane-A idle re-rasters while the divider moves
+      // scale the frozen iframe to visually fill pane B at the new ratio —
+      // compositor-only (the embedded document never re-lays-out)
+      if (iframeEl && b0.w > 4 && b0.h > 4) {
+        const hostR = host.getBoundingClientRect();
+        const divider = 10; // w-2.5 / h-2.5 separator thickness (px)
+        if (vertical) {
+          const bw = Math.max(24, hostR.width - k * hostR.width - divider);
+          iframeEl.style.transform = `scaleX(${bw / b0.w})`;
+        } else {
+          const bh = Math.max(24, hostR.height - k * hostR.height - divider);
+          iframeEl.style.transform = `scaleY(${bh / b0.h})`;
+        }
+      }
+    };
     const onMove = (ev: PointerEvent) => {
       const r = host.getBoundingClientRect();
       let k = vertical ? (ev.clientX - r.left) / r.width : (ev.clientY - r.top) / r.height;
       k = Math.min(MAX_RATIO, Math.max(MIN_RATIO, k));
-      setLiveRatio(k);
+      latestK = k;
+      if (pending == null) pending = requestAnimationFrame(applyK);
     };
     const onUp = () => {
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
+      if (pending != null) { cancelAnimationFrame(pending); pending = null }
+      if (latestK != null) setLiveRatio(latestK);
       setDragging(false);
+      setFrozenB(null); // one final reflow of pane B at the committed ratio
+      if (iframeEl) iframeEl.style.transform = '';
       setLiveRatio((k) => {
         if (k != null) useApp.getState().setSplit({ ratio: k });
         return null;
@@ -131,10 +182,13 @@ export function SplitWorkspace({ children, notebookA }: { children: React.ReactN
       className={cn('flex min-h-0 min-w-0 flex-1', vertical ? 'flex-row' : 'flex-col')}
       dir="ltr"
     >
-      {/* pane A — the live editor */}
+      {/* pane A — the live editor (pointer-dead while the divider drags) */}
       <div
         className="relative flex min-h-0 min-w-0 flex-col"
-        style={vertical ? { width: `${ratio * 100}%` } : { height: `${ratio * 100}%` }}
+        style={{
+          ...(vertical ? { width: `${ratio * 100}%` } : { height: `${ratio * 100}%` }),
+          ...(dragging ? { pointerEvents: 'none' } : null),
+        }}
       >
         {children}
       </div>
@@ -190,8 +244,10 @@ export function SplitWorkspace({ children, notebookA }: { children: React.ReactN
         </div>
       </div>
 
-      {/* pane B — embedded instance */}
-      <div className="relative min-h-0 min-w-0 flex-1 bg-background">
+      {/* pane B — embedded instance. FROZEN at its drag-start pixel size while
+          the divider moves (no document reflow mid-drag); clipped by the
+          wrapper's overflow-hidden until the release reflow. */}
+      <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden bg-background">
         <iframe
           ref={iframeRef}
           key={split.notebookB ?? 'b'}
@@ -199,7 +255,12 @@ export function SplitWorkspace({ children, notebookA }: { children: React.ReactN
           title={t('split.paneB', 'Split workspace', 'مساحة مقسّمة')}
           className="h-full w-full border-0"
           allow="clipboard-read; clipboard-write; autoplay"
-          style={{ pointerEvents: dragging ? 'none' : 'auto' }}
+          style={{
+            pointerEvents: dragging ? 'none' : 'auto',
+            ...(frozenB
+              ? { position: 'absolute' as const, left: 0, top: 0, width: frozenB.w, height: frozenB.h, transformOrigin: '0 0' }
+              : null),
+          }}
           onLoad={() => setLoadedFor(split.notebookB ?? '')}
         />
         {!loaded && (

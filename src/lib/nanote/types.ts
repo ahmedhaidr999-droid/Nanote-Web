@@ -257,6 +257,9 @@ export interface Settings {
   laserMode: LaserMode;
   laserFadeSec: number;        // 1..10 seconds (timed mode)
   penShortcuts: PenShortcutPrefs;   // stylus hardware buttons + double-tap
+  /** master switch — temporarily disable every pen-button shortcut without
+   *  clearing the bindings (raw events still show in diagnostics) */
+  penShortcutsOn: boolean;
   fingerGestures: FingerGesturePrefs; // finger tap gestures
   minimap: boolean;                 // infinity paper: show the mini overview map
   penProfileId: string;             // manual pen model override ('auto' = detect)
@@ -287,6 +290,7 @@ export const DEFAULT_SETTINGS: Settings = {
   laserMode: 'normal',
   laserFadeSec: 3,
   penShortcuts: PEN_SHORTCUTS_DEFAULT,
+  penShortcutsOn: true,
   fingerGestures: FINGER_GESTURES_DEFAULT,
   minimap: true,
   penProfileId: 'auto',

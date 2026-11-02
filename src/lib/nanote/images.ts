@@ -1,4 +1,8 @@
 // Image resolution for canvas rendering — object-URL + bitmap LRU caches.
+// MEMORY: the bitmap LRU is BYTE-BUDGETED (scaled to device RAM, halved in
+// embedded split panes). The old fixed 48-ENTRY cap held up to 48 full-res
+// PDF page backgrounds (≈14 MB each on a 2× device ⇒ hundreds of MB — the
+// OOM/lag vector on mid-range Android while flipping through an imported PDF).
 import * as db from './idb';
 
 interface Entry<T> { value: T; touched: number }
@@ -6,7 +10,26 @@ interface Entry<T> { value: T; touched: number }
 const bitmaps = new Map<string, Entry<ImageBitmap | HTMLCanvasElement>>();
 const naturals = new Map<string, { w: number; h: number }>();
 const inflight = new Map<string, Promise<void>>();
-const MAX = 48;
+
+function imgBudgetBytes(): number {
+  let gb = 4;
+  try {
+    gb = (navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 4;
+  } catch { /* guarded */ }
+  let bytes = Math.round(Math.min(160, Math.max(40, gb * 20)) * 1024 * 1024);
+  try {
+    if (window !== window.top) bytes = Math.round(bytes / 2); // embedded split pane
+  } catch { /* cross-origin — assume embedded */ }
+  return bytes;
+}
+
+function entryBytes(v: ImageBitmap | HTMLCanvasElement): number {
+  const w = (v as ImageBitmap).width ?? 0;
+  const h = (v as ImageBitmap).height ?? 0;
+  return Math.max(1, w * h * 4);
+}
+
+let bitmapBytes = 0;
 
 function touch<T>(map: Map<string, Entry<T>>, id: string) {
   const e = map.get(id);
@@ -14,17 +37,20 @@ function touch<T>(map: Map<string, Entry<T>>, id: string) {
 }
 
 function evict() {
-  while (bitmaps.size > MAX) {
+  const budget = imgBudgetBytes();
+  while (bitmapBytes > budget && bitmaps.size > 1) {
     let oldest: string | null = null;
     let t = Infinity;
     for (const [k, v] of bitmaps) if (v.touched < t) { t = v.touched; oldest = k }
     if (!oldest) break;
     const e = bitmaps.get(oldest);
     if (e) {
+      bitmapBytes -= entryBytes(e.value);
       const val = e.value as unknown as ImageBitmap;
       if (typeof val.close === 'function') val.close();
     }
     bitmaps.delete(oldest);
+    naturals.delete(oldest);
   }
 }
 
@@ -54,6 +80,7 @@ export async function ensureImageLoaded(imageId: string): Promise<void> {
       });
     }
     bitmaps.set(imageId, { value: src, touched: Date.now() });
+    bitmapBytes += entryBytes(src);
     naturals.set(imageId, { w: rec.w || (src as ImageBitmap).width || 100, h: rec.h || (src as ImageBitmap).height || 100 });
     evict();
   })();
@@ -94,6 +121,7 @@ export function dropImageCache(imageId?: string) {
   if (imageId) {
     const e = bitmaps.get(imageId);
     if (e) {
+      bitmapBytes -= entryBytes(e.value);
       const val = e.value as unknown as ImageBitmap;
       if (typeof val.close === 'function') val.close();
     }
@@ -106,6 +134,7 @@ export function dropImageCache(imageId?: string) {
     }
     bitmaps.clear();
     naturals.clear();
+    bitmapBytes = 0;
   }
 }
 

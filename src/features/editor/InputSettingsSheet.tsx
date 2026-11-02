@@ -28,6 +28,7 @@ const FINGER_ACTIONS: FingerAction[] = ['zoom', 'undo', 'redo', 'eraserToggle', 
 export function InputSettingsSheet({ open, onOpenChange }: { open: boolean; onOpenChange: (v: boolean) => void }) {
   const { t } = useT();
   const penShortcuts = useApp((s) => s.settings.penShortcuts);
+  const penShortcutsOn = useApp((s) => s.settings.penShortcutsOn);
   const fingerGestures = useApp((s) => s.settings.fingerGestures);
   const fingerDrawing = useApp((s) => s.settings.fingerDrawing);
   const stylusOnly = useApp((s) => s.settings.stylusOnly);
@@ -162,6 +163,21 @@ export function InputSettingsSheet({ open, onOpenChange }: { open: boolean; onOp
               >
                 <Database className="h-4 w-4" /> {t('pens.manage')}
               </Button>
+
+              {/* ---------- master switch: temporarily disable all pen-button shortcuts */}
+              <div className="mb-3 flex items-center justify-between gap-3 rounded-xl border border-border bg-card p-3">
+                <div className="min-w-0">
+                  <span className="text-sm font-medium">{t('input.shortcutsOn', 'Pen button shortcuts', 'اختصارات أزرار القلم')}</span>
+                  <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+                    {t('input.shortcutsOn.hint', 'Off = buttons are ignored but raw events still appear in Diagnostics.', 'عند الإيقاف تُتجاهل الأزرار لكن الأحداث الخام تظهر في التشخيص.')}
+                  </p>
+                </div>
+                <Switch
+                  checked={penShortcutsOn}
+                  onCheckedChange={(v) => void setSettings({ penShortcutsOn: v })}
+                  aria-label={t('input.shortcutsOn', 'Pen button shortcuts', 'اختصارات أزرار القلم')}
+                />
+              </div>
 
               <div className="space-y-2.5 rounded-xl border border-border bg-card p-3">
                 <div className="flex items-center justify-between gap-3">

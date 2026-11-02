@@ -30,7 +30,7 @@
 // selection is computed from caret positions (./textsel) and NEVER creates a
 // native DOM selection, so no browser/WebView/Google selection UI can ever
 // appear on top of ours.
-import { useEffect, useRef } from 'react';
+import { memo, useEffect, useRef } from 'react';
 import { useApp, useT } from '@/lib/nanote/store';
 import { EditorTool, FingerAction, INK_PALETTE, PenAction, ShapeEl, StrokeEl, ToolId, TextEl, ImageEl, isLineShape } from '@/lib/nanote/types';
 import { uid, clamp } from '@/lib/nanote/util';
@@ -38,7 +38,7 @@ import { computeOutline, OP } from '@/lib/nanote/outline';
 import { drawStroke, drawText, drawShape, drawImageEl, hiAlphaOf } from '@/lib/nanote/render';
 import { resolveImage, imageNatural } from '@/lib/nanote/images';
 import { recognizeShape, type ShapeSpec } from '@/lib/nanote/shapedetect';
-import { observePenEvent, normalizePenPressure, onPenButtonEvent, barrelMap } from '@/lib/nanote/penengine';
+import { observePenEvent, normalizePenPressure, onPenButtonEvent, barrelMap, logPenAction, setPenRouterActive } from '@/lib/nanote/penengine';
 import {
   elementInLasso, strokeIntersectsCircle, elementIntersectsCircle,
   snapAngle, shapePath, pointInImage, transformElement,
@@ -358,7 +358,7 @@ export interface InkSurfaceProps {
   onTextTap: (pageId: string, pt: { x: number; y: number }, existing: TextEl | null) => void;
 }
 
-export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProps) {
+export default memo(function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const modeRef = useRef<Mode>({ type: 'none' });
   const pointersRef = useRef(new Map<number, { x: number; y: number; type: string }>());
@@ -772,9 +772,14 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       );
     };
 
-    /** run a stylus hardware-button / gesture shortcut (Settings → Pen & input) */
-    const applyPenAction = (act: PenAction) => {
+    /** run a stylus hardware-button / gesture shortcut (Settings → Pen & input).
+     *  Extended action set (pen-DB v2): color cycling, width up/down, zoom,
+     *  toolbar toggle and a quick PNG capture of the current page. Every
+     *  execution is logged to the pen diagnostics feed (button → binding →
+     *  action) so users can verify the chain on their device. */
+    const applyPenAction = (act: PenAction, via = 'pen button') => {
       const st = useApp.getState();
+      if (act !== 'none') logPenAction(String(act), via);
       switch (act) {
         case 'none': return;
         case 'eraserHold':
@@ -887,7 +892,12 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
      * pen reports as primary — the user's Barrel shortcut fires on any vendor.
      */
     const offPenButtons = onPenButtonEvent((ev) => {
-      const prefs = useApp.getState().settings.penShortcuts;
+      const st0 = useApp.getState();
+      // master switch — shortcuts can be disabled temporarily (Settings →
+      // Pen & input); the engine still logs the raw button events so the
+      // diagnostics panel keeps working
+      if (!st0.settings.penShortcutsOn) return;
+      const prefs = st0.settings.penShortcuts;
       if (ev.bit === 32) {
         // dedicated eraser end/button (Surface / MPP / Wacom One / Lenovo)
         if (ev.pattern === 'press') { if (prefs.eraser.press !== 'none') applyPenAction(prefs.eraser.press) }
@@ -1212,10 +1222,22 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       if (e.pointerType === 'pen') {
         penSeenRef.current = performance.now();
         penDownRef.current = true; // pen contact
-        // feed the pen engine (identification + capabilities for Settings) and
-        // route hardware buttons — hover presses already fired on pointermove;
-        // a press that begins exactly at tip contact fires here
-        observePenEvent(e);
+        // feed the pen engine (identification + capabilities + the button
+        // pattern machine for Settings) — a press beginning exactly at tip
+        // contact fires its pattern through the same engine
+        observePenEvent(e, 1, 'down');
+        // BARREL-BUTTON TRANSITION (changed button ≠ 0 while the pointer stays
+        // active — `buttons` still has bits): Chrome fires a discrete
+        // pointerdown for the barrel press BOTH while hovering (buttons=2)
+        // AND mid-stroke (buttons=3, tip still down). Either way it is a
+        // BUTTON event — never the start of ink. The old code fell through
+        // here: a mid-stroke barrel press re-routed the gesture through the
+        // (momentary-activated) eraser tool — chopping the live stroke AND
+        // erasing whatever the sweep crossed. Button-only, always.
+        if (e.button !== 0 && e.buttons !== 0) {
+          penDownRef.current = (e.buttons & 1) === 1; // tip still in contact?
+          return;
+        }
       }
 
       // ---- palm rejection gate (touches only; pens & mice always pass)
@@ -1235,8 +1257,9 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
           pendingTapRef.current = null;
           modeRef.current = { type: 'none' };
           activeTypeRef.current = null;
-          const dAct = useApp.getState().settings.penShortcuts.doubleTap;
-          if (dAct && dAct !== 'none') applyPenAction(dAct);
+          const stTap = useApp.getState();
+          const dAct = stTap.settings.penShortcuts.doubleTap;
+          if (dAct && dAct !== 'none' && stTap.settings.penShortcutsOn) applyPenAction(dAct, 'pen double-tap');
           return; // consumed — no dot, no stroke, no long-press
         }
       }
@@ -1745,6 +1768,16 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     };
 
     const finishGesture = (e: PointerEvent) => {
+      // BARREL RELEASE while the tip is still writing: the browser fires
+      // pointerup with button ≠ 0 while `buttons` STILL has the tip bit —
+      // a button transition, not the end of the stroke. Treating it as a
+      // lift CHOPPED the stroke in two and dropped the tail (the "pressing
+      // the pen button ruins my writing" bug). Feed the engine, keep the
+      // gesture alive.
+      if (e.pointerType === 'pen' && e.button !== 0 && e.buttons !== 0) {
+        observePenEvent(e, 1, 'up');
+        return;
+      }
       const m = modeRef.current;
       const known = pointers.has(e.pointerId); // rejected (palm) pointers were never tracked
       pointers.delete(e.pointerId);
@@ -1757,7 +1790,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         penLastUpRef.current = performance.now();
         // the engine sees the release too (buttons released exactly at lift
         // restore momentary tools through the pattern router)
-        observePenEvent(e);
+        observePenEvent(e, 1, 'up');
         restoreMomentaryTool();
         // keep only bits that are still physically held after the lift so the
         // next press can never be swallowed by a stale mask
@@ -1838,7 +1871,8 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         // normally — only taps are deferred.
         if (
           e.pointerType === 'pen' && quick &&
-          useApp.getState().settings.penShortcuts.doubleTap !== 'none'
+          useApp.getState().settings.penShortcuts.doubleTap !== 'none' &&
+          useApp.getState().settings.penShortcutsOn
         ) {
           const prev = pendingTapRef.current;
           if (prev) clearTimeout(prev.timer);
@@ -2033,6 +2067,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       // same bookkeeping as a normal release (pen linger, finger tap counting) —
       // a cancelled gesture must never leave stale state behind
       if (e.pointerType === 'pen') {
+        observePenEvent(e, 1, 'cancel');
         penDownRef.current = false;
         penLastUpRef.current = performance.now();
         const restore = momentaryToolRef.current;
@@ -2122,6 +2157,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     };
     const onBlurWin = () => { spaceRef.current = false };
 
+    setPenRouterActive(true);
     host.addEventListener('pointerdown', onPointerDown);
     host.addEventListener('pointermove', onPointerMove);
     host.addEventListener('pointerup', onPointerUp);
@@ -2141,7 +2177,7 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       if (pending) { clearTimeout(pending.timer); pendingTapRef.current = null }
       const mEnd = modeRef.current;
       if (mEnd.type === 'imgmove') setHiddenIds(mEnd.pageId, null);
-      stopLaserLoop(); // fade loop + trail die with the surface
+      stopLaserLoop(); // fade loop + trail die with the surface      setPenRouterActive(false);
       host.removeEventListener('pointerdown', onPointerDown);
       host.removeEventListener('pointermove', onPointerMove);
       host.removeEventListener('pointerup', onPointerUp);
@@ -2166,4 +2202,4 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       aria-label={t('app.name')}
     />
   );
-}
+});

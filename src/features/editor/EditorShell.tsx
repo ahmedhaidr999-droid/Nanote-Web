@@ -13,6 +13,7 @@ import { useApp, useT } from '@/lib/nanote/store';
 import { PAGE_SIZES, PAPER_COLORS, PageRow, TemplateId } from '@/lib/nanote/types';
 import { uid } from '@/lib/nanote/util';
 import { elementBBox } from '@/lib/nanote/geometry';
+import { preloadPageImages } from '@/lib/nanote/images';
 import * as db from '@/lib/nanote/idb';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
@@ -249,6 +250,32 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
       unsub();
     };
   }, [pageW]);
+
+  // -------------------------------------------------- neighbor-page prefetch
+  // PDF page flips used to pay the doc-read + image-decode toll on EVERY flip:
+  // a culled page remounts → ensureDoc (IndexedDB) → background PNG decode →
+  // only then the raster. Prefetching the PREVIOUS and NEXT page's doc +
+  // images once the viewport settles makes the flip itself instant — the
+  // remounted canvas finds everything hot and paints from the raster cache.
+  useEffect(() => {
+    const prefetchNeighbors = () => {
+      const st = useApp.getState();
+      const pagesNow = st.editor.pages;
+      const idx = pagesNow.findIndex((p) => p.id === st.editor.activePageId);
+      if (idx < 0) return;
+      const ids = [idx - 1, idx + 1]
+        .filter((i) => i >= 0 && i < pagesNow.length)
+        .map((i) => pagesNow[i].id);
+      for (const id of ids) {
+        if (st.editor.docs[id]) continue; // already hot
+        void st.ensureDoc(id).then((doc) => {
+          const page = useApp.getState().editor.pages.find((p) => p.id === id);
+          if (page) void preloadPageImages(page, doc).catch(() => null);
+        }).catch(() => null);
+      }
+    };
+    return onVpIdle(prefetchNeighbors);
+  }, [notebookId]);
 
   // -------------------------------------------------- keyboard shortcuts
   useEffect(() => {

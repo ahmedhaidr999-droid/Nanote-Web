@@ -36,22 +36,29 @@
 //     In windowed mode the page edge is drawn INTO the bitmap at a constant
 //     1-device-pixel width and a pointer-events-none frame div carries the
 //     page shadow.
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '@/lib/nanote/store';
 import { renderPage } from '@/lib/nanote/render';
 import { preloadPageImages, resolveImage, imageNatural } from '@/lib/nanote/images';
 import { renderPdfPageVector } from '@/lib/nanote/pdftext';
 import { getCachedRaster, putCachedRaster } from '@/lib/nanote/rastercache';
+import { bitmapAreaBudget, bitmapSideCap, degradeBitmapBudget } from '@/lib/nanote/canvasbudget';
 import { PageRow } from '@/lib/nanote/types';
 import { clamp } from '@/lib/nanote/util';
 import { getHiddenIds, onRepaint, onVpIdle, getVp, getViewportSize, visibleWorldRect } from './viewport';
 import type { PageLayout } from './viewport';
 
-/** per-side bitmap cap (Android Chromium handles far more; keep headroom) */
-const MAX_BITMAP_DIM = 8192;
-/** total pixel budget for a window bitmap (Android-only app — no iOS 16.6M
- *  canvas ceiling here, so windowed renders keep generous pan margins) */
-const MAX_BITMAP_AREA = 32e6;
+/** per-side bitmap cap (Chromium handles 16k; keep headroom for tiling) */
+const MAX_BITMAP_DIM = bitmapSideCap();
+/**
+ * total pixel budget for a window bitmap — ADAPTIVE (canvasbudget.ts): sized
+ * from device RAM, verified by an allocation probe, halved in embedded split
+ * panes. The old fixed 16.6M-px ceiling blanked canvases on low-memory
+ * Android WebViews at max zoom (the "screen turns black" report).
+ */
+function maxBitmapArea(): number {
+  return bitmapAreaBudget();
+}
 /** full-page render cap: the cacheable "bucket" path tops out here */
 const FULL_RASTER_MAX = 5;
 /** zoom-out degenerate guard only — the budgets above are the real limits */
@@ -80,7 +87,7 @@ function dprOf(): number {
 function bucketFor(scale: number, pageW: number, pageH: number): number {
   const raw = Math.min(Math.max(0.5, scale * dprOf()), FULL_RASTER_MAX);
   // memory guard for very tall pages
-  const byPixels = Math.sqrt(MAX_BITMAP_AREA / Math.max(1, pageW * pageH));
+  const byPixels = Math.sqrt(maxBitmapArea() / Math.max(1, pageW * pageH));
   return Math.min(raw, Math.max(0.5, byPixels));
 }
 
@@ -93,7 +100,7 @@ function windowRaster(scale: number, ww: number, wh: number): number {
   let r = scale * dprOf();
   if (ww > 1 && wh > 1) {
     r = Math.min(r, MAX_BITMAP_DIM / Math.max(ww, wh));
-    r = Math.min(r, Math.sqrt(MAX_BITMAP_AREA / (ww * wh)));
+    r = Math.min(r, Math.sqrt(maxBitmapArea() / (ww * wh)));
   }
   // NOTE: no raising floor — at 8% zoom the correct raster IS 0.08·dpr and
   // the bitmap stays viewport-sized; forcing it higher would exceed the
@@ -121,7 +128,7 @@ function winIsFull(w: Win, l: PageLayout): boolean {
 function budgetedMargins(visW: number, visH: number, cw: number, ch: number, scale: number, mf: number) {
   const dpr = dprOf();
   const budgetSide = MAX_BITMAP_DIM / (scale * dpr);
-  const budgetArea = MAX_BITMAP_AREA / (scale * dpr) ** 2;
+  const budgetArea = maxBitmapArea() / (scale * dpr) ** 2;
   let mx = Math.max(240, cw * mf) / scale;
   let my = Math.max(240, ch * mf) / scale;
   mx = Math.min(mx, Math.max(0, (budgetSide - visW) / 2));
@@ -139,22 +146,35 @@ function budgetedMargins(visW: number, visH: number, cw: number, ch: number, sca
 
 /**
  * Infinity paper: the render window ≈ the visible viewport expanded by ~80%
- * on every side (so panning keeps showing rendered paper), rounded to a
- * coarse grid to avoid churn. Unclamped — the sheet has no edges.
+ * (high zooms: ~50%) on every side (so panning keeps showing rendered paper),
+ * rounded to a coarse grid to avoid churn. Unclamped — the sheet has no edges.
+ *
+ * CRITICAL ROUNDING RULE (the max-zoom black-screen fix): the LOW edges round
+ * DOWN and the HIGH edges round UP, so the grid-quantized window is always a
+ * SUPERSET of viewport+margin. The old `floor` on BOTH edges could collapse
+ * the window to a single grid cell (or an empty span) when the visible rect
+ * at 2400% zoom (~50×30 local units) is smaller than the 128-unit grid — the
+ * canvas then covered a 174×110 px sliver of a 1280×744 viewport and the rest
+ * of the screen showed the app background (black in dark mode).
  */
 function viewportWin(l: PageLayout): Win {
   const vis = visibleWorldRect();
   const { w: cw, h: ch } = getViewportSize();
   const visW = Math.max(1, vis.x1 - vis.x0);
   const visH = Math.max(1, vis.y1 - vis.y0);
-  const { mx, my } = budgetedMargins(visW, visH, cw, ch, getVp().scale, 0.8);
+  // extreme zooms keep tighter margins — the bitmap stays device-exact but
+  // smaller, so re-renders after each zoom-settle stay fast and memory-light
+  const s = getVp().scale;
+  const mf = s > 8 ? 0.5 : s > 4 ? 0.65 : 0.8;
+  const { mx, my } = budgetedMargins(visW, visH, cw, ch, s, mf);
   const G = 128; // grid rounding — keeps re-renders sparse
-  const r = (v: number) => Math.floor(v / G) * G;
+  const down = (v: number) => Math.floor(v / G) * G;
+  const up = (v: number) => Math.ceil(v / G) * G;
   return {
-    x0: r(vis.x0 - mx),
-    y0: r(vis.y0 - l.y - my),
-    x1: r(vis.x1 + mx),
-    y1: r(vis.y1 - l.y + my),
+    x0: down(vis.x0 - mx),
+    y0: down(vis.y0 - l.y - my),
+    x1: up(vis.x1 + mx),
+    y1: up(vis.y1 - l.y + my),
   };
 }
 
@@ -170,7 +190,7 @@ function fixedWin(l: PageLayout, currentlyWindowed: boolean): Win {
   const affordable = Math.min(
     FULL_RASTER_MAX,
     MAX_BITMAP_DIM / Math.max(pageW, pageH, 1),
-    Math.sqrt(MAX_BITMAP_AREA / Math.max(1, pageW * pageH)),
+    Math.sqrt(maxBitmapArea() / Math.max(1, pageW * pageH)),
   );
   const need = getVp().scale * dprOf();
   if (currentlyWindowed ? need < affordable * 0.96 : need <= affordable * 1.0) return full;
@@ -195,9 +215,13 @@ function fixedWin(l: PageLayout, currentlyWindowed: boolean): Win {
 function winChanged(a: Win, b: Win): boolean {
   // relative threshold: at low zoom the window spans tens of thousands of
   // local units and a fixed 64-unit trigger would re-render on every ~5px of
-  // panning; 6% of the window keeps re-renders sparse at every zoom
-  const sx = Math.max(64, (b.x1 - b.x0) * 0.06);
-  const sy = Math.max(64, (b.y1 - b.y0) * 0.06);
+  // panning; 6% of the window keeps re-renders sparse at every zoom. The
+  // absolute FLOOR is 12 units (not 64): at max zoom the window span is
+  // ~100 units and margins ~25 — a 64-unit floor meant the viewport could pan
+  // clean off the rendered bitmap (black strip) long before a re-render was
+  // even considered. 12 units keeps ≥ half the margin in hand at any zoom.
+  const sx = Math.max(12, (b.x1 - b.x0) * 0.06);
+  const sy = Math.max(12, (b.y1 - b.y0) * 0.06);
   return Math.abs(a.x0 - b.x0) > sx || Math.abs(a.y0 - b.y0) > sy || Math.abs(a.x1 - b.x1) > sx || Math.abs(a.y1 - b.y1) > sy;
 }
 
@@ -229,7 +253,7 @@ function putVectorCanvas(pageId: string, raster: number, win: Win, canvas: HTMLC
   while (vectorLru.length > VECTOR_LRU_MAX) vectorLru.shift();
 }
 
-export default function PageCanvas({
+export function PageCanvas({
   page,
   layout,
   infinite,
@@ -319,22 +343,66 @@ export default function PageCanvas({
     if (canvas.width !== bw || canvas.height !== bh) { canvas.width = bw; canvas.height = bh }
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    ctx.setTransform(raster, 0, 0, raster, -w.x0 * raster, -w.y0 * raster);
-    const vector = !infinite && page.backgroundImageId != null
-      ? getVectorCanvas(page.id, Math.round(raster * 10) / 10, w)
-      : null;
     const hidden = getHiddenIds(page.id);
-    renderPage(ctx, page, doc ?? null, l.w, l.h, {
-      gamma,
-      highlighterOpacity: hiOpacity,
-      resolveImage,
-      imageNatural,
-      hideIds: hidden,
-      win: w,
-      infinite,
-      ...(vector ? { backgroundOverride: { source: vector.canvas, x: vector.win.x0, y: vector.win.y0, w: vector.win.x1 - vector.win.x0, h: vector.win.y1 - vector.win.y0 } } : {}),
-      ...audioOptsRef.current,
-    });
+    try {
+      ctx.setTransform(raster, 0, 0, raster, -w.x0 * raster, -w.y0 * raster);
+      const vector = !infinite && page.backgroundImageId != null
+        ? getVectorCanvas(page.id, Math.round(raster * 10) / 10, w)
+        : null;
+      renderPage(ctx, page, doc ?? null, l.w, l.h, {
+        gamma,
+        highlighterOpacity: hiOpacity,
+        resolveImage,
+        imageNatural,
+        hideIds: hidden,
+        win: w,
+        infinite,
+        ...(vector ? { backgroundOverride: { source: vector.canvas, x: vector.win.x0, y: vector.win.y0, w: vector.win.x1 - vector.win.x0, h: vector.win.y1 - vector.win.y0 } } : {}),
+        ...audioOptsRef.current,
+      });
+      // SELF-HEAL CHECK: on over-constrained devices a canvas at the budget
+      // can allocate but rasterize nothing (blank backing store) — verify a
+      // pixel actually changed; if not, degrade the budget and retry this
+      // paint once at the smaller size (the "max zoom black screen" guard).
+      if (bw > 2048 && bh > 2048) {
+        const probe = ctx.getImageData(Math.min(4, bw - 1), Math.min(4, bh - 1), 1, 1).data;
+        const paperHex = (page.backgroundHex || '#FFFFFF').replace('#', '');
+        const expect0 = probe.length ? probe[0] : 0;
+        const expectR = paperHex.length >= 6 ? parseInt(paperHex.slice(0, 2), 16) : 255;
+        if (probe[3] === 0 || (expect0 === 0 && expectR > 40)) {
+          // transparent corner = the backing store never rasterized
+          degradeBitmapBudget();
+          const r2 = Math.min(raster, Math.sqrt(maxBitmapArea() / (ww * wh)));
+          if (r2 < raster) {
+            rasterRef.current = r2;
+            canvas.width = Math.max(2, Math.round(ww * r2));
+            canvas.height = Math.max(2, Math.round(wh * r2));
+            const ctx2 = canvas.getContext('2d');
+            if (ctx2) {
+              ctx2.setTransform(r2, 0, 0, r2, -w.x0 * r2, -w.y0 * r2);
+              const vector2 = !infinite && page.backgroundImageId != null
+                ? getVectorCanvas(page.id, Math.round(r2 * 10) / 10, w)
+                : null;
+              renderPage(ctx2, page, doc ?? null, l.w, l.h, {
+                gamma,
+                highlighterOpacity: hiOpacity,
+                resolveImage,
+                imageNatural,
+                hideIds: getHiddenIds(page.id),
+                win: w,
+                infinite,
+                ...(vector2 ? { backgroundOverride: { source: vector2.canvas, x: vector2.win.x0, y: vector2.win.y0, w: vector2.win.x1 - vector2.win.x0, h: vector2.win.y1 - vector2.win.y0 } } : {}),
+                ...audioOptsRef.current,
+              });
+            }
+          }
+        }
+      }
+    } catch {
+      // allocation/ raster threw (out of memory at this size) — degrade the
+      // session budget so the next window render asks for a smaller bitmap
+      degradeBitmapBudget();
+    }
     // fixed pages: draw the page edge INTO the bitmap at a constant ~1 device
     // pixel — stays a hairline at any zoom (the old CSS outline scaled with
     // the world transform and turned into a thick band at 800%)
@@ -400,7 +468,7 @@ export default function PageCanvas({
       const want = Math.min(
         bucketFor(getVp().scale, pageW, pageH),
         MAX_BITMAP_DIM / Math.max(2, pageW),
-        Math.sqrt(MAX_BITMAP_AREA / Math.max(4, pageW * pageH)),
+        Math.sqrt(maxBitmapArea() / Math.max(4, pageW * pageH)),
       );
       const base = { pageId: page.id, docVersion, pageW, pageH, gamma, hiOpacity };
       let got: { bmp: ImageBitmap; raster: number } | null = null;
@@ -478,16 +546,27 @@ export default function PageCanvas({
   // re-rasterizing. Never during the gesture itself.
   //   • windowed renders (infinity paper + zoomed-in fixed pages): re-center
   //     the window AND re-render at device-exact raster when the zoom moved
-  //     ≥6% (culling makes these cheap — crispness wins);
+  //     ≥6% (culling makes these cheap — crispness wins). The window is also
+  //     re-centered whenever the CURRENT bitmap no longer comfortably covers
+  //     the viewport (edge-coverage check — the max-zoom black-strip guard);
   //   • full-page renders: coarse ≥1.3× bucket changes only (expensive).
   useEffect(() => {
+    /** does the current window still cover the visible rect with headroom? */
+    const winStillCovers = (cur: Win, desired: Win): boolean => {
+      const hx = (desired.x1 - desired.x0) * 0.04;
+      const hy = (desired.y1 - desired.y0) * 0.04;
+      return (
+        cur.x0 <= desired.x0 + hx && cur.x1 >= desired.x1 - hx &&
+        cur.y0 <= desired.y0 + hy && cur.y1 >= desired.y1 - hy
+      );
+    };
     const maybeReRaster = () => {
       idleScheduledRef.current = 0;
       if (infinite) {
         const desired = viewportWin(layout);
         const raster = windowRaster(getVp().scale, desired.x1 - desired.x0, desired.y1 - desired.y0);
         const ratio = raster / rasterRef.current;
-        if (winChanged(desired, winRef.current) || ratio > 1.06 || ratio < 1 / 1.06) {
+        if (winChanged(desired, winRef.current) || ratio > 1.06 || ratio < 1 / 1.06 || !winStillCovers(winRef.current, desired)) {
           setWin(desired);
         }
         return;
@@ -497,7 +576,7 @@ export default function PageCanvas({
         // windowed fixed page — same cheap device-exact re-render policy
         const raster = windowRaster(getVp().scale, desired.x1 - desired.x0, desired.y1 - desired.y0);
         const ratio = raster / rasterRef.current;
-        if (winChanged(desired, winRef.current) || ratio > 1.06 || ratio < 1 / 1.06) {
+        if (winChanged(desired, winRef.current) || ratio > 1.06 || ratio < 1 / 1.06 || !winStillCovers(winRef.current, desired)) {
           setWin(desired);
         }
         return;
@@ -596,3 +675,8 @@ export default function PageCanvas({
     </>
   );
 }
+
+// PERF: memoized — EditorShell re-renders on every container-size state tick
+// (window resize, split-divider drags); without this memo each tick re-ran
+// every mounted page component (and their layout effects) for nothing.
+export default memo(PageCanvas);

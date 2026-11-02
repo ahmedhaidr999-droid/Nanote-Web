@@ -149,6 +149,11 @@ let profiledPointerId: number | null = null;
 const BARREL_CANDIDATES = [2, 4, 8, 16] as const;
 let primaryBarrelBit = 0; // 0 = not locked yet
 
+// diagnostics-log decimation state (per pointerId)
+const lastLoggedButtons = new Map<number, number>();
+const lastLoggedContact = new Map<number, boolean>();
+const lastMoveLog = new Map<number, number>();
+
 type Listener = (info: PenInfo) => void;
 const listeners = new Set<Listener>();
 
@@ -203,7 +208,112 @@ const bitsOf = (buttons: number) => {
   return out;
 };
 
+// ---------------------------------------------------------------- diagnostics log
+// A rolling, timestamped record of EVERY pen-related input event and every
+// shortcut the engine executed — the live "why don't my pen buttons work"
+// debugger (Settings → Electronic pens → Diagnostics). Shows the full chain:
+// raw pointer event → button pattern recognized → binding matched → action
+// executed, so users can see exactly WHERE a vendor pen's events stop.
+export type PenLogKind = 'down' | 'move' | 'up' | 'cancel' | 'hover' | 'button' | 'action' | 'info';
+export interface PenLogEntry {
+  id: number;
+  t: number;               // performance.now()
+  kind: PenLogKind;
+  pointerType: string;
+  pointerId: number;
+  button: number;          // e.button (which button CHANGED)
+  buttons: number;         // e.buttons (current bitmask)
+  pressure: number;
+  tiltDeg: number;
+  hover: boolean;
+  note: string;            // pattern / action / context description
+}
+const penLog: PenLogEntry[] = [];
+const PEN_LOG_MAX = 80;
+let penLogSeq = 0;
+// immutable snapshot for useSyncExternalStore — the raw array is mutated in
+// place for O(1) appends, so getSnapshot() must hand out a NEW reference
+// whenever the data changes or React never re-renders the log view.
+let penLogSnapshot: readonly PenLogEntry[] = [];
+type LogListener = (entries: readonly PenLogEntry[]) => void;
+const logListeners = new Set<LogListener>();
+
+export function subscribePenLog(cb: LogListener): () => void {
+  logListeners.add(cb);
+  return () => { logListeners.delete(cb) };
+}
+
+export function getPenLog(): readonly PenLogEntry[] {
+  return penLogSnapshot;
+}
+
+export function clearPenLog(): void {
+  penLog.length = 0;
+  penLogSnapshot = [];
+  for (const l of logListeners) l(penLogSnapshot);
+}
+
+function logPen(kind: PenLogKind, e: { pointerType: string; pointerId: number; button?: number; buttons?: number; pressure?: number; tiltDeg?: number; hover?: boolean }, note = ''): void {
+  penLog.push({
+    id: ++penLogSeq,
+    t: performance.now(),
+    kind,
+    pointerType: e.pointerType,
+    pointerId: e.pointerId,
+    button: e.button ?? 0,
+    buttons: e.buttons ?? 0,
+    pressure: e.pressure ?? 0,
+    tiltDeg: e.tiltDeg ?? 0,
+    hover: e.hover ?? false,
+    note,
+  });
+  if (penLog.length > PEN_LOG_MAX) penLog.splice(0, penLog.length - PEN_LOG_MAX);
+  penLogSnapshot = penLog.slice();
+  for (const l of logListeners) l(penLogSnapshot);
+}
+
+/** Diagnostics helper — log a non-pointer note (router status, simulation…). */
+export function logPenInfo(note: string): void {
+  logPen('info', { pointerType: '—', pointerId: -1 }, note);
+}
+
+/** Log a shortcut EXECUTION (called by the router in the editor). */
+export function logPenAction(action: string, via: string): void {
+  logPen('action', { pointerType: 'pen', pointerId: -1 }, `${via} → ${action}`);
+}
+
+/** true while the editor's shortcut router is mounted (diagnostics banner). */
+let routerActive = false;
+export function setPenRouterActive(v: boolean): void {
+  if (routerActive === v) return;
+  routerActive = v;
+  emit(); // refresh diagnostics listeners
+}
+export function isPenRouterActive(): boolean {
+  return routerActive;
+}
+
+/**
+ * SIMULATION (diagnostics): fire a synthetic button pattern through the SAME
+ * engine pipeline a physical press takes — the pattern machine → the router
+ * listeners → the bound action. Proves the shortcut chain end-to-end without
+ * hardware (button event → engine → binding → action executed in the log).
+ * A press pattern auto-releases after ~600ms so momentary actions
+ * (hold-to-erase) restore themselves exactly like a physical button would.
+ */
+export function simulatePenButton(bit: number, pattern: 'press' | 'double' | 'long'): void {
+  logPenInfo(`simulate bit ${bit} ${pattern}`);
+  emitButton(bit, pattern, false);
+  if (pattern === 'press') {
+    setTimeout(() => {
+      logPenInfo(`simulate bit ${bit} release`);
+      emitButton(bit, 'release', false);
+    }, 600);
+  }
+}
+
 function emitButton(bit: number, pattern: PenPatternKind, writing: boolean) {
+  logPen('button', { pointerType: 'pen', pointerId: -1, buttons: bit }, `bit ${bit} ${pattern}${writing ? ' (while writing)' : ''}`);
   const ev: PenButtonEvent = { bit, primary: bit !== 32 && bit === barrelMap().primary, pattern, writing };
   for (const l of buttonListeners) l(ev);
 }
@@ -290,18 +400,45 @@ function resolveProfile(): { family: PenFamily; label: string; spec: StylusSpec 
  * Feed one pen pointer event into the engine. Call for EVERY pen event
  * (pointerdown / pointermove / pointerup). Runs the button-edge detector +
  * the press/double/long pattern state machine and emits PenButtonEvent's —
- * subscribers (the shortcut router) fire the user's bindings.
+ * subscribers (the shortcut router) fire the user's bindings. `phase` feeds
+ * the diagnostics log (down/move/up/cancel) with move decimation so a 240 Hz
+ * stream doesn't drown the log.
  */
 export function observePenEvent(e: {
   pointerType: string;
   pointerId: number;
   pressure: number;
   buttons: number;
+  button?: number;
   tiltX?: number;
   tiltY?: number;
-}, coalescedCount = 1): void {
+}, coalescedCount = 1, phase: 'down' | 'move' | 'up' | 'cancel' = 'move'): void {
   if (e.pointerType !== 'pen') return;
   const now = performance.now();
+
+  // ---- diagnostics log (decimated: button/contact transitions always log;
+  //      plain moves at most ~5/s so 240 Hz streams stay readable)
+  const prevButtons = lastLoggedButtons.get(e.pointerId) ?? -1;
+  const contact = e.pressure > 0.015 || (e.buttons & 1) === 1;
+  const prevContact = lastLoggedContact.get(e.pointerId) ?? false;
+  const buttonsChanged = e.buttons !== prevButtons;
+  const contactChanged = contact !== prevContact;
+  if (
+    phase !== 'move' || buttonsChanged || contactChanged ||
+    now - (lastMoveLog.get(e.pointerId) ?? 0) > 200
+  ) {
+    if (phase === 'move' && !buttonsChanged && !contactChanged) lastMoveLog.set(e.pointerId, now);
+    lastLoggedButtons.set(e.pointerId, e.buttons);
+    lastLoggedContact.set(e.pointerId, contact);
+    logPen(phase === 'move' && !contact ? 'hover' : phase, {
+      pointerType: 'pen',
+      pointerId: e.pointerId,
+      button: e.button ?? 0,
+      buttons: e.buttons,
+      pressure: e.pressure,
+      hover: !contact,
+    });
+  }
 
   if (!info.detected || (profiledPointerId !== null && profiledPointerId !== e.pointerId)) {
     // (re)seed the profile for this pen (a new pen swapped mid-session)

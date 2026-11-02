@@ -379,6 +379,7 @@ export const useApp = create<AppState>((set, get) => ({
       ...DEFAULT_SETTINGS,
       ...settings,
       penShortcuts: migratePenShortcuts(settings.penShortcuts),
+      penShortcutsOn: settings.penShortcutsOn !== false,
       fingerGestures: { ...FINGER_GESTURES_DEFAULT, ...(settings.fingerGestures ?? {}) },
     };
     set({ settings: migrated });
