@@ -4,8 +4,8 @@
 import { create } from 'zustand';
 import * as db from './idb';
 import {
-  DEFAULT_SETTINGS, DEFAULT_TOOL_STATES, EditorTool, EraserMode, FINGER_GESTURES_DEFAULT, FolderRow, ImageEl, INFINITE_GROW_MARGIN, INFINITE_GROW_STEP, migratePenShortcuts, NotebookRow,
-  PageDoc, PageElement, PageRow, PageSizeId, PdfTextRec, RecordingRow, Settings, ShapeType, StrokeEl, TabRow, TagRow,
+  DEFAULT_SETTINGS, DEFAULT_SHAPE_STATE, DEFAULT_TOOL_STATES, EditorTool, EraserMode, FINGER_GESTURES_DEFAULT, FolderRow, ImageEl, INFINITE_GROW_MARGIN, INFINITE_GROW_STEP, migratePenShortcuts, NotebookRow,
+  PageDoc, PageElement, PageRow, PageSizeId, PdfTextRec, RecordingRow, Settings, ShapeEl, ShapeToolState, StrokeEl, TabRow, TagRow,
   TemplateId, ToolId, ToolState, UNDO_LIMIT, emptyDoc,
 } from './types';
 import { uid } from './util';
@@ -28,6 +28,24 @@ export interface Cmd { label: string; run(): void; revert(): void; pages?: strin
 
 export interface TextDefaults {
   fontId: string; size: number; color: string; bold: boolean; italic: boolean; underline: boolean; align: 'start' | 'center' | 'end';
+}
+
+/** pending shape-recognition offer (pen-lift mode): the converted shapes can
+ *  be reverted back to the original ink from the floating chip. */
+export interface RecogState {
+  pageId: string;
+  shapeIds: string[];
+  ink: StrokeEl[];
+  at: number;
+}
+
+/** Split Workspace session state — pane A is the live editor (the app itself),
+ *  pane B is a second notebook rendered in an embedded instance. */
+export interface SplitState {
+  open: boolean;
+  orientation: 'vertical' | 'horizontal';
+  ratio: number;       // pane A's share of the split, 0.2..0.8
+  notebookB: string | null;
 }
 
 export interface NewNotebookInput {
@@ -61,6 +79,9 @@ interface AppState {
   sort: 'recent' | 'title' | 'created';
   searchQuery: string;
 
+  // ----- split workspace (session-scoped; layout prefs persist locally)
+  split: SplitState;
+
   // ----- editor
   editor: {
     notebookId: string;
@@ -73,7 +94,7 @@ interface AppState {
     lastPen: ToolId;
     toolStates: Record<ToolId, ToolState>;
     eraser: { mode: EraserMode; size: number };
-    shape: { type: ShapeType; filled: boolean; color: string; width: number };
+    shape: ShapeToolState;
     highlighterStraight: boolean;
     textDefaults: TextDefaults;
     recentColors: string[];
@@ -87,6 +108,8 @@ interface AppState {
     toolbarHidden: boolean;
     activeRecording: { recId: string; startedAt: number } | null;
     audio: { recId: string | null; playing: boolean; tMs: number; sync: boolean; replay: boolean };
+    /** pending shape-recognition offer (pen-lift mode keep/revert chip) */
+    recog: RecogState | null;
   };
 
   // ----- actions
@@ -140,7 +163,18 @@ interface AppState {
   setTool(tool: EditorTool): void;
   setToolState(tool: ToolId, patch: Partial<ToolState>): void;
   setEraser(patch: Partial<{ mode: EraserMode; size: number }>): void;
-  setShape(patch: Partial<{ type: ShapeType; filled: boolean; color: string; width: number }>): void;
+  setShape(patch: Partial<ShapeToolState>): void;
+  setRecog(recog: RecogState | null): void;
+  /** replace freshly-drawn ink strokes with recognized vector shapes as ONE
+   *   undoable command (undo restores the ink) */
+  applyRecognition(pageId: string, ink: StrokeEl[], shapes: ShapeEl[]): void;
+  /** revert the pending recognition offer back to the original ink */
+  revertRecognition(): void;
+  /** assign every selected element one shared groupId (they select & move as
+   *   a unit from then on); undoable */
+  groupSelection(): void;
+  /** strip groupIds from the selected elements' groups; undoable */
+  ungroupSelection(): void;
   setHighlighterStraight(v: boolean): void;
   setTextDefaults(patch: Partial<TextDefaults>): void;
   pushRecentColor(hex: string): void;
@@ -176,6 +210,12 @@ interface AppState {
   deletePage(pageId: string): Promise<void>;
   duplicatePage(pageId: string): Promise<string>;
   reorderPages(orderedIds: string[]): Promise<void>;
+
+  // ------------------------------------------------------------ split workspace
+  openSplit(notebookB: string, orientation?: 'vertical' | 'horizontal'): void;
+  closeSplit(): void;
+  setSplit(patch: Partial<Omit<SplitState, 'open'>>): void;
+  swapSplit(): void;
 
   loadRecordings(pageId: string): Promise<void>;
   addRecording(rec: RecordingRow, blob: Blob): Promise<void>;
@@ -228,6 +268,28 @@ async function persistDoc(get: () => AppState, pageId: string) {
 
 const docClone = (doc: PageDoc): PageDoc => ({ version: 1, elements: [...doc.elements], sync: { ...doc.sync } });
 
+// ---------------------------------------------------------------- split layout prefs (localStorage)
+interface SplitPrefs { orientation: 'vertical' | 'horizontal'; ratio: number }
+const SPLIT_PREFS_KEY = 'nanote.splitPrefs';
+
+function loadSplitPrefs(): SplitPrefs {
+  try {
+    const raw = localStorage.getItem(SPLIT_PREFS_KEY);
+    if (raw) {
+      const p = JSON.parse(raw) as Partial<SplitPrefs>;
+      return {
+        orientation: p.orientation === 'horizontal' ? 'horizontal' : 'vertical',
+        ratio: typeof p.ratio === 'number' ? Math.min(0.8, Math.max(0.2, p.ratio)) : 0.5,
+      };
+    }
+  } catch { /* ignore */ }
+  return { orientation: 'vertical', ratio: 0.5 };
+}
+
+function saveSplitPrefs(p: SplitPrefs) {
+  try { localStorage.setItem(SPLIT_PREFS_KEY, JSON.stringify(p)) } catch { /* ignore */ }
+}
+
 // ---------------------------------------------------------------- v2 migration (one-time)
 // Old model: flat top-level folders as the only grouping. New model: TABS are
 // the top-level edge chips; folders nest inside tabs (folder→folder→notebooks).
@@ -279,6 +341,8 @@ export const useApp = create<AppState>((set, get) => ({
   sort: 'recent',
   searchQuery: '',
 
+  split: { open: false, orientation: 'vertical', ratio: 0.5, notebookB: null },
+
   editor: {
     notebookId: '',
     pages: [],
@@ -290,7 +354,7 @@ export const useApp = create<AppState>((set, get) => ({
     lastPen: 'fountain',
     toolStates: JSON.parse(JSON.stringify(DEFAULT_TOOL_STATES)),
     eraser: { mode: 'stroke', size: 24 },
-    shape: { type: 'rect' as ShapeType, filled: false, color: '#16233A', width: 3 },
+    shape: { ...DEFAULT_SHAPE_STATE },
     highlighterStraight: false,
     textDefaults: { fontId: 'sans', size: 22, color: '#16233A', bold: false, italic: false, underline: false, align: 'start' },
     recentColors: ['#1E6FF2', '#16233A'],
@@ -303,6 +367,7 @@ export const useApp = create<AppState>((set, get) => ({
     toolbarHidden: false,
     activeRecording: null,
     audio: { recId: null, playing: false, tMs: 0, sync: true, replay: false },
+    recog: null,
   },
 
   // ------------------------------------------------------------ boot / nav
@@ -828,6 +893,84 @@ export const useApp = create<AppState>((set, get) => ({
     set({ editor: { ...ed, shape: { ...ed.shape, ...patch } } });
   },
 
+  setRecog(recog) {
+    const ed = get().editor;
+    set({ editor: { ...ed, recog } });
+  },
+
+  applyRecognition(pageId, ink, shapes) {
+    const doc = get().editor.docs[pageId];
+    if (!doc || !shapes.length) return;
+    const inkIds = new Set(ink.map((e) => e.id));
+    const shapeIds = new Set(shapes.map((e) => e.id));
+    const setDoc = (withShapes: boolean) => {
+      const d = docClone(get().editor.docs[pageId]);
+      d.elements = d.elements.filter((e) => !(withShapes ? shapeIds : inkIds).has(e.id));
+      d.elements = [...d.elements, ...(withShapes ? shapes : ink).map((e) => ({ ...e }) as PageElement)];
+      set({ editor: { ...get().editor, docs: { ...get().editor.docs, [pageId]: d }, docVersions: { ...get().editor.docVersions, [pageId]: (get().editor.docVersions[pageId] ?? 0) + 1 } } });
+    };
+    // the raw ink is never committed as an element — the single command owns
+    // BOTH directions: run = shapes appear, revert = original ink appears
+    get().pushCmd({
+      label: 'recognize',
+      run: () => setDoc(true),
+      revert: () => setDoc(false),
+    }, [pageId]);
+    set({ editor: { ...get().editor, recog: { pageId, shapeIds: [...shapeIds], ink, at: Date.now() } } });
+    void get().growInfinitePage(pageId, shapes);
+  },
+
+  revertRecognition() {
+    const recog = get().editor.recog;
+    if (!recog) return;
+    const cmd = get().editor.undoStack[get().editor.undoStack.length - 1];
+    set({ editor: { ...get().editor, recog: null } });
+    // the recognition is the newest command in the chip's lifetime — undo
+    // restores the ink atomically (if the user already drew something else,
+    // the chip has expired and this path is not reachable)
+    if (cmd && cmd.label === 'recognize') get().undo();
+  },
+
+  groupSelection() {
+    const { selection, docs } = get().editor;
+    if (!selection || selection.ids.length < 2) return;
+    const doc = docs[selection.pageId];
+    if (!doc) return;
+    const ids = new Set(selection.ids);
+    const gid = uid();
+    const patches: { id: string; before: PageElement; after: PageElement }[] = [];
+    for (const e of doc.elements) {
+      if (!ids.has(e.id)) continue;
+      if ((e as { groupId?: string }).groupId === gid) continue;
+      patches.push({ id: e.id, before: e, after: { ...e, groupId: gid } as PageElement });
+    }
+    if (patches.length >= 2) get().patchElements(selection.pageId, patches, 'group');
+  },
+
+  ungroupSelection() {
+    const { selection, docs } = get().editor;
+    if (!selection) return;
+    const doc = docs[selection.pageId];
+    if (!doc) return;
+    const ids = new Set(selection.ids);
+    const groups = new Set<string>();
+    for (const e of doc.elements) {
+      const gid = (e as { groupId?: string }).groupId;
+      if (gid && ids.has(e.id)) groups.add(gid);
+    }
+    if (!groups.size) return;
+    const patches: { id: string; before: PageElement; after: PageElement }[] = [];
+    for (const e of doc.elements) {
+      const gid = (e as { groupId?: string }).groupId;
+      if (gid && groups.has(gid)) {
+        const after = { ...e } as PageElement;
+        delete (after as { groupId?: string }).groupId;
+        patches.push({ id: e.id, before: e, after });
+      }
+    }
+    if (patches.length) get().patchElements(selection.pageId, patches, 'ungroup');
+  },
+
   setHighlighterStraight(v) {
     const ed = get().editor;
     set({ editor: { ...ed, highlighterStraight: v } });
@@ -1273,6 +1416,44 @@ export const useApp = create<AppState>((set, get) => ({
     });
   },
 
+  // ------------------------------------------------------------ split workspace
+  // layout preferences persist locally (orientation + ratio); WHICH notebook is
+  // in pane B is session-scoped, like editor tabs.
+  openSplit(notebookB, orientation) {
+    const prefs = loadSplitPrefs();
+    set({
+      split: {
+        open: true,
+        orientation: orientation ?? prefs.orientation,
+        ratio: prefs.ratio,
+        notebookB,
+      },
+    });
+  },
+
+  closeSplit() {
+    set({ split: { ...get().split, open: false, notebookB: null } });
+  },
+
+  setSplit(patch) {
+    const next = { ...get().split, ...patch, open: get().split.open };
+    set({ split: next });
+    saveSplitPrefs({ orientation: next.orientation, ratio: next.ratio });
+  },
+
+  swapSplit() {
+    const { split, editor } = get();
+    if (!split.open || !split.notebookB) return;
+    const a = editor.notebookId;
+    const b = split.notebookB;
+    if (!a || a === b) return;
+    // pane A's pending ink must reach disk BEFORE its editor state is swapped
+    get().flushSaves();
+    void get().openEditor(b).then(() => {
+      get().setSplit({ notebookB: a });
+    });
+  },
+
   // ------------------------------------------------------------ audio / recordings
   async loadRecordings(pageId) {
     const recs = (await db.listRecordings()).filter((r) => r.pageId === pageId);
@@ -1368,3 +1549,9 @@ export function useT() {
 }
 
 export type { StrokeEl, ImageEl };
+
+// dev-only test hook: exposes the live store instance on the window object so
+// E2E verification (and field debugging) can inspect/verify app state
+if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+  (window as unknown as { __nanoteStore?: typeof useApp }).__nanoteStore = useApp;
+}

@@ -52,8 +52,9 @@ const outlineCache = new Map<string, CacheEntry>();
 const OUTLINE_CACHE_MAX = 3000;
 
 function getOutline(stroke: StrokeEl, gamma: number): number[] {
-  const sig = `${stroke.points.length}:${stroke.width}:${gamma}:${stroke.tool}:${stroke.points.length ? stroke.points[stroke.points.length - 1].x.toFixed(1) : ''}`;
-  const key = `${stroke.id}`;
+  const a = stroke.points[0], b = stroke.points[stroke.points.length - 1];
+  const sig = `${stroke.points.length}:${stroke.width}:${gamma}:${stroke.tool}:${a ? a.x.toFixed(1) + ',' + a.y.toFixed(1) : ''}:${b ? b.x.toFixed(1) + ',' + b.y.toFixed(1) : ''}`;
+  const key = `${stroke.id}:${stroke.color}`;
   const hit = outlineCache.get(key);
   if (hit && hit.sig === sig) return hit.outline;
   const outline = computeOutline(withSpeed(stroke), { tool: stroke.tool, width: stroke.width, gamma });
@@ -152,12 +153,21 @@ export function drawText(ctx: CanvasRenderingContext2D, el: TextEl) {
 
 export function drawShape(ctx: CanvasRenderingContext2D, el: ShapeEl) {
   ctx.save();
-  shapePath(ctx, el.shape, el.x, el.y, el.w, el.h);
+  // rotation about the shape's center (line-family shapes rotate about the
+  // segment midpoint — (x + w/2, y + h/2) covers both conventions)
+  if (el.rotation) {
+    ctx.translate(el.x + el.w / 2, el.y + el.h / 2);
+    ctx.rotate(el.rotation);
+    ctx.translate(-(el.x + el.w / 2), -(el.y + el.h / 2));
+  }
+  shapePath(ctx, el);
   if (el.fill != null) {
     ctx.fillStyle = el.fill;
+    ctx.globalAlpha = el.fillOpacity != null ? Math.max(0, Math.min(1, el.fillOpacity)) : 1;
     ctx.fill();
+    ctx.globalAlpha = 1;
   }
-  if (el.strokeWidth > 0 && (el.fill == null || el.stroke.toLowerCase() !== el.fill.toLowerCase())) {
+  if (el.strokeWidth > 0 && (el.fill == null || el.stroke.toLowerCase() !== el.fill.toLowerCase() || (el.fillOpacity ?? 1) < 1)) {
     ctx.strokeStyle = el.stroke;
     ctx.lineWidth = el.strokeWidth;
     ctx.lineJoin = 'round';

@@ -1,22 +1,37 @@
 'use client';
 // SelectionLayer — dashed selection box + transform handles + action bar for the
-// lasso selection. Drags (move/scale/rotate) preview on the live overlay and
-// commit as a single undoable command.
+// lasso selection / selected image. Drags (move/scale/rotate) preview on the live
+// overlay and commit as a single undoable command.
+//
+// IMAGE RESIZE — EXACT UNDER ROTATION (the "image moves randomly when resized"
+// fix): a single image resizes through resizeImageCorner() — the OPPOSITE corner
+// stays glued on screen, the pointer is tracked in the image's rotated frame,
+// the aspect ratio locks by default (Shift = free) and the sides clamp to sane
+// min/max bounds. Multi-element selections keep the classic AABB scale.
+//
+// CROP TOOL: single image → Crop in the quick options (or the ⌾ button) starts
+// a crop session — a rotated overlay dims everything outside the crop window,
+// 4 corner handles + rule-of-thirds grid let you frame the region, then
+// Apply commits the visible region as the new image bounds (stored as a
+// normalized source-rect `crop` on the element — fully undoable) and Cancel
+// leaves everything untouched.
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Copy, Scissors, ClipboardPaste, Trash2, CopyPlus, Palette, X, RotateCw, RotateCcw, FlipHorizontal, FlipVertical, BringToFront, SendToBack, Image as ImageIcon, Squircle, Crop, Check } from 'lucide-react';
+import { Copy, Scissors, ClipboardPaste, Trash2, CopyPlus, Palette, X, RotateCw, RotateCcw, FlipHorizontal, FlipVertical, BringToFront, SendToBack, Image as ImageIcon, Squircle, Crop, Check, Shapes, Group, Ungroup, ArrowRightLeft } from 'lucide-react';
 import { toast } from 'sonner';
 import { useApp, useT } from '@/lib/nanote/store';
-import { PageElement, PageDoc, TextEl, ImageEl } from '@/lib/nanote/types';
+import { ImageEl, PageDoc, PageElement, ShapeEl, ShapeType, TextEl, isLineShape } from '@/lib/nanote/types';
 import { drawStroke, drawText, drawShape, drawImageEl } from '@/lib/nanote/render';
 import { resolveImage, imageNatural } from '@/lib/nanote/images';
-import { elementBBox, imageLocalPoint, resizeImageCorner, transformElement, unionBBox } from '@/lib/nanote/geometry';
+import { elementBBoxAccurate, imageLocalPoint, resizeImageCorner, transformElement, unionBBox } from '@/lib/nanote/geometry';
 import { cn } from '@/lib/utils';
 import { Slider } from '@/components/ui/slider';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import {
   Painter, addPainter, getVp, useVp, worldToScreen, setHiddenIds,
   requestOverlayRepaint, requestRepaint, type PageLayout,
 } from './viewport';
 import { ColorPopover } from './ColorPopover';
+import { inEdgeZone, sendElementsToOtherPane, splitActiveHere } from './splitbus';
 
 type Drag =
   | { kind: 'move'; startWorld: { x: number; y: number }; dx: number; dy: number }
@@ -43,12 +58,12 @@ export function SelectionLayer({
   const { t } = useT();
   const dragRef = useRef<Drag>(null);
   const [recolorOpen, setRecolorOpen] = useState(false);
+  const [cropState, setCropState] = useState<{ forId: string; rect: CropRect } | null>(null);
   const [cornersOpen, setCornersOpen] = useState(false);
   const cornerPreviewRef = useRef<number | null>(null); // live slider preview radius
   const cornerPageRef = useRef<string | null>(null);   // page whose ids are hidden for the preview
   const cornersAnchorRef = useRef<HTMLDivElement>(null); // toggle button wrapper (outside-click ignore)
   const [imgOptsOpen, setImgOptsOpen] = useState(false);
-  const [cropState, setCropState] = useState<{ forId: string; rect: CropRect } | null>(null);
   const imgOptsAnchorRef = useRef<HTMLDivElement>(null); // toggle button wrapper (outside-click ignore)
 
   const activePageLayout = useMemo(
@@ -63,8 +78,18 @@ export function SelectionLayer({
 
   const bbox = useMemo(() => {
     if (!selectedEls.length) return null;
-    return unionBBox(selectedEls.map((e) => elementBBox(e, 6)));
+    // pad 0 + measured text bounds → the dashed box matches the real visual
+    // bounds and the resize handles map 1:1 onto it (no “random” sizes)
+    return unionBBox(selectedEls.map((e) => elementBBoxAccurate(e, 0)));
   }, [selectedEls]);
+
+  const interactive = tool === 'lasso' || tool === 'image';
+  const singleImage = selectedEls.length === 1 && selectedEls[0].kind === 'image';
+  const imgEl = singleImage ? (selectedEls[0] as ImageEl) : null;
+  const singleShape = selectedEls.length === 1 && selectedEls[0].kind === 'shape';
+  const shapeEl = singleShape ? (selectedEls[0] as ShapeEl) : null;
+  const rotatable = singleImage || singleShape; // rotate handle owner
+  const splitOn = splitActiveHere();
 
   // hide originals + paint moved copies while dragging; live-preview the
   // corner-radius slider on a selected image (same hidden-ids mechanism)
@@ -95,8 +120,8 @@ export function SelectionLayer({
               drawTransformed(ctx, moved, gamma);
             }
           } else if (drag.kind === 'rotate') {
-            if (el.kind === 'image' && selectedEls.length === 1) {
-              drawTransformed(ctx, { ...el, rotation: drag.rotation }, gamma);
+            if (selectedEls.length === 1 && (el.kind === 'image' || el.kind === 'shape')) {
+              drawTransformed(ctx, { ...(el as ImageEl | ShapeEl), rotation: drag.rotation } as PageElement, gamma);
             } else {
               drawTransformed(ctx, el, gamma);
             }
@@ -131,15 +156,141 @@ export function SelectionLayer({
     const sel = useApp.getState().editor.selection;
     if (!sel) return;
     const st = useApp.getState();
-    const doc = st.editor.docs[sel.pageId];
-    const el = doc?.elements.find((x) => x.id === sel.ids[0]);
+    const d = st.editor.docs[sel.pageId];
+    const el = d?.elements.find((x) => x.id === sel.ids[0]);
     if (!el || el.kind !== 'image' || (el.cornerRadius ?? 0) === radius) return;
     st.patchElements(sel.pageId, [{ id: el.id, before: el, after: { ...el, cornerRadius: radius } }], 'corners');
   };
 
-  const isImageOnly = selectedEls.length === 1 && selectedEls[0].kind === 'image';
-  const interactive = tool === 'lasso' || tool === 'image';
+  // leave crop mode when the image goes away — derived reset (no effect):
+  // `cropping` only computes true while a single image stays selected, and
+  // applyCrop/cancel clear the rect themselves on session end
+  // the crop session belongs to ONE image id — selecting anything else ends it
+  const cropRect = cropState && imgEl && cropState.forId === imgEl.id ? cropState.rect : null;
+  const cropping = !!cropRect && !!imgEl;
+  // ---------------------------------------------------------------- drag handling
+  const startDrag = (e: React.PointerEvent, kind: 'move' | 'resize' | 'rotate', corner?: 'nw' | 'ne' | 'sw' | 'se') => {
+    if (!selection || !bbox || !activePageLayout) return;
+    if (cropping && kind !== 'move') return; // crop session owns the gestures
+    e.stopPropagation();
+    try { (e.target as HTMLElement).setPointerCapture(e.pointerId) } catch { /* pointer gone */ }
+    const host = (e.currentTarget as HTMLElement).closest('[data-viewport]') as HTMLElement;
+    const rect = host.getBoundingClientRect();
+    const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+    const vpNow = getVp();
+    const world = { x: (sx - vpNow.tx) / vpNow.scale, y: (sy - vpNow.ty) / vpNow.scale };
+    // PAGE-LOCAL pointer: element x/y are page-local, but the pointer arrives
+    // in WORLD coords (page stacking offset included). On page 2+ the raw
+    // world point is a full page-height BELOW the element — resizeImageCorner
+    // measured a huge pointer offset and the sticker exploded to its 4096 max
+    // in one frame ("suddenly grows fast and disappears"). Subtract the page
+    // origin so resize/rotate geometry happens in the element's own space.
+    const layoutY = activePageLayout.y;
+    const local = { x: world.x, y: world.y - layoutY };
+    const startEl = kind === 'resize' && singleImage ? imgEl : null;
+    if (kind === 'move') dragRef.current = { kind: 'move', startWorld: world, dx: 0, dy: 0 };
+    if (kind === 'resize' && corner) {
+      dragRef.current = {
+        kind: 'resize', corner, startWorld: world, startBBox: bbox, sx: 1, sy: 1,
+        startEl, previewEl: startEl,
+      };
+    }
+    if (kind === 'rotate') {
+      const target = selectedEls[0] as ImageEl | ShapeEl;
+      const cx = target.x + target.w / 2, cy = target.y + target.h / 2;
+      const startRot = (target as ImageEl).rotation ?? 0;
+      dragRef.current = { kind: 'rotate', startAngle: Math.atan2(local.y - cy, local.x - cx) - startRot, rotation: startRot };
+    }
+    setHiddenIds(selection.pageId, new Set(selection.ids));
 
+    const onMove = (ev: PointerEvent) => {
+      const drag = dragRef.current;
+      if (!drag) return;
+      const v = getVp(); // live viewport — never a stale snapshot
+      const px = ev.clientX - rect.left, py = ev.clientY - rect.top;
+      const w = { x: (px - v.tx) / v.scale, y: (py - v.ty) / v.scale };
+      // page-local pointer (see startDrag) — resize/rotate element geometry
+      const lp = { x: w.x, y: w.y - layoutY };
+      if (drag.kind === 'move') {
+        drag.dx = w.x - drag.startWorld.x;
+        drag.dy = w.y - drag.startWorld.y;
+      } else if (drag.kind === 'resize') {
+        if (drag.startEl) {
+          // single image: exact corner-anchored, rotation-aware, aspect-locked
+          // by default (Shift = free), clamped to min/max side bounds
+          drag.previewEl = resizeImageCorner(drag.startEl, drag.corner, lp, { free: ev.shiftKey });
+        } else {
+          const b = drag.startBBox;
+          const wSpan = Math.max(8, b.x1 - b.x0);
+          const hSpan = Math.max(8, b.y1 - b.y0);
+          let sx = drag.corner === 'nw' || drag.corner === 'sw'
+            ? (b.x1 - w.x) / wSpan
+            : (w.x - b.x0) / wSpan;
+          let sy = drag.corner === 'nw' || drag.corner === 'ne'
+            ? (b.y1 - w.y) / hSpan
+            : (w.y - b.y0) / hSpan;
+          if (ev.shiftKey) { const u = (Math.abs(sx) + Math.abs(sy)) / 2; sx = Math.sign(sx) * u; sy = Math.sign(sy) * u }
+          // clamp to a sane minimum — a handle crossing the opposite edge
+          // shrinks the box instead of exploding it with random geometry
+          drag.sx = Math.min(24, Math.max(0.04, sx));
+          drag.sy = Math.min(24, Math.max(0.04, sy));
+        }
+      } else if (drag.kind === 'rotate') {
+        const target = selectedEls[0] as ImageEl | ShapeEl;
+        const cx = target.x + target.w / 2, cy = target.y + target.h / 2;
+        let rot = Math.atan2(lp.y - cy, lp.x - cx) - drag.startAngle;
+        if (ev.shiftKey) rot = Math.round(rot / (Math.PI / 12)) * (Math.PI / 12); // 15° snapping
+        drag.rotation = rot;
+      }
+      requestOverlayRepaint();
+    };
+    const onUp = (ev: PointerEvent) => {
+      const drag = dragRef.current;
+      dragRef.current = null;
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      if (!drag || !selection || !doc) { setHiddenIds(selection?.pageId ?? '', null); return }
+      const els = doc.elements.filter((el) => selection.ids.includes(el.id));
+      // SPLIT TRANSFER: a move-drag released against the divider-facing edge
+      // sends the selection to the other pane instead of committing the move
+      if (drag.kind === 'move' && splitActiveHere() && inEdgeZone(ev.clientX, ev.clientY)) {
+        const moving = els.map((el) => transformElement(el, { dx: drag.dx, dy: drag.dy }));
+        setHiddenIds(selection.pageId, null);
+        if (moving.length) {
+          useApp.getState().removeElements(selection.pageId, moving.map((e) => e.id));
+          sendElementsToOtherPane(moving);
+          toast.success(t('split.sent', 'Sent to the other pane', 'أُرسل إلى المساحة الأخرى'), { duration: 1800 });
+        }
+        requestRepaint();
+        return;
+      }
+      const changed =
+        (drag.kind === 'move' && (Math.abs(drag.dx) > 0.5 || Math.abs(drag.dy) > 0.5)) ||
+        (drag.kind === 'resize' && (drag.previewEl
+          ? (drag.previewEl.w !== drag.startEl!.w || drag.previewEl.h !== drag.startEl!.h || drag.previewEl.x !== drag.startEl!.x || drag.previewEl.y !== drag.startEl!.y)
+          : (Math.abs(drag.sx - 1) > 0.01 || Math.abs(drag.sy - 1) > 0.01))) ||
+        (drag.kind === 'rotate');
+      if (!changed) { setHiddenIds(selection.pageId, null); requestRepaint(); return }
+      const patches = els.map((el) => {
+        let after: PageElement;
+        if (drag.kind === 'move') after = transformElement(el, { dx: drag.dx, dy: drag.dy });
+        else if (drag.kind === 'resize') {
+          if (drag.previewEl && el.kind === 'image') after = drag.previewEl as PageElement;
+          else after = transformElement(el, { sx: drag.sx, sy: drag.sy, ox: drag.startBBox.x0, oy: drag.startBBox.y0 });
+        }
+        else after = { ...el } as PageElement;
+        if (drag.kind === 'rotate' && (el.kind === 'image' || el.kind === 'shape')) {
+          after = { ...(after as ImageEl | ShapeEl), rotation: drag.rotation } as PageElement;
+        }
+        return { id: el.id, before: el, after };
+      });
+      useApp.getState().patchElements(selection.pageId, patches, drag.kind);
+      setHiddenIds(selection.pageId, null);
+      requestRepaint();
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  };
 
   // ---------------------------------------------------------------- crop session
   const startCrop = () => {
@@ -185,7 +336,7 @@ export function SelectionLayer({
   };
 
   /** Apply the crop window: the visible region becomes the image's new bounds
-   * (a normalized source-rect `crop` on the element — undoable, lossless). */
+   *  (a normalized source-rect `crop` on the element — undoable, lossless). */
   const applyCrop = () => {
     if (!imgEl || !cropRect || !selection) return;
     const nat = imageNatural(imgEl.imageId) ?? { w: imgEl.w, h: imgEl.h };
@@ -222,8 +373,9 @@ export function SelectionLayer({
         h: Math.min(1, (sv1 - sv0) / nat.h),
       },
     };
+    // degenerate full-frame crop → drop the field
     if (after.crop!.x <= 0.001 && after.crop!.y <= 0.001 && after.crop!.w >= 0.999 && after.crop!.h >= 0.999) {
-      delete after.crop; // degenerate full-frame crop → drop the field
+      delete after.crop;
     }
     useApp.getState().patchElements(selection.pageId, [{ id: imgEl.id, before: imgEl, after }], 'image');
     setCropState(null);
@@ -231,135 +383,28 @@ export function SelectionLayer({
     toast.success(t('tool.image.crop.done', 'Cropped', 'تم القص'));
   };
 
-  // ---------------------------------------------------------------- drag handling
-  const startDrag = (e: React.PointerEvent, kind: 'move' | 'resize' | 'rotate', corner?: 'nw' | 'ne' | 'sw' | 'se') => {
-    if (!selection || !bbox || !activePageLayout) return;
-    if (cropping && kind !== 'move') return; // the crop session owns the gestures
-    e.stopPropagation();
-    try { (e.target as HTMLElement).setPointerCapture(e.pointerId) } catch { /* pointer gone */ }
-    const host = (e.currentTarget as HTMLElement).closest('[data-viewport]') as HTMLElement;
-    const rect = host.getBoundingClientRect();
-    const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
-    const world = { x: (sx - vp.tx) / vp.scale, y: (sy - vp.ty) / vp.scale };
-    // PAGE-LOCAL pointer: element x/y are page-local, but the pointer arrives
-    // in WORLD coords (page stacking offset included). On page 2+ the raw
-    // world point is a full page-height BELOW the element — resizeImageCorner
-    // measured a huge pointer offset and the sticker exploded to its 4096 max
-    // in one frame ("suddenly grows fast and disappears"). Subtract the page
-    // origin so resize/rotate geometry happens in the element's own space.
-    const layoutY = activePageLayout.y;
-    const local = { x: world.x, y: world.y - layoutY };
-    const startEl = kind === 'resize' && singleImage && imgEl ? imgEl : null;
-    if (kind === 'move') dragRef.current = { kind: 'move', startWorld: world, dx: 0, dy: 0 };
-    if (kind === 'resize' && corner) dragRef.current = { kind: 'resize', corner, startWorld: world, startBBox: bbox, sx: 1, sy: 1, startEl, previewEl: startEl };
-    if (kind === 'rotate') {
-      const img = selectedEls[0] as Extract<PageElement, { kind: 'image' }>;
-      const cx = img.x + img.w / 2, cy = img.y + img.h / 2;
-      dragRef.current = { kind: 'rotate', startAngle: Math.atan2(local.y - cy, local.x - cx) - img.rotation, rotation: img.rotation };
-    }
-    setHiddenIds(selection.pageId, new Set(selection.ids));
-
-    const onMove = (ev: PointerEvent) => {
-      const drag = dragRef.current;
-      if (!drag) return;
-      const v = getVp(); // live viewport — never a stale snapshot mid-gesture
-      const px = ev.clientX - rect.left, py = ev.clientY - rect.top;
-      const w = { x: (px - v.tx) / v.scale, y: (py - v.ty) / v.scale };
-      // page-local pointer (see startDrag) — resize/rotate element geometry
-      const lp = { x: w.x, y: w.y - layoutY };
-      if (drag.kind === 'move') {
-        drag.dx = w.x - drag.startWorld.x;
-        drag.dy = w.y - drag.startWorld.y;
-      } else if (drag.kind === 'resize') {
-        if (drag.startEl) {
-          // single image: exact corner-anchored, rotation-aware, aspect-locked
-          // by default (Shift = free), clamped to min/max side bounds — the
-          // opposite corner stays GLUED to the screen (the old AABB scaling
-          // visibly swam rotated images around)
-          drag.previewEl = resizeImageCorner(drag.startEl, drag.corner, lp, { free: ev.shiftKey });
-        }
-        const b = drag.startBBox;
-        const wSpan = Math.max(8, b.x1 - b.x0);
-        const hSpan = Math.max(8, b.y1 - b.y0);
-        let sx = drag.corner === 'nw' || drag.corner === 'sw'
-          ? (b.x1 - w.x) / wSpan
-          : (w.x - b.x0) / wSpan;
-        let sy = drag.corner === 'nw' || drag.corner === 'ne'
-          ? (b.y1 - w.y) / hSpan
-          : (w.y - b.y0) / hSpan;
-        if (ev.shiftKey) { const u = (Math.abs(sx) + Math.abs(sy)) / 2; sx = Math.sign(sx) * u; sy = Math.sign(sy) * u }
-        drag.sx = Math.max(0.05, sx);
-        drag.sy = Math.max(0.05, sy);
-      } else if (drag.kind === 'rotate') {
-        const img = selectedEls[0] as Extract<PageElement, { kind: 'image' }>;
-        const cx = img.x + img.w / 2, cy = img.y + img.h / 2;
-        let rot = Math.atan2(lp.y - cy, lp.x - cx) - drag.startAngle;
-        if (ev.shiftKey) rot = Math.round(rot / (Math.PI / 12)) * (Math.PI / 12); // 15° snapping
-        drag.rotation = rot;
-      }
-      requestOverlayRepaint();
-    };
-    const onUp = () => {
-      const drag = dragRef.current;
-      dragRef.current = null;
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-      if (!drag || !selection || !doc) { setHiddenIds(selection?.pageId ?? '', null); return }
-      const els = doc.elements.filter((el) => selection.ids.includes(el.id));
-      const changed =
-        (drag.kind === 'move' && (Math.abs(drag.dx) > 0.5 || Math.abs(drag.dy) > 0.5)) ||
-        (drag.kind === 'resize' && (drag.previewEl
-          ? (drag.previewEl.w !== drag.startEl!.w || drag.previewEl.h !== drag.startEl!.h || drag.previewEl.x !== drag.startEl!.x || drag.previewEl.y !== drag.startEl!.y)
-          : (Math.abs(drag.sx - 1) > 0.01 || Math.abs(drag.sy - 1) > 0.01))) ||
-        (drag.kind === 'rotate');
-      if (!changed) { setHiddenIds(selection.pageId, null); requestRepaint(); return }
-      const patches = els.map((el) => {
-        let after: PageElement;
-        if (drag.kind === 'move') after = transformElement(el, { dx: drag.dx, dy: drag.dy });
-        else if (drag.kind === 'resize') {
-          if (drag.previewEl && el.kind === 'image') after = drag.previewEl as PageElement;
-          else after = transformElement(el, { sx: drag.sx, sy: drag.sy, ox: drag.startBBox.x0, oy: drag.startBBox.y0 });
-        }
-        else after = { ...el } as PageElement;
-        if (drag.kind === 'rotate' && el.kind === 'image') {
-          after = { ...(after as Extract<PageElement, { kind: 'image' }>), rotation: drag.rotation } as PageElement;
-        }
-        return { id: el.id, before: el, after };
-      });
-      useApp.getState().patchElements(selection.pageId, patches, drag.kind);
-      setHiddenIds(selection.pageId, null);
-      requestRepaint();
-    };
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
-  };
-
   if (!selection || !bbox || !activePageLayout) return null;
 
   const tl = worldToScreen(bbox.x0, activePageLayout.y + bbox.y0);
   const br = worldToScreen(bbox.x1, activePageLayout.y + bbox.y1);
   const boxW = br.x - tl.x, boxH = br.y - tl.y;
-  const singleImage = selectedEls.length === 1 && selectedEls[0].kind === 'image';
-  const imgEl = singleImage ? (selectedEls[0] as Extract<PageElement, { kind: 'image' }>) : null;
-  const rotC = imgEl ? worldToScreen(imgEl.x + imgEl.w / 2, activePageLayout.y + imgEl.y + imgEl.h / 2) : null;
-  const rotHandle = imgEl && rotC
-    ? { x: rotC.x + Math.cos(imgEl.rotation) * (boxH / 2 + 34), y: rotC.y + Math.sin(imgEl.rotation) * (boxH / 2 + 34) }
+  // structural view of the rotate target (image or shape — both carry a box + rotation)
+  const rotTarget: { x: number; y: number; w: number; h: number; rotation?: number } | null = imgEl ?? shapeEl;
+  const rotC = rotTarget ? worldToScreen(rotTarget.x + rotTarget.w / 2, activePageLayout.y + rotTarget.y + rotTarget.h / 2) : null;
+  const rotHandle = rotTarget && rotC
+    ? { x: rotC.x + Math.cos(rotTarget.rotation ?? 0) * (boxH / 2 + 34), y: rotC.y + Math.sin(rotTarget.rotation ?? 0) * (boxH / 2 + 34) }
     : null;
-
-  // the crop session belongs to ONE image id — selecting anything else ends it
-  const cropRect = cropState && imgEl && cropState.forId === imgEl.id ? cropState.rect : null;
-  const cropping = !!cropRect && !!imgEl;
 
   const barTop = tl.y - 52 < 8 ? br.y + 12 : tl.y - 52;
 
-  // ---- crop overlay (rotated frame riding the image, dim outside the window)
+  // ---- crop overlay geometry (image-local frame, drawn rotated on screen)
   const cropOverlay = (() => {
     if (!cropping || !imgEl || !cropRect || !rotC) return null;
-    const sc = vp.scale;
-    const imgW = imgEl.w * sc, imgH = imgEl.h * sc;
-    const cw = (cropRect.x1 - cropRect.x0) * sc;
-    const ch = (cropRect.y1 - cropRect.y0) * sc;
-    const cx0 = cropRect.x0 * sc, cy0 = cropRect.y0 * sc;
+    const s = vp.scale;
+    const imgW = imgEl.w * s, imgH = imgEl.h * s;
+    const cw = (cropRect.x1 - cropRect.x0) * s;
+    const ch = (cropRect.y1 - cropRect.y0) * s;
+    const cx0 = cropRect.x0 * s, cy0 = cropRect.y0 * s;
     const cornerAt = (c: 'nw' | 'ne' | 'sw' | 'se') => ({
       left: (c === 'nw' || c === 'sw' ? cx0 : cx0 + cw) - 14,
       top: (c === 'nw' || c === 'ne' ? cy0 : cy0 + ch) - 14,
@@ -413,7 +458,7 @@ export function SelectionLayer({
 
   return (
     <>
-      {/* crop Apply/Cancel bar (replaces the normal bar during a crop session) */}
+      {/* action bar */}
       {cropping ? (
         <div
           className="absolute z-40 flex items-center gap-1 rounded-full border border-border bg-card/95 p-1 shadow-ink-2 backdrop-blur"
@@ -427,101 +472,167 @@ export function SelectionLayer({
           <SBtn label={t('common.apply', 'Apply', 'تطبيق')} onClick={applyCrop}><Check className="h-4 w-4 text-emerald-600" /></SBtn>
         </div>
       ) : (
-      <div
-        className="absolute z-30 flex items-center gap-0.5 rounded-full border border-border bg-card/95 p-1 shadow-ink-2 backdrop-blur"
-        style={{ left: Math.max(8, Math.min(tl.x, window.innerWidth - 320)), top: Math.max(8, barTop), pointerEvents: 'auto' }}
-        dir="ltr"
-      >
-        <SBtn label={t('lasso.duplicate')} onClick={() => useApp.getState().duplicateSelection()}><CopyPlus className="h-4 w-4" /></SBtn>
-        <SBtn label={t('lasso.copy')} onClick={() => { useApp.getState().copySelection(); toast.success(t('lasso.copy')) }}><Copy className="h-4 w-4" /></SBtn>
-        <SBtn label={t('lasso.cut')} onClick={() => useApp.getState().cutSelection()}><Scissors className="h-4 w-4" /></SBtn>
-        <SBtn label={t('lasso.paste')} disabled={!clipboard} onClick={() => { const ok = useApp.getState().pasteClipboard(selection.pageId); if (!ok) toast(t('lasso.empty')) }}><ClipboardPaste className="h-4 w-4" /></SBtn>
-        <div className="relative">
-          <SBtn label={t('lasso.recolor')} onClick={() => setRecolorOpen((v) => !v)}><Palette className="h-4 w-4" /></SBtn>
-          {recolorOpen && (
-            <div className="absolute start-0 top-10 z-40" style={{ pointerEvents: 'auto' }}>
-              <ColorPopover
-                current={selectedEls[0]?.kind === 'stroke' || selectedEls[0]?.kind === 'text' ? (selectedEls[0] as TextEl).color : (selectedEls[0] as { color?: string })?.color ?? '#1E6FF2'}
-                onPick={(hex) => { useApp.getState().recolorSelection(hex); setRecolorOpen(false) }}
-                onClose={() => setRecolorOpen(false)}
-              />
-            </div>
-          )}
-        </div>
-        {singleImage && imgEl && doc && (
-          <div className="relative" ref={imgOptsAnchorRef}>
-            <SBtn label={t('tool.image.options')} onClick={() => { setImgOptsOpen((v) => !v); setCornersOpen(false) }}><ImageIcon className="h-4 w-4" /></SBtn>
-            {imgOptsOpen && (
-              <ImageOptionsPopover
-                key={imgEl.id}
-                imgEl={imgEl}
-                doc={doc}
-                anchorRef={imgOptsAnchorRef}
-                onCrop={startCrop}
-                onClose={() => setImgOptsOpen(false)}
-              />
-            )}
-          </div>
-        )}
-        {singleImage && (
-          <div className="relative" ref={cornersAnchorRef}>
-            <SBtn label={t('tool.image.corners')} onClick={() => { setCornersOpen((v) => !v); setImgOptsOpen(false) }}><Squircle className="h-4 w-4" /></SBtn>
-            {cornersOpen && imgEl && (
+        <div
+          className="absolute z-30 flex items-center gap-0.5 rounded-full border border-border bg-card/95 p-1 shadow-ink-2 backdrop-blur"
+          style={{ left: Math.max(8, Math.min(tl.x, window.innerWidth - 320)), top: Math.max(8, barTop), pointerEvents: 'auto' }}
+          dir="ltr"
+        >
+          <SBtn label={t('lasso.duplicate')} onClick={() => useApp.getState().duplicateSelection()}><CopyPlus className="h-4 w-4" /></SBtn>
+          <SBtn label={t('lasso.copy')} onClick={() => { useApp.getState().copySelection(); toast.success(t('lasso.copy')) }}><Copy className="h-4 w-4" /></SBtn>
+          <SBtn label={t('lasso.cut')} onClick={() => useApp.getState().cutSelection()}><Scissors className="h-4 w-4" /></SBtn>
+          <SBtn label={t('lasso.paste')} disabled={!clipboard} onClick={() => { const ok = useApp.getState().pasteClipboard(selection.pageId); if (!ok) toast(t('lasso.empty')) }}><ClipboardPaste className="h-4 w-4" /></SBtn>
+          <div className="relative">
+            <SBtn label={t('lasso.recolor')} onClick={() => setRecolorOpen((v) => !v)}><Palette className="h-4 w-4" /></SBtn>
+            {recolorOpen && (
               <div className="absolute start-0 top-10 z-40" style={{ pointerEvents: 'auto' }}>
-                <CornersPopover
-                  key={imgEl.id}
-                  imgEl={imgEl}
-                  anchorRef={cornersAnchorRef}
-                  onPreview={previewCorners}
-                  onCommit={commitCorners}
-                  onClose={() => { previewCorners(null); setCornersOpen(false) }}
+                <ColorPopover
+                  current={selectedEls[0]?.kind === 'stroke' || selectedEls[0]?.kind === 'text' ? (selectedEls[0] as TextEl).color : (selectedEls[0] as { color?: string })?.color ?? '#1E6FF2'}
+                  onPick={(hex) => { useApp.getState().recolorSelection(hex); setRecolorOpen(false) }}
+                  onClose={() => setRecolorOpen(false)}
                 />
               </div>
             )}
           </div>
-        )}
-        {singleImage && imgEl && (
-          <SBtn label={t('tool.image.crop', 'Crop image', 'قص الصورة')} onClick={startCrop}><Crop className="h-4 w-4" /></SBtn>
-        )}
-        <SBtn label={t('lasso.delete')} onClick={() => useApp.getState().deleteSelection()}><Trash2 className="h-4 w-4 text-destructive" /></SBtn>
-        <SBtn label={t('lasso.clear')} onClick={() => useApp.getState().setSelection(null)}><X className="h-4 w-4" /></SBtn>
-      </div>
+          {/* image quick options — one-tap transforms (rotate ±90°, flips, z-order) */}
+          {singleImage && imgEl && doc && (
+            <div className="relative" ref={imgOptsAnchorRef}>
+              <SBtn label={t('tool.image.options')} onClick={() => { setImgOptsOpen((v) => !v); setCornersOpen(false) }}><ImageIcon className="h-4 w-4" /></SBtn>
+              {imgOptsOpen && (
+                <ImageOptionsPopover
+                  key={imgEl.id}
+                  imgEl={imgEl}
+                  doc={doc}
+                  anchorRef={imgOptsAnchorRef}
+                  onCrop={startCrop}
+                  onClose={() => setImgOptsOpen(false)}
+                />
+              )}
+            </div>
+          )}
+          {/* corner radius (single selected image) */}
+          {singleImage && (
+            <div className="relative" ref={cornersAnchorRef}>
+              <SBtn label={t('tool.image.corners')} onClick={() => { setCornersOpen((v) => !v); setImgOptsOpen(false) }}><Squircle className="h-4 w-4" /></SBtn>
+              {cornersOpen && imgEl && (
+                <div className="absolute start-0 top-10 z-40" style={{ pointerEvents: 'auto' }}>
+                  <CornersPopover
+                    key={imgEl.id}
+                    imgEl={imgEl}
+                    anchorRef={cornersAnchorRef}
+                    onPreview={previewCorners}
+                    onCommit={commitCorners}
+                    onClose={() => { previewCorners(null); setCornersOpen(false) }}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+          {/* shape quick options — single shape selected */}
+          {singleShape && shapeEl && doc && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label={t('tool.shape.options', 'Shape options', 'خيارات الشكل')}
+                  title={t('tool.shape.options', 'Shape options', 'خيارات الشكل')}
+                  className="flex h-8 w-8 items-center justify-center rounded-full text-foreground transition-colors press-scale hover:bg-accent active:bg-accent"
+                >
+                  <Shapes className="h-4 w-4" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="w-56">
+                <DropdownMenuItem onClick={() => patchShape(shapeEl, { rotation: normRad((shapeEl.rotation ?? 0) + Math.PI / 2) })}>
+                  <RotateCw className="h-4 w-4" /> {t('tool.image.rotate90')}
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => patchShape(shapeEl, { rotation: normRad((shapeEl.rotation ?? 0) - Math.PI / 2) })}>
+                  <RotateCcw className="h-4 w-4" /> {t('tool.image.rotate90ccw')}
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => patchShape(shapeEl, shapeEl.fill != null ? { fill: null } : { fill: shapeEl.stroke })}>
+                  <Shapes className="h-4 w-4" /> {shapeEl.fill != null ? t('tool.shape.strokeOnly') : t('tool.shape.fill')}
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <div className="px-2 py-1 text-[11px] font-semibold text-muted-foreground">{t('tool.shape.morph', 'Change shape', 'تغيير الشكل')}</div>
+                <div className="grid grid-cols-4 gap-1 px-1.5 pb-1.5">
+                  {morphTargets(shapeEl.shape).map((s) => (
+                    <button
+                      key={s.id}
+                      type="button"
+                      title={s.label}
+                      aria-label={s.label}
+                      onClick={() => patchShape(shapeEl, { shape: s.id as ShapeType })}
+                      className={cn('flex h-9 items-center justify-center rounded-lg', s.id === shapeEl.shape ? 'bg-accent' : 'hover:bg-accent')}
+                    >
+                      <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" style={{ width: 18, height: 18 }}>
+                        <path d={s.d} />
+                      </svg>
+                    </button>
+                  ))}
+                </div>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+          {/* grouping: bind several elements as one unit */}
+          {selectedEls.length >= 2 && (
+            <SBtn label={t('lasso.group', 'Group', 'تجميع')} onClick={() => { useApp.getState().groupSelection(); toast.success(t('lasso.group.done', 'Grouped', 'تم التجميع'), { duration: 1600 }) }}>
+              <Group className="h-4 w-4" />
+            </SBtn>
+          )}
+          {selectedEls.some((e) => (e as { groupId?: string }).groupId) && (
+            <SBtn label={t('lasso.ungroup', 'Ungroup', 'إلغاء التجميع')} onClick={() => { useApp.getState().ungroupSelection(); toast.success(t('lasso.ungroup.done', 'Ungrouped', 'تم إلغاء التجميع'), { duration: 1600 }) }}>
+              <Ungroup className="h-4 w-4" />
+            </SBtn>
+          )}
+          {/* split workspace: send the selection to the other pane */}
+          {splitOn && (
+            <SBtn label={t('split.send', 'Send to other pane', 'إرسال للمساحة الأخرى')} onClick={() => {
+              const els = selectedEls.map((e) => ({ ...e }) as PageElement);
+              if (!els.length) return;
+              useApp.getState().removeElements(selection!.pageId, els.map((e) => e.id));
+              sendElementsToOtherPane(els);
+              toast.success(t('split.sent', 'Sent to the other pane', 'أُرسل إلى المساحة الأخرى'), { duration: 1800 });
+            }}>
+              <ArrowRightLeft className="h-4 w-4" />
+            </SBtn>
+          )}
+          <SBtn label={t('lasso.delete')} onClick={() => useApp.getState().deleteSelection()}><Trash2 className="h-4 w-4 text-destructive" /></SBtn>
+          <SBtn label={t('lasso.clear')} onClick={() => useApp.getState().setSelection(null)}><X className="h-4 w-4" /></SBtn>
+        </div>
       )}
 
-      {/* crop overlay (dim + grid + corner handles) */}
+      {/* crop overlay (replaces the plain box + handles while cropping) */}
       {cropOverlay}
 
       {/* box + handles */}
       {!cropping && (
-      <div
-        className="absolute z-20 rounded-[3px]"
-        style={{
-          left: tl.x, top: tl.y, width: Math.max(6, boxW), height: Math.max(6, boxH),
-          border: `1.6px dashed #1E6FF2`,
-          pointerEvents: interactive ? 'auto' : 'none',
-          cursor: interactive ? 'move' : 'default',
-          touchAction: 'none',
-        }}
-        onPointerDown={(e) => startDrag(e, 'move')}
-      >
-        {(['nw', 'ne', 'sw', 'se'] as const).map((c) => (
-          <div
-            key={c}
-            className={cn('absolute h-4 w-4 rounded-full border-2 border-white bg-primary shadow-ink-1', {
-              '-start-2 -top-2': c === 'nw',
-              '-end-2 -top-2': c === 'ne',
-              '-start-2 -bottom-2': c === 'sw',
-              '-end-2 -bottom-2': c === 'se',
-            })}
-            style={{ pointerEvents: interactive ? 'auto' : 'none', cursor: `${c}-resize`, touchAction: 'none' }}
-            onPointerDown={(e) => startDrag(e, 'resize', c)}
-          />
-        ))}
-      </div>
+        <div
+          className="absolute z-20 rounded-[3px]"
+          style={{
+            left: tl.x, top: tl.y, width: Math.max(6, boxW), height: Math.max(6, boxH),
+            border: `1.6px dashed #1E6FF2`,
+            pointerEvents: interactive ? 'auto' : 'none',
+            cursor: interactive ? 'move' : 'default',
+            touchAction: 'none',
+          }}
+          onPointerDown={(e) => startDrag(e, 'move')}
+        >
+          {(['nw', 'ne', 'sw', 'se'] as const).map((c) => (
+            <div
+              key={c}
+              className={cn('absolute h-4 w-4 rounded-full border-2 border-white bg-primary shadow-ink-1', {
+                '-start-2 -top-2': c === 'nw',
+                '-end-2 -top-2': c === 'ne',
+                '-start-2 -bottom-2': c === 'sw',
+                '-end-2 -bottom-2': c === 'se',
+              })}
+              style={{ pointerEvents: interactive ? 'auto' : 'none', cursor: `${c}-resize`, touchAction: 'none' }}
+              onPointerDown={(e) => startDrag(e, 'resize', c)}
+            />
+          ))}
+        </div>
       )}
 
-      {/* rotate handle for single image */}
-      {interactive && !cropping && rotHandle && singleImage && (
+      {/* rotate handle for a single image or shape */}
+      {interactive && !cropping && rotHandle && rotatable && (
         <div
           className="absolute z-20 flex h-8 w-8 items-center justify-center rounded-full border-2 border-white bg-primary text-white shadow-ink-1"
           style={{ left: rotHandle.x - 16, top: rotHandle.y - 16, pointerEvents: 'auto', cursor: 'grab', touchAction: 'none' }}
@@ -546,14 +657,13 @@ function drawTransformed(ctx: CanvasRenderingContext2D, el: PageElement, gamma: 
   }
 }
 
-/** radians normalized to (-π, π] */
+/** keep rotations within [0, 2π) */
 function normRad(r: number): number {
-  r = r % (Math.PI * 2);
-  if (r > Math.PI) r -= Math.PI * 2;
-  if (r < -Math.PI) r += Math.PI * 2;
-  return r;
+  const TAU = Math.PI * 2;
+  return ((r % TAU) + TAU) % TAU;
 }
 
+/** apply an image quick-option as one undoable patch (z / flip / rotation) */
 function patchImage(el: ImageEl, patch: Partial<ImageEl>) {
   const sel = useApp.getState().editor.selection;
   if (!sel) return;
@@ -563,6 +673,38 @@ function patchImage(el: ImageEl, patch: Partial<ImageEl>) {
     'image',
   );
   requestRepaint();
+}
+
+/** apply a shape quick-option as one undoable patch (rotation / fill / type) */
+function patchShape(el: ShapeEl, patch: Partial<ShapeEl>) {
+  const sel = useApp.getState().editor.selection;
+  if (!sel) return;
+  useApp.getState().patchElements(
+    sel.pageId,
+    [{ id: el.id, before: el, after: { ...el, ...patch } }],
+    'shape',
+  );
+  requestRepaint();
+}
+
+/** shape-type morph targets — geometrically compatible families: line-like
+ *  shapes can become each other, frame shapes can become each other. */
+function morphTargets(current: ShapeType): { id: ShapeType; label: string; d: string }[] {
+  const line = isLineShape(current);
+  const defs: { id: ShapeType; label: string; d: string }[] = [
+    { id: 'line', label: 'Line', d: 'M4 12h16' },
+    { id: 'arrow', label: 'Arrow', d: 'M4 12h14M13 6l6 6-6 6' },
+    { id: 'darrow', label: 'Double arrow', d: 'M7 6l-4 6 4 6M4 12h16M17 6l4 6-4 6' },
+    { id: 'arc', label: 'Arc', d: 'M4 17c0-7 16-7 16 0' },
+    { id: 'rect', label: 'Rectangle', d: 'M4 6h16v12H4z' },
+    { id: 'rrect', label: 'Rounded rect', d: 'M6 6h12a2 2 0 012 2v8a2 2 0 01-2 2H6a2 2 0 01-2-2V8a2 2 0 012-2z' },
+    { id: 'ellipse', label: 'Ellipse', d: 'M12 5a8 7 0 100 14 8 7 0 100-14z' },
+    { id: 'triangle', label: 'Triangle', d: 'M12 5l8 14H4z' },
+    { id: 'star', label: 'Star', d: 'M12 3l2.7 5.8 6.3.7-4.7 4.3 1.3 6.2L12 17l-5.6 3 1.3-6.2L3 9.5l6.3-.7z' },
+    { id: 'hexagon', label: 'Hexagon', d: 'M12 4l7 4v8l-7 4-7-4V8z' },
+    { id: 'polygon', label: 'Polygon', d: 'M12 4l7.7 5.6-2.9 9H7.2l-2.9-9z' },
+  ];
+  return defs.filter((d) => (isLineShape(d.id) === line) && d.id !== current);
 }
 
 /** image quick options — one-tap transforms (rotate ±90°, flips, z-order) */

@@ -374,6 +374,7 @@ function PenPopover({ railPos, railOnRight, anchor }: { railPos: RailPos; railOn
   const lastPen = useApp((s) => s.editor.lastPen);
   const toolStates = useApp((s) => s.editor.toolStates);
   const shapeDetection = useApp((s) => s.settings.shapeDetection);
+  const recogMode = useApp((s) => s.settings.shapeRecogMode);
   const setSettings = useApp((s) => s.setSettings);
   const setTool = useApp((s) => s.setTool);
   const setToolState = useApp((s) => s.setToolState);
@@ -424,6 +425,22 @@ function PenPopover({ railPos, railOnRight, anchor }: { railPos: RailPos; railOn
           aria-label={t('tool.shapeDetect')}
         />
       </div>
+      {/* recognition timing: hold to morph live, or convert on pen lift */}
+      {shapeDetection && (
+        <div className="mt-2 grid grid-cols-2 gap-1.5" role="group" aria-label={t('tool.shapeDetect.mode', 'Recognition mode', 'وضع التعرف')}>
+          {(['hold', 'penlift'] as const).map((m) => (
+            <button
+              key={m}
+              type="button"
+              aria-pressed={recogMode === m}
+              onClick={() => void setSettings({ shapeRecogMode: m })}
+              className={cn('rounded-lg px-2 py-2 text-xs font-medium press-scale', recogMode === m ? 'bg-accent text-accent-foreground' : 'hover:bg-surface-variant')}
+            >
+              {t(`tool.shapeDetect.${m}`, m === 'hold' ? 'Hold to recognize' : 'Recognize on pen lift', m === 'hold' ? 'استمر بالضغط للتعرف' : 'التعرف عند رفع القلم')}
+            </button>
+          ))}
+        </div>
+      )}
       <div className="relative mt-3">
         <button
           type="button"
@@ -649,54 +666,103 @@ function ShapePopover({ railPos, railOnRight, anchor }: { railPos: RailPos; rail
   const shape = useApp((s) => s.editor.shape);
   const setShape = useApp((s) => s.setShape);
   const [colorOpen, setColorOpen] = useState(false);
+  const [fillOpen, setFillOpen] = useState(false);
+
   const shapes: { id: ShapeType; label: string; d: string }[] = [
     { id: 'line', label: t('tool.shape.line'), d: 'M4 12h16' },
     { id: 'arrow', label: t('tool.shape.arrow'), d: 'M4 12h14M13 6l6 6-6 6' },
+    { id: 'darrow', label: t('tool.shape.darrow', 'Double arrow', 'سهم مزدوج'), d: 'M7 6l-4 6 4 6M4 12h16M17 6l4 6-4 6' },
+    { id: 'arc', label: t('tool.shape.arc', 'Arc', 'قوس'), d: 'M4 17c0-7 16-7 16 0' },
     { id: 'rect', label: t('tool.shape.rect'), d: 'M4 6h16v12H4z' },
     { id: 'rrect', label: t('tool.shape.rrect'), d: 'M6 6h12a2 2 0 012 2v8a2 2 0 01-2 2H6a2 2 0 01-2-2V8a2 2 0 012-2z' },
     { id: 'ellipse', label: t('tool.shape.ellipse'), d: 'M12 5a8 7 0 100 14 8 7 0 100-14z' },
     { id: 'triangle', label: t('tool.shape.triangle'), d: 'M12 5l8 14H4z' },
     { id: 'star', label: t('tool.shape.star'), d: 'M12 3l2.7 5.8 6.3.7-4.7 4.3 1.3 6.2L12 17l-5.6 3 1.3-6.2L3 9.5l6.3-.7z' },
+    { id: 'hexagon', label: t('tool.shape.hexagon', 'Hexagon', 'سداسي'), d: 'M12 4l7 4v8l-7 4-7-4V8z' },
+    { id: 'polygon', label: t('tool.shape.polygon', 'Polygon', 'مضلع'), d: 'M12 4l7.7 5.6-2.9 9H7.2l-2.9-9z' },
+    { id: 'freeform', label: t('tool.shape.freeform', 'Freeform', 'شكل حر'), d: 'M5 18c1-8 5-12 7-9s-1 6 2 6 4-3 5-5' },
   ];
+
+  const activeFill = shape.fillColor ?? (shape.filled ? shape.color : null);
+
   return (
     <Pop railPos={railPos} railOnRight={railOnRight} anchor={anchor}>
-      <div className="mb-2 grid grid-cols-4 gap-1.5">
+      <div className="grid grid-cols-4 gap-1.5">
         {shapes.map((s) => (
           <button
             key={s.id}
             type="button"
             aria-label={s.label}
             title={s.label}
+            aria-pressed={shape.type === s.id}
             onClick={() => setShape({ type: s.id })}
             className={cn('flex h-11 items-center justify-center rounded-lg press-scale', shape.type === s.id ? 'bg-accent text-accent-foreground' : 'hover:bg-surface-variant')}
           >
-            <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+            <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth={s.id === 'freeform' ? 2.4 : 1.7} strokeLinecap="round" strokeLinejoin="round">
               <path d={s.d} />
             </svg>
           </button>
         ))}
       </div>
-      <div className="mb-2 grid grid-cols-2 gap-1.5">
+
+      {shape.type === 'polygon' && (
+        <div className="mt-3">
+          <div className="mb-1 flex items-center justify-between text-xs font-medium text-muted-foreground">
+            <span>{t('tool.shape.sides', 'Sides', 'الأضلاع')}</span>
+            <span className="tabular-nums">{shape.sides}</span>
+          </div>
+          <Slider
+            value={[shape.sides]}
+            min={3}
+            max={12}
+            step={1}
+            onValueChange={(v) => setShape({ sides: Math.round(v[0]) })}
+            aria-label={t('tool.shape.sides', 'Sides', 'الأضلاع')}
+          />
+        </div>
+      )}
+
+      {/* border width */}
+      <div className="mb-1 mt-3 flex items-center justify-between text-xs font-medium text-muted-foreground">
+        <span>{t('tool.width')}</span>
+        <span className="tabular-nums">{shape.width.toFixed(0)}</span>
+      </div>
+      <Slider value={[shape.width]} min={1} max={16} step={0.5} onValueChange={(v) => setShape({ width: v[0] })} aria-label={t('tool.width')} />
+
+      {/* fill color + opacity */}
+      <div className="mt-3 grid grid-cols-2 gap-1.5">
         <button
           type="button"
-          onClick={() => setShape({ filled: false })}
-          className={cn('rounded-lg px-2 py-2 text-xs font-medium press-scale', !shape.filled ? 'bg-accent text-accent-foreground' : 'hover:bg-surface-variant')}
+          onClick={() => setShape({ fillColor: null, filled: false })}
+          className={cn('rounded-lg px-2 py-2 text-xs font-medium press-scale', activeFill == null ? 'bg-accent text-accent-foreground' : 'hover:bg-surface-variant')}
         >
           {t('tool.shape.strokeOnly')}
         </button>
         <button
           type="button"
-          onClick={() => setShape({ filled: true })}
-          className={cn('rounded-lg px-2 py-2 text-xs font-medium press-scale', shape.filled ? 'bg-accent text-accent-foreground' : 'hover:bg-surface-variant')}
+          onClick={() => setShape({ fillColor: activeFill ?? shape.color, filled: false })}
+          className={cn('rounded-lg px-2 py-2 text-xs font-medium press-scale', activeFill != null ? 'bg-accent text-accent-foreground' : 'hover:bg-surface-variant')}
         >
           {t('tool.shape.fill')}
         </button>
       </div>
-      <div className="mb-1 flex items-center justify-between text-xs font-medium text-muted-foreground">
-        <span>{t('tool.width')}</span>
-        <span className="tabular-nums">{shape.width.toFixed(0)}</span>
-      </div>
-      <Slider value={[shape.width]} min={1} max={16} step={0.5} onValueChange={(v) => setShape({ width: v[0] })} aria-label={t('tool.width')} />
+      {activeFill != null && (
+        <>
+          <div className="mb-1 mt-2 flex items-center justify-between text-xs font-medium text-muted-foreground">
+            <span>{t('tool.shape.fillOpacity', 'Fill opacity', 'شفافية التعبئة')}</span>
+            <span className="tabular-nums">{Math.round(shape.fillOpacity * 100)}%</span>
+          </div>
+          <Slider
+            value={[Math.round(shape.fillOpacity * 100)]}
+            min={5}
+            max={100}
+            step={5}
+            onValueChange={(v) => setShape({ fillOpacity: v[0] / 100 })}
+            aria-label={t('tool.shape.fillOpacity', 'Fill opacity', 'شفافية التعبئة')}
+          />
+        </>
+      )}
+
       <div className="relative mt-3">
         <button
           type="button"
@@ -709,11 +775,48 @@ function ShapePopover({ railPos, railOnRight, anchor }: { railPos: RailPos; rail
         </button>
         {colorOpen && (
           <div className="absolute start-0 top-11 z-50">
-            <ColorPopover current={shape.color} onPick={(hex) => { setShape({ color: hex }); setColorOpen(false) }} onClose={() => setColorOpen(false)} />
+            <ColorPopover current={shape.color} onPick={(hex) => { setShape({ color: hex, fillColor: shape.fillColor ?? (shape.filled ? hex : null) }); setColorOpen(false) }} onClose={() => setColorOpen(false)} />
           </div>
         )}
       </div>
+      {activeFill != null && (
+        <div className="relative mt-2">
+          <button
+            type="button"
+            onClick={() => setFillOpen((v) => !v)}
+            className="flex h-9 w-full items-center justify-center gap-2 rounded-lg bg-surface-variant text-xs font-medium press-scale"
+            aria-label={t('tool.shape.fillColor', 'Fill color', 'لون التعبئة')}
+          >
+            <span className="h-4 w-4 rounded-full border border-black/20" style={{ background: activeFill }} />
+            {t('tool.shape.fillColor', 'Fill color', 'لون التعبئة')}
+          </button>
+          {fillOpen && (
+            <div className="absolute start-0 top-11 z-50">
+              <ColorPopover current={activeFill} onPick={(hex) => { setShape({ fillColor: hex, filled: false }); setFillOpen(false) }} onClose={() => setFillOpen(false)} />
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* snapping & perfect-shape locks */}
+      <div className="mt-3 space-y-1.5">
+        <ToggleRow label={t('tool.shape.lockAspect', 'Perfect square / circle', 'مربع/دائرة مثالية')} checked={shape.lockAspect} onChange={(v) => setShape({ lockAspect: v })} id="shape-lock" />
+        <ToggleRow label={t('tool.shape.gridSnap', 'Snap to grid', 'محاذاة للشبكة')} checked={shape.gridSnap} onChange={(v) => setShape({ gridSnap: v })} id="shape-grid" />
+        <ToggleRow label={t('tool.shape.smartSnap', 'Smart guides', 'خطوط إرشادية ذكية')} checked={shape.smartSnap} onChange={(v) => setShape({ smartSnap: v })} id="shape-smart" />
+      </div>
+      <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
+        {t('tool.shape.hint', 'Shift = perfect square/circle · drag from start to end', 'Shift = مربع/دائرة مثالية · اسحب من البداية إلى النهاية')}
+      </p>
     </Pop>
+  );
+}
+
+function ToggleRow({ label, checked, onChange, id }: { label: string; checked: boolean; onChange: (v: boolean) => void; id: string }) {
+  return (
+    <div className="flex items-center justify-between">
+      <label htmlFor={id} className="text-xs font-medium">{label}</label>
+      <Switch id={id} checked={checked} onCheckedChange={onChange} aria-label={label} />
+    </div>
   );
 }
 

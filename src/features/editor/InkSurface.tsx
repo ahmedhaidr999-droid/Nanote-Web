@@ -32,16 +32,18 @@
 // appear on top of ours.
 import { useEffect, useRef } from 'react';
 import { useApp, useT } from '@/lib/nanote/store';
-import { EditorTool, FingerAction, INK_PALETTE, PenAction, StrokeEl, ToolId, TextEl, ImageEl } from '@/lib/nanote/types';
+import { EditorTool, FingerAction, INK_PALETTE, PenAction, ShapeEl, StrokeEl, ToolId, TextEl, ImageEl, isLineShape } from '@/lib/nanote/types';
 import { uid, clamp } from '@/lib/nanote/util';
 import { computeOutline, OP } from '@/lib/nanote/outline';
-import { drawImageEl, hiAlphaOf } from '@/lib/nanote/render';
+import { drawStroke, drawText, drawShape, drawImageEl, hiAlphaOf } from '@/lib/nanote/render';
 import { resolveImage, imageNatural } from '@/lib/nanote/images';
-import { recognizeShape, type RecognizedShape } from '@/lib/nanote/shapedetect';
+import { recognizeShape, type ShapeSpec } from '@/lib/nanote/shapedetect';
 import { observePenEvent, normalizePenPressure, onPenButtonEvent, barrelMap } from '@/lib/nanote/penengine';
 import {
   elementInLasso, strokeIntersectsCircle, elementIntersectsCircle,
   snapAngle, shapePath, pointInImage, transformElement,
+  snapToGrid, collectSnapLines, smartSnapPoint, expandIdsByGroup,
+  rdpSimplify, type SnapLines,
 } from '@/lib/nanote/geometry';
 import {
   caretAtPoint, clearTextSel, getTextSel, setSelectionFromCarets, wordRangeAt, compareCarets,
@@ -68,6 +70,17 @@ const TEXT_SLOP_TOUCH = 16;      // movement that cancels a pending touch long-p
 const TEXT_SLOP_MOUSE = 10;     // tighter for the mouse
 const SHAPE_DWELL_MS = 600;     // pen held still at stroke end → recognize a shape (Notewise draw & hold)
 const SHAPE_UNLOCK_PX = 18;     // movement after a shape snap that resumes freehand
+const SHAPE_MIN_PX = 6;         // minimum drag size for a committed shape
+
+/** live shape-drag session: anchor + current end (line-family) or the drag
+ *  frame (box-family); freeform collects raw points instead. `guides` are the
+ *  active smart-snap alignment lines rendered over the preview. */
+interface ShapeDrag {
+  ax: number; ay: number; bx: number; by: number;
+  pts?: OP[];                 // freeform capture (screen of raw samples)
+  snapLines?: SnapLines;      // smart-snap candidates (collected at start)
+  guides?: { axis: 'x' | 'y'; at: number }[];
+}
 
 const AUTO_CONTINUE_PTS = 2400;   // very long strokes continue as a fresh stroke
 const PALM_DRAW_PX = 50;          // touch contact axis (px) too big to draw with
@@ -90,12 +103,12 @@ const HOLD_STILL_MS = 120;        // release after this much stillness ⇒ no fl
 
 type Mode =
   | { type: 'none' }
-  | { type: 'stroke'; pointerId: number; pageId: string; pageY: number; points: OP[]; tool: ToolId; color: string; width: number; startAbs: number; lastAbs: number; lastTs: number; minDist: number; pSmooth: number; straight: boolean; cached: Path2D | null; cachedUpTo: number; lockedShape: RecognizedShape | null; lastMoveAbs: number }
+  | { type: 'stroke'; pointerId: number; pageId: string; pageY: number; points: OP[]; tool: ToolId; color: string; width: number; startAbs: number; lastAbs: number; lastTs: number; minDist: number; pSmooth: number; straight: boolean; cached: Path2D | null; cachedUpTo: number; lockedSpecs: ShapeSpec[] | null; lastMoveAbs: number; fromPointer: string }
   | { type: 'laser'; pointerId: number; pageId: string; pageY: number; points: { x: number; y: number }[]; color: string; width: number; minDist: number }
   | { type: 'textpick'; pointerId: number; wordStart: CaretPoint | null; wordEnd: CaretPoint | null; anchor: CaretPoint; fromLongPress: boolean }
   | { type: 'erase'; pointerId: number; pageId: string; pageY: number; path: { x: number; y: number }[]; removed: Set<string>; lastScreen: { x: number; y: number }; done?: boolean; flushQueued?: boolean }
   | { type: 'lasso'; pointerId: number; pageId: string; pageY: number; poly: { x: number; y: number }[] }
-  | { type: 'shape'; pointerId: number; pageId: string; pageY: number; ax: number; ay: number; bx: number; by: number }
+  | { type: 'shape'; pointerId: number; pageId: string; pageY: number; drag: ShapeDrag }
   | { type: 'pan'; pointerId: number; lastX: number; lastY: number; rawX: number; rawY: number;
       lockX: boolean; lockY: boolean; minX: number; maxX: number; minY: number; maxY: number;
       samples: { t: number; x: number; y: number }[]; lastMoveT: number }
@@ -244,6 +257,93 @@ function tracePath(target: Path2D | CanvasRenderingContext2D, outline: number[])
     else target.lineTo(outline[i], outline[i + 1]);
   }
   target.closePath();
+}
+
+/** translate any page element by (dx, dy) — used by the long-press grab */
+function translateEl<T extends import('@/lib/nanote/types').PageElement>(el: T, dx: number, dy: number): T {
+  if (el.kind === 'stroke') {
+    return { ...el, points: el.points.map((p) => ({ ...p, x: p.x + dx, y: p.y + dy })) };
+  }
+  return { ...el, x: el.x + dx, y: el.y + dy } as T;
+}
+
+/** draw any page element raw (no transform) — used by the long-press grab preview */
+function drawRawElement(ctx: CanvasRenderingContext2D, el: import('@/lib/nanote/types').PageElement, gamma: number) {
+  const opts = { gamma, resolveImage, imageNatural };
+  switch (el.kind) {
+    case 'stroke': drawStroke(ctx, el, opts); break;
+    case 'text': drawText(ctx, el); break;
+    case 'shape': drawShape(ctx, el); break;
+    case 'image': drawImageEl(ctx, el, opts); break;
+  }
+}
+
+/** build the live preview spec from the shape-tool state + drag session.
+ *  line-family keeps (start → end); box-family uses the normalized frame;
+ *  arc keeps the SIGNED drag height (h ≥ 0 bulges up, h < 0 bulges down). */
+function shapeSpecOf(
+  st: { type: import('@/lib/nanote/types').ShapeType; sides: number },
+  d: ShapeDrag,
+): ShapeSpec | null {
+  const { ax, ay, bx, by } = d;
+  if (isLineShape(st.type)) {
+    return { shape: st.type, x: ax, y: ay, w: bx - ax, h: by - ay };
+  }
+  if (st.type === 'arc') {
+    // frame from the anchor corner to the drag point; keep the sign of the
+    // vertical drag so the bulge follows the draw direction
+    return { shape: 'arc', x: Math.min(ax, bx), y: Math.min(ay, by), w: Math.abs(bx - ax), h: Math.abs(by - ay) * (by >= ay ? 1 : -1) };
+  }
+  return {
+    shape: st.type,
+    x: Math.min(ax, bx), y: Math.min(ay, by),
+    w: Math.abs(bx - ax), h: Math.abs(by - ay),
+    sides: st.sides,
+  };
+}
+
+/** convert a recognition spec (+ the drawing pen's look) into shape elements */
+function shapeElsFromSpecs(
+  specs: ShapeSpec[],
+  look: { color: string; width: number },
+  z: number,
+): ShapeEl[] {
+  return specs.map((s, i) => ({
+    kind: 'shape' as const,
+    id: uid(),
+    shape: s.shape,
+    x: s.x, y: s.y, w: s.w, h: s.h,
+    stroke: look.color,
+    strokeWidth: clamp(look.width, 1, 16),
+    fill: null,
+    sides: s.sides,
+    pts: s.pts,
+    closed: s.closed,
+    z: z + 1 + i,
+  }));
+}
+
+/** polyline length (module-local helper) */
+function pathLen(pts: { x: number; y: number }[]): number {
+  let s = 0;
+  for (let i = 1; i < pts.length; i++) s += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+  return s;
+}
+
+/** build the ink StrokeEl a recognition would replace (for the revert path) */
+function buildInkEl(m: Extract<Mode, { type: 'stroke' }>, st: ReturnType<typeof useApp.getState>): StrokeEl {
+  const ts0 = m.points[0]?.ts;
+  const pts = m.points.length === 1
+    ? [{ ...m.points[0], t: 16 }]
+    : m.points.map((p, i) => ({
+        x: p.x, y: p.y, p: p.p,
+        t: ts0 != null && p.ts != null ? Math.max(1, Math.round(p.ts - ts0)) : i * 16,
+      }));
+  const doc = st.editor.docs[m.pageId];
+  const z = doc ? doc.elements.reduce((acc, e) => Math.max(acc, e.z), 0) + 1 : 1;
+  return {
+    kind: 'stroke', id: uid(), tool: m.tool, color: m.color, width: m.width, points: pts, z,
+  };
 }
 
 /** all coalesced samples of an event (high-Hz digitizers batch many per frame) */
@@ -436,17 +536,18 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         ctx.restore();
       }
 
-      if (m.type === 'stroke' && m.lockedShape) {
-        // shape snapped (draw & hold) — preview the perfect shape
+      if (m.type === 'stroke' && m.lockedSpecs) {
+        // shape snapped (draw & hold) — preview the perfect shapes
         ctx.translate(vp.tx, m.pageY * vp.scale + vp.ty);
         ctx.scale(vp.scale, vp.scale);
-        const lk = m.lockedShape;
-        ctx.strokeStyle = m.color;
-        ctx.lineWidth = clamp(m.width, 1, 16);
-        ctx.lineJoin = 'round';
-        ctx.lineCap = 'round';
-        shapePath(ctx, lk.shape, lk.x, lk.y, lk.w, lk.h);
-        ctx.stroke();
+        for (const lk of m.lockedSpecs) {
+          ctx.strokeStyle = m.color;
+          ctx.lineWidth = clamp(m.width, 1, 16);
+          ctx.lineJoin = 'round';
+          ctx.lineCap = 'round';
+          shapePath(ctx, lk);
+          ctx.stroke();
+        }
       } else if (m.type === 'stroke') {
         ctx.translate(vp.tx, m.pageY * vp.scale + vp.ty);
         ctx.scale(vp.scale, vp.scale);
@@ -509,16 +610,57 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         ctx.stroke();
         ctx.setLineDash([]);
       } else if (m.type === 'shape') {
+        const st = useApp.getState().editor.shape;
+        const d = m.drag;
         ctx.translate(vp.tx, m.pageY * vp.scale + vp.ty);
         ctx.scale(vp.scale, vp.scale);
-        const st = useApp.getState().editor.shape;
         ctx.strokeStyle = st.color;
-        ctx.fillStyle = st.color;
         ctx.lineWidth = st.width;
         ctx.lineJoin = 'round';
         ctx.lineCap = 'round';
-        shapePath(ctx, st.type, Math.min(m.ax, m.bx), Math.min(m.ay, m.by), Math.abs(m.bx - m.ax), Math.abs(m.by - m.ay));
-        if (st.filled) ctx.fill(); else ctx.stroke();
+        if (st.type === 'freeform' && d.pts && d.pts.length > 1) {
+          // live freeform preview — the raw drag path
+          ctx.beginPath();
+          d.pts.forEach((p, i) => {
+            if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+          });
+          ctx.stroke();
+        } else {
+          const spec = shapeSpecOf(st, d);
+          if (spec) {
+            shapePath(ctx, spec);
+            const fill = st.fillColor ?? (st.filled ? st.color : null);
+            if (fill) {
+              ctx.save();
+              ctx.globalAlpha = st.fillOpacity;
+              ctx.fillStyle = fill;
+              ctx.fill();
+              ctx.restore();
+            }
+            ctx.stroke();
+          }
+        }
+        // smart-snap alignment guides (full-viewport lines)
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        if (d.guides?.length) {
+          ctx.strokeStyle = '#E5484D';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([6, 4]);
+          for (const g of d.guides) {
+            ctx.beginPath();
+            if (g.axis === 'x') {
+              const sx = g.at * vp.scale + vp.tx;
+              ctx.moveTo(sx, 0); ctx.lineTo(sx, ctx.canvas.clientHeight || 9999);
+            } else {
+              const sy = (g.at + m.pageY) * vp.scale + vp.ty;
+              ctx.moveTo(0, sy); ctx.lineTo(ctx.canvas.clientWidth || 9999, sy);
+            }
+            ctx.stroke();
+          }
+          ctx.setLineDash([]);
+        }
+        ctx.restore();
       } else if (m.type === 'erase') {
         const st = useApp.getState().editor.eraser;
         ctx.beginPath();
@@ -1001,9 +1143,9 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       const last = m.points[m.points.length - 1];
       const d = Math.hypot(px - last.x, py - last.y);
       const dt = Math.max(0.5, ev.timeStamp - m.lastTs);
-      if (m.lockedShape && d > SHAPE_UNLOCK_PX) {
+      if (m.lockedSpecs && d > SHAPE_UNLOCK_PX) {
         // resumed drawing after a shape snap → unlock, continue freehand
-        m.lockedShape = null;
+        m.lockedSpecs = null;
       }
       if (d >= m.minDist) {
         // ts carries the REAL event timestamp so the committed stroke keeps
@@ -1034,18 +1176,20 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     // end of the stroke for ~600ms → try to recognize a clean shape (Notewise
     // draw & hold). The live stroke MORPHS into the perfect shape; moving
     // again (>18px) unlocks back to freehand; release commits a ShapeEl.
+    // HOLD mode only; pen-lift mode converts the instant the pen lifts.
     const startDwellWatch = () => {
       if (dwellTimerRef.current) return;
       dwellTimerRef.current = setInterval(() => {
         const m = modeRef.current;
-        if (m.type !== 'stroke' || m.lockedShape) return;
+        if (m.type !== 'stroke' || m.lockedSpecs) return;
         const st = useApp.getState();
-        if (!st.settings.shapeDetection) return;
-        if (m.points.length < 12 || !m.lastMoveAbs) return;
+        if (!st.settings.shapeDetection || st.settings.shapeRecogMode !== 'hold') return;
+        if (!recogEligible(m)) return;
+        if (m.points.length < 8 || !m.lastMoveAbs) return;
         if (performance.now() - m.lastMoveAbs < SHAPE_DWELL_MS) return;
         const rec = recognizeShape(m.points);
         if (rec) {
-          m.lockedShape = rec;
+          m.lockedSpecs = rec.specs;
           requestOverlayRepaint();
         } else {
           m.lastMoveAbs = performance.now(); // not shape-like — wait for another dwell
@@ -1054,6 +1198,14 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
     };
     const stopDwellWatch = () => {
       if (dwellTimerRef.current) { clearInterval(dwellTimerRef.current); dwellTimerRef.current = null }
+    };
+
+    /** recognition eligibility: pens & mice always; a finger only when finger
+     *  drawing is explicitly enabled (handwriting via finger stays untouched) */
+    const recogEligible = (m: Extract<Mode, { type: 'stroke' }>): boolean => {
+      if (m.tool === 'highlighter') return false; // pens only — highlighter shapes would lose their translucent look
+      if (m.fromPointer === 'pen' || m.fromPointer === 'mouse') return true;
+      return m.fromPointer === 'touch' && useApp.getState().settings.fingerDrawing;
     };
 
     const onPointerDown = (e: PointerEvent) => {
@@ -1272,9 +1424,24 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       }
 
       if (tool === 'shape') {
+        const stShape = st.editor.shape;
+        const drag: ShapeDrag = { ax: pagePt.x, ay: pagePt.y, bx: pagePt.x, by: pagePt.y };
+        if (stShape.type === 'freeform') {
+          drag.pts = [{ x: pagePt.x, y: pagePt.y, p: pressureOf(e, 'fineliner'), v: 0.4, ts: e.timeStamp }];
+        } else {
+          // grid snap the anchor; collect smart-snap candidates once per drag
+          if (stShape.gridSnap) {
+            drag.ax = snapToGrid(drag.ax);
+            drag.ay = snapToGrid(drag.ay);
+            drag.bx = drag.ax; drag.by = drag.ay;
+          }
+          if (stShape.smartSnap) {
+            const doc = st.editor.docs[page.id];
+            if (doc) drag.snapLines = collectSnapLines(doc.elements);
+          }
+        }
         modeRef.current = {
-          type: 'shape', pointerId: e.pointerId, pageId: page.id, pageY: page.y,
-          ax: pagePt.x, ay: pagePt.y, bx: pagePt.x, by: pagePt.y,
+          type: 'shape', pointerId: e.pointerId, pageId: page.id, pageY: page.y, drag,
         };
         requestOverlayRepaint();
         return;
@@ -1324,8 +1491,8 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         tool: tool as ToolId, color: ts.color, width: ts.width,
         startAbs: performance.now(), lastAbs: performance.now(), lastTs: e.timeStamp,
         minDist: clamp(0.7 / getVp().scale, 0.25, 2.5), pSmooth: p0,
-        straight, cached: null, cachedUpTo: 0,
-        lockedShape: null, lastMoveAbs: performance.now(),
+        straight, cached: null, cachedUpTo: 0, lockedSpecs: null, lastMoveAbs: performance.now(),
+        fromPointer: e.pointerType,
       };
       startDwellWatch();
       requestOverlayRepaint();
@@ -1486,26 +1653,61 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
       }
 
       if (m.type === 'shape' && e.pointerId === m.pointerId) {
-        const world = screenToWorld(l.x, l.y);
         const page = layouts.find((p) => p.id === m.pageId);
         if (!page) return;
-        const inf = isInfinitePaper();
-        let bx = inf ? world.x : clamp(world.x, 0, page.w);
-        let by = inf ? world.y - page.y : clamp(world.y - page.y, 0, page.h);
         const st = useApp.getState();
-        const shape = st.editor.shape.type;
-        if (shape === 'line' || shape === 'arrow') {
-          const s = snapAngle(m.ax, m.ay, bx, by, 5);
-          bx = s.x; by = s.y;
-        } else if (e.shiftKey) {
-          const dx = bx - m.ax, dy = by - m.ay;
-          const size = Math.max(Math.abs(dx), Math.abs(dy));
-          m.bx = m.ax + Math.sign(dx || 1) * size;
-          m.by = m.ay + Math.sign(dy || 1) * size;
+        const stShape = st.editor.shape;
+        const d = m.drag;
+        const inf = isInfinitePaper();
+        const vp = getVp();
+
+        // freeform: collect the raw path (same decimation as ink)
+        if (stShape.type === 'freeform' && d.pts) {
+          const minDist = clamp(0.7 / vp.scale, 0.25, 2.5);
+          for (const ev of coalescedOf(e)) {
+            const el = localPt(ev);
+            const world = screenToWorld(el.x, el.y);
+            const px = inf ? world.x : clamp(world.x, 0, page.w);
+            const py = inf ? world.y - page.y : clamp(world.y - page.y, 0, page.h);
+            const last = d.pts[d.pts.length - 1];
+            if (Math.hypot(px - last.x, py - last.y) >= minDist) {
+              d.pts.push({ x: px, y: py, p: 0.5, v: 0.4, ts: ev.timeStamp });
+            }
+          }
           requestOverlayRepaint();
           return;
         }
-        m.bx = bx; m.by = by;
+
+        const worldPt = screenToWorld(l.x, l.y);
+        let bx = inf ? worldPt.x : clamp(worldPt.x, 0, page.w);
+        let by = inf ? worldPt.y - page.y : clamp(worldPt.y - page.y, 0, page.h);
+        d.guides = [];
+
+        const isLine = isLineShape(stShape.type);
+        // angle snap line-family shapes to 0/45/90° increments
+        if (isLine) {
+          const s = snapAngle(d.ax, d.ay, bx, by, 5);
+          bx = s.x; by = s.y;
+        } else if (e.shiftKey || stShape.lockAspect) {
+          // perfect square / circle from the anchor
+          const dx = bx - d.ax, dy = by - d.ay;
+          const size = Math.max(Math.abs(dx), Math.abs(dy));
+          bx = d.ax + Math.sign(dx || 1) * size;
+          by = d.ay + Math.sign(dy || 1) * size;
+        }
+        // smart snapping (alignment with existing elements) — skipped while a
+        // modifier lock is active so Shift/lock never fights the guides
+        if (stShape.smartSnap && d.snapLines && !(e.shiftKey || stShape.lockAspect)) {
+          const tol = 7 / vp.scale;
+          const snap = smartSnapPoint(d.snapLines, bx, by, tol);
+          bx = snap.bx; by = snap.by;
+          d.guides = snap.guides;
+        }
+        // grid snapping wins last (strongest constraint)
+        if (stShape.gridSnap && !(e.shiftKey || stShape.lockAspect)) {
+          bx = snapToGrid(bx); by = snapToGrid(by);
+        }
+        d.bx = bx; d.by = by;
         requestOverlayRepaint();
         return;
       }
@@ -1654,22 +1856,36 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
           requestOverlayRepaint();
           return;
         }
-        if (m.lockedShape) {
-          // draw & hold snapped a clean shape — commit it as a shape element
+        if (m.lockedSpecs) {
+          // draw & hold snapped clean shapes — commit them as shape elements
           // with the pen's color/width (Notewise-style)
-          const lk = m.lockedShape;
+          const specs = m.lockedSpecs;
           void st.ensureDoc(m.pageId).then((doc) => {
-            const z = doc.elements.reduce((acc, el) => Math.max(acc, el.z), 0) + 1;
-            st.addElements(m.pageId, [{
-              kind: 'shape', id: uid(), shape: lk.shape,
-              x: lk.x, y: lk.y, w: lk.w, h: lk.h,
-              stroke: m.color, strokeWidth: clamp(m.width, 1, 16), fill: null, z,
-            }]);
+            const z = doc.elements.reduce((acc, el) => Math.max(acc, el.z), 0);
+            const els = shapeElsFromSpecs(specs, { color: m.color, width: m.width }, z);
+            st.addElements(m.pageId, els);
           });
           modeRef.current = { type: 'none' };
           activeTypeRef.current = null;
           requestOverlayRepaint();
           return;
+        }
+        // PEN-LIFT recognition: convert the instant the pen lifts (with a brief
+        // keep/revert chip) — the ink never lands as a stroke element
+        if (st.settings.shapeDetection && st.settings.shapeRecogMode === 'penlift' && recogEligible(m) && m.points.length >= 6) {
+          const rec = recognizeShape(m.points);
+          if (rec) {
+            const ink = buildInkEl(m, st);
+            void st.ensureDoc(m.pageId).then((doc) => {
+              const z = doc.elements.reduce((acc, el) => Math.max(acc, el.z), 0);
+              const shapes = shapeElsFromSpecs(rec.specs, { color: m.color, width: m.width }, z);
+              st.applyRecognition(m.pageId, [ink], shapes);
+            });
+            modeRef.current = { type: 'none' };
+            activeTypeRef.current = null;
+            requestOverlayRepaint();
+            return;
+          }
         }
         void commitStroke(m, true);
         modeRef.current = { type: 'none' };
@@ -1699,7 +1915,10 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
           const doc = st.editor.docs[m.pageId];
           if (doc) {
             const pagePoly = m.poly.map((p) => ({ x: p.x, y: p.y - m.pageY }));
-            const ids = doc.elements.filter((el) => elementInLasso(el, pagePoly)).map((el) => el.id);
+            const ids = expandIdsByGroup(
+              doc.elements,
+              doc.elements.filter((el) => elementInLasso(el, pagePoly)).map((el) => el.id),
+            );
             st.setSelection(ids.length ? { pageId: m.pageId, ids } : null);
             if (ids.length) st.setTool('lasso');
           }
@@ -1712,19 +1931,57 @@ export default function InkSurface({ layouts, pageW, onTextTap }: InkSurfaceProp
         return;
       }
       if (m.type === 'shape' && e.pointerId === m.pointerId) {
-        const w = m.bx - m.ax, h = m.by - m.ay;
-        const isLine = st.editor.shape.type === 'line' || st.editor.shape.type === 'arrow';
-        if (Math.hypot(w, h) > (isLine ? 4 : 8)) {
-          const shape = st.editor.shape;
+        const stShape = st.editor.shape;
+        const d = m.drag;
+        const commit = (els: ShapeEl[]) => {
+          if (!els.length) return;
           void st.ensureDoc(m.pageId).then((doc) => {
-            const z = doc.elements.reduce((acc, el) => Math.max(acc, el.z), 0) + 1;
-            st.addElements(m.pageId, [{
-              kind: 'shape', id: uid(), shape: shape.type,
-              x: m.ax, y: m.ay, w, h,
-              stroke: shape.color, strokeWidth: shape.width,
-              fill: shape.filled ? shape.color : null, z,
-            }]);
+            const z = doc.elements.reduce((acc, el) => Math.max(acc, el.z), 0);
+            st.addElements(m.pageId, els.map((el, i) => ({ ...el, z: z + 1 + i })));
           });
+        };
+        if (stShape.type === 'freeform' && d.pts) {
+          // simplify the raw path into polygon vertices (RDP), normalize into
+          // the element box → an editable vector freeform
+          const raw = d.pts.map((p) => ({ x: p.x, y: p.y }));
+          if (raw.length >= 3 && pathLen(raw) > SHAPE_MIN_PX) {
+            let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+            for (const p of raw) {
+              x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y);
+              x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y);
+            }
+            const w = Math.max(1, x1 - x0), h = Math.max(1, y1 - y0);
+            const eps = Math.max(1.1, 0.016 * Math.hypot(w, h));
+            const verts = rdpSimplify(raw, eps);
+            if (verts.length >= 2) {
+              commit([{
+                kind: 'shape', id: uid(), shape: 'freeform',
+                x: x0, y: y0, w, h,
+                stroke: stShape.color, strokeWidth: stShape.width,
+                fill: stShape.fillColor ?? (stShape.filled ? stShape.color : null),
+                fillOpacity: stShape.fillOpacity,
+                pts: verts.map((p) => ({ x: (p.x - x0) / w, y: (p.y - y0) / h })),
+                closed: true,
+                z: 0,
+              }]);
+            }
+          }
+        } else {
+          const spec = shapeSpecOf(stShape, d);
+          if (spec) {
+            const isLine = isLineShape(stShape.type);
+            if (Math.hypot(spec.w, spec.h) > (isLine ? 4 : SHAPE_MIN_PX)) {
+              commit([{
+                kind: 'shape', id: uid(), shape: spec.shape,
+                x: spec.x, y: spec.y, w: spec.w, h: spec.h,
+                stroke: stShape.color, strokeWidth: stShape.width,
+                fill: stShape.fillColor ?? (stShape.filled ? stShape.color : null),
+                fillOpacity: stShape.fillOpacity,
+                sides: spec.sides,
+                z: 0,
+              }]);
+            }
+          }
         }
         modeRef.current = { type: 'none' };
         activeTypeRef.current = null;

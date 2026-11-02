@@ -6,12 +6,17 @@ import { useApp, useT } from '@/lib/nanote/store';
 import { AppIcon } from '@/components/nanote/AppIcon';
 import * as db from '@/lib/nanote/idb';
 import { applyNativeStatusBar, registerNativeBackButton } from '@/lib/nanote/native';
+import {
+  isEmbedded, onParentMessage, postToParent, receiveDroppedElements, noteSplitLayout,
+} from '@/features/editor/splitbus';
+import { PageElement } from '@/lib/nanote/types';
 
 import OnboardingView from '@/features/onboarding/OnboardingView';
 import LibraryView from '@/features/library/LibraryView';
 import CreateNotebookView from '@/features/notebook/CreateNotebookView';
 import SettingsView from '@/features/settings/SettingsView';
 import EditorShell from '@/features/editor/EditorShell';
+import { SplitWorkspace } from '@/features/editor/SplitWorkspace';
 
 // ---------------------------------------------------------------- error boundary
 class AppErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
@@ -76,7 +81,11 @@ function Router() {
         {view.name === 'library' && <LibraryView />}
         {view.name === 'create-notebook' && <CreateNotebookView folderId={view.folderId} />}
         {view.name === 'settings' && <SettingsView />}
-        {view.name === 'editor' && <EditorShell notebookId={view.notebookId} />}
+        {view.name === 'editor' && (
+          <SplitWorkspace notebookA={view.notebookId}>
+            <EditorShell notebookId={view.notebookId} />
+          </SplitWorkspace>
+        )}
       </div>
     </div>
   );
@@ -86,9 +95,35 @@ function Router() {
 export default function NanoteApp() {
   const settings = useApp((s) => s.settings);
 
-  // boot once
+  // boot once — embedded split panes open their assigned notebook directly
+  // (no onboarding / library round-trip inside pane B). NOTE: the APK boot()
+  // session-restores the LAST open notebook into the editor — the guard must
+  // compare the notebook id, not the view, or pane B would keep the restored
+  // notebook instead of its assigned one.
   useEffect(() => {
-    void useApp.getState().boot();
+    void useApp.getState().boot().then(() => {
+      if (!isEmbedded()) return;
+      const nb = new URLSearchParams(window.location.search).get('nb');
+      const view = useApp.getState().view;
+      if (nb && (view.name !== 'editor' || view.notebookId !== nb)) void useApp.getState().openEditor(nb);
+    });
+  }, []);
+
+  // embedded pane: splitbus wiring (clipboard in, drops in, layout updates)
+  // + announce readiness so the parent can answer with the split layout
+  useEffect(() => {
+    if (!isEmbedded()) return;
+    const off = onParentMessage((msg) => {
+      if (msg.type === 'clipboardPut') {
+        useApp.setState({ editor: { ...useApp.getState().editor, clipboard: msg.elements.map((e) => ({ ...e }) as PageElement) } });
+      } else if (msg.type === 'receiveDrop' || msg.type === 'transferOut') {
+        receiveDroppedElements(msg.elements as PageElement[]);
+      } else if (msg.type === 'splitLayout') {
+        noteSplitLayout(msg.orientation);
+      }
+    });
+    postToParent({ type: 'ready' });
+    return off;
   }, []);
 
   // apply lang/dir instantly (no restart)

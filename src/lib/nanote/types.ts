@@ -6,7 +6,22 @@ export type ThemeMode = 'light' | 'dark' | 'system';
 // ---------------------------------------------------------------- tools
 export type ToolId = 'fountain' | 'ballpoint' | 'brush' | 'fineliner' | 'highlighter' | 'laser';
 export type EditorTool = ToolId | 'eraser' | 'lasso' | 'text' | 'shape' | 'image' | 'sticker' | 'pan' | 'textselect';
-export type ShapeType = 'line' | 'arrow' | 'rect' | 'rrect' | 'ellipse' | 'triangle' | 'star';
+/** geometric shape kinds — 'line'-family shapes (line/arrow/darrow/arc) store
+ *  (x,y) = start point and (w,h) = delta to the end point; bbox-family shapes
+ *  (rect/rrect/ellipse/triangle/star/hexagon/polygon/freeform) store the
+ *  top-left of the frame and its size. 'freeform' carries normalized vertices
+ *  in `pts` (fractions 0..1 of w/h) so it resizes/rotates with its box. */
+export type ShapeType =
+  | 'line' | 'arrow' | 'darrow' | 'arc'
+  | 'rect' | 'rrect' | 'ellipse' | 'triangle' | 'star'
+  | 'hexagon' | 'polygon' | 'freeform';
+/** bbox-family shapes (frame-based geometry; 'arc' keeps a signed h for the
+ *  bulge direction) */
+export const BOX_SHAPES: ReadonlySet<ShapeType> = new Set(['rect', 'rrect', 'ellipse', 'triangle', 'star', 'hexagon', 'polygon', 'freeform', 'arc']);
+/** line-family shapes (start + delta geometry) */
+export const LINE_SHAPES: ReadonlySet<ShapeType> = new Set(['line', 'arrow', 'darrow']);
+export const isBoxShape = (s: ShapeType) => BOX_SHAPES.has(s);
+export const isLineShape = (s: ShapeType) => LINE_SHAPES.has(s);
 export type EraserMode = 'stroke' | 'area';
 
 // ---------------------------------------------------------------- paper
@@ -228,6 +243,10 @@ export interface Settings {
   includeAudioInBackup: boolean;
   highlighterOpacity: number; // 0..100 (%) — same-color highlighter passes never stack
   shapeDetection: boolean;    // draw & hold → recognize shapes (pens, Notewise-style)
+  /** when recognition runs: 'hold' = draw & hold ~600ms (Notewise-style live
+   *  morph), 'penlift' = convert instantly when the pen lifts (with a brief
+   *  keep/revert chip) */
+  shapeRecogMode: 'hold' | 'penlift';
   // ----- translation platform (independent app platform: online engines +
   // downloaded offline language packs from the in-app language library)
   translateEngine: TranslateEngine; // which engine the Translate button uses
@@ -261,6 +280,7 @@ export const DEFAULT_SETTINGS: Settings = {
   includeAudioInBackup: true,
   highlighterOpacity: 40,
   shapeDetection: true,
+  shapeRecogMode: 'hold',
   translateEngine: 'nanote',
   translateTarget: 'auto',
   aiService: 'chatgpt',
@@ -313,6 +333,8 @@ export interface StrokeEl {
   width: number;
   points: InkPoint[];
   z: number;
+  /** grouping: elements sharing a groupId are selected & moved together */
+  groupId?: string;
 }
 
 export interface TextEl {
@@ -328,6 +350,8 @@ export interface TextEl {
   underline: boolean;
   align: 'start' | 'center' | 'end';
   z: number;
+  /** grouping: elements sharing a groupId are selected & moved together */
+  groupId?: string;
 }
 
 export interface ShapeEl {
@@ -338,7 +362,19 @@ export interface ShapeEl {
   stroke: string;
   strokeWidth: number;
   fill: string | null;
+  /** fill alpha 0..1 (default 1 = solid) */
+  fillOpacity?: number;
+  /** rotation about the shape's center, radians (default 0) */
+  rotation?: number;
+  /** polygon: side count 3..12 (default 5) */
+  sides?: number;
+  /** freeform: vertices normalized to the box (0..1 of w/h), Y down */
+  pts?: { x: number; y: number }[];
+  /** freeform: close the path (polygon) vs leave it open (polyline) */
+  closed?: boolean;
   z: number;
+  /** grouping: elements sharing a groupId are selected & moved together */
+  groupId?: string;
 }
 
 export interface ImageEl {
@@ -356,6 +392,8 @@ export interface ImageEl {
    * then frames exactly the cropped region. */
   crop?: { x: number; y: number; w: number; h: number };
   z: number;
+  /** grouping: elements sharing a groupId are selected & moved together */
+  groupId?: string;
 }
 
 export type PageElement = StrokeEl | TextEl | ShapeEl | ImageEl;
@@ -420,6 +458,27 @@ export const DEFAULT_TOOL_STATES: Record<ToolId, ToolState> = {
 
 export const ERASER_DEFAULT = { mode: 'stroke' as EraserMode, size: 24 };
 
+/** shape-tool session state (persists across notebooks within a session) */
+export interface ShapeToolState {
+  type: ShapeType;
+  /** legacy filled flag — true ⇒ fill = stroke color at 100% opacity */
+  filled: boolean;
+  color: string;          // border color
+  width: number;          // border thickness
+  fillColor: string | null; // null = no fill
+  fillOpacity: number;    // 0..1
+  sides: number;          // polygon side count 3..12
+  lockAspect: boolean;    // perfect circle / square without Shift
+  gridSnap: boolean;      // snap to the 24-unit paper grid
+  smartSnap: boolean;     // snap to nearby element edges/centers + guides
+}
+
+export const DEFAULT_SHAPE_STATE: ShapeToolState = {
+  type: 'rect', filled: false, color: '#16233A', width: 3,
+  fillColor: null, fillOpacity: 1, sides: 5,
+  lockAspect: false, gridSnap: false, smartSnap: true,
+};
+
 // ---------------------------------------------------------------- misc
 export const TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 export const MIN_ZOOM = 0.5; // 50% max zoom-out — pages stay centered and readable
@@ -431,3 +490,5 @@ export const INFINITE_MAX_ZOOM = 24;
 export const INFINITE_GROW_STEP = 512;
 export const INFINITE_GROW_MARGIN = 140;
 export const UNDO_LIMIT = 200;
+/** the paper grid pitch (grid/dotgrid templates) — also the grid-snap step */
+export const GRID_PITCH = 24;

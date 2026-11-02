@@ -6,7 +6,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import {
   ArrowLeft, Undo2, Redo2, MoreVertical, Bookmark, BookmarkCheck, ListTree, FileImage,
   FileText, NotebookPen, Share2, Eraser, Plus, LayoutGrid, ZoomIn, ZoomOut, Maximize2, Check,
-  SlidersHorizontal, Map as MapIcon, Palette,
+  SlidersHorizontal, Map as MapIcon, Palette, Columns2, Minimize2, Undo2 as UndoIcon,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useApp, useT } from '@/lib/nanote/store';
@@ -34,6 +34,7 @@ import { PagesDialog } from './PagesDialog';
 import { InputSettingsSheet } from './InputSettingsSheet';
 import { Ruler } from './Ruler';
 import { recallPage } from '@/lib/nanote/pagemem';
+import { isEmbedded, postToParent, splitActiveHere } from './splitbus';
 import {
   fitWidth, getVp, layoutPages, pageAtWorldY, scrollToPage, subscribeVp, useVp, type Vp,
   animateZoomTo, animatedFit, clampVpToWorld, setViewportSize, setVp, type PageLayout,
@@ -59,6 +60,7 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
   const [pagesOpen, setPagesOpen] = useState(false);
   const [inputOpen, setInputOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false); // Split Workspace notebook picker
   const [thumbVersion, setThumbVersion] = useState(0);
   const dirtyThumbsRef = useRef(new Set<string>());
   const restoredRef = useRef(false); // last-page restore runs once per editor session
@@ -320,9 +322,16 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
     <main className="flex h-dvh flex-col overflow-hidden bg-background" style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}>
       {/* ------------------------------------------------ top bar */}
       <header className="z-40 flex h-14 shrink-0 items-center gap-1 border-b border-border bg-background/90 px-2 backdrop-blur">
-        <Button variant="ghost" size="icon" aria-label={t('common.back')} onClick={() => useApp.getState().closeEditor()}>
-          <ArrowLeft className="h-5 w-5 rtl:-scale-x-100" />
-        </Button>
+        {isEmbedded() ? (
+          /* embedded pane B: leaving means closing the split (parent decides) */
+          <Button variant="ghost" size="icon" aria-label={t('split.close', 'Close split', 'إغلاق التقسيم')} onClick={() => postToParent({ type: 'closeRequest' })}>
+            <Minimize2 className="h-5 w-5 rtl:-scale-x-100" />
+          </Button>
+        ) : (
+          <Button variant="ghost" size="icon" aria-label={t('common.back')} onClick={() => useApp.getState().closeEditor()}>
+            <ArrowLeft className="h-5 w-5 rtl:-scale-x-100" />
+          </Button>
+        )}
         <button
           type="button"
           className="mx-1 min-w-0 max-w-[38vw] truncate rounded-md px-2 py-1 text-sm font-semibold hover:bg-accent lg:max-w-none"
@@ -385,6 +394,19 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
                 <MapIcon className="h-5 w-5" />
               </Button>
             </>
+          )}
+          {/* Split Workspace — open a second notebook beside this one */}
+          {!isEmbedded() && (
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label={t('split.open', 'Split workspace', 'مساحة عمل مقسّمة')}
+              title={t('split.open', 'Split workspace', 'مساحة عمل مقسّمة')}
+              className={splitActiveHere() ? 'text-primary' : undefined}
+              onClick={() => setPickerOpen(true)}
+            >
+              <Columns2 className="h-5 w-5" />
+            </Button>
           )}
 
           <DropdownMenu>
@@ -563,7 +585,102 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
       {/* rename dialog */}
       <RenameDialog key={renameOpen ? 'open' : 'closed'} open={renameOpen} onOpenChange={setRenameOpen} initial={notebook.title} onConfirm={(title) => void useApp.getState().renameNotebook(notebookId, title)} />
 
+      {/* Split Workspace notebook picker */}
+      <NotebookPickerDialog open={pickerOpen} onOpenChange={setPickerOpen} activeId={notebookId} />
+
+      {/* pen-lift shape recognition: keep / revert chip */}
+      <RecogChip />
+
     </main>
+  );
+}
+
+/** Recognition chip — right after a pen-lift shape conversion, offer an
+ *  explicit accept (dismiss) or reject (back to the original ink). The offer
+ *  expires by itself after a few seconds. */
+function RecogChip() {
+  const recog = useApp((s) => s.editor.recog);
+  const { t } = useT();
+  useEffect(() => {
+    if (!recog) return;
+    const timer = setTimeout(() => useApp.getState().setRecog(null), 6500);
+    return () => clearTimeout(timer);
+  }, [recog]);
+  if (!recog) return null;
+  return (
+    <div
+      dir="auto"
+      className="absolute bottom-24 left-1/2 z-40 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-border bg-card/95 py-1.5 pl-4 pr-1.5 shadow-ink-2 backdrop-blur"
+      role="status"
+    >
+      <span className="text-xs font-medium">{t('recog.converted', 'Shape recognized', 'تم التعرف على الشكل')}</span>
+      <button
+        type="button"
+        aria-label={t('common.done')}
+        onClick={() => useApp.getState().setRecog(null)}
+        className="flex h-8 w-8 items-center justify-center rounded-full text-emerald-600 transition-colors press-scale hover:bg-accent"
+      >
+        <Check className="h-4 w-4" />
+      </button>
+      <button
+        type="button"
+        aria-label={t('recog.revert', 'Back to ink', 'عودة للحبر')}
+        title={t('recog.revert', 'Back to ink', 'عودة للحبر')}
+        onClick={() => useApp.getState().revertRecognition()}
+        className="flex h-8 items-center gap-1.5 rounded-full bg-surface-variant px-3 text-xs font-semibold text-foreground transition-colors press-scale hover:bg-accent"
+      >
+        <UndoIcon className="h-4 w-4" />
+        {t('recog.revert', 'Back to ink', 'عودة للحبر')}
+      </button>
+    </div>
+  );
+}
+
+/** NotebookPickerDialog — choose a notebook to open as the second pane of a
+ *  Split Workspace. */
+function NotebookPickerDialog({ open, onOpenChange, activeId }: {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  activeId: string;
+}) {
+  const { t } = useT();
+  const notebooks = useApp((s) => s.notebooks);
+  const sorted = [...notebooks].filter((n) => !n.deletedAt).sort((a, b) => b.lastOpenedAt - a.lastOpenedAt);
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>{t('split.pick', 'Open in split view', 'فتح في عرض مقسّم')}</DialogTitle>
+        </DialogHeader>
+        <div className="max-h-[60dvh] overflow-y-auto nanote-scroll">
+          {sorted.length === 0 && (
+            <p className="p-4 text-sm text-muted-foreground">—</p>
+          )}
+          {sorted.map((nb) => (
+            <button
+              key={nb.id}
+              type="button"
+              onClick={() => {
+                if (nb.id !== activeId) useApp.getState().openSplit(nb.id);
+                onOpenChange(false);
+              }}
+              className={cn(
+                'flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-start text-sm press-scale',
+                nb.id === activeId ? 'bg-accent font-medium' : 'hover:bg-accent',
+              )}
+            >
+              <Columns2 className="h-4 w-4 shrink-0 text-primary" />
+              <span className="min-w-0 flex-1 truncate">{nb.title}</span>
+              {nb.id === activeId && (
+                <span className="shrink-0 rounded-full bg-surface-variant px-2 py-0.5 text-[10px] text-muted-foreground">
+                  {t('split.current', 'this pane', 'هذه المساحة')}
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
