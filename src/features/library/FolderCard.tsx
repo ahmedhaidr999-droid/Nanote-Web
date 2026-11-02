@@ -1,10 +1,10 @@
 'use client';
 // Folder tile for the content area — grid variant (card) or list variant
-// (row). Clicking navigates INTO the folder in place; a ⋯ menu offers rename,
-// move, new subfolder and delete.
-import { useState } from 'react';
+// (row / compact row). Clicking navigates INTO the folder in place; a ⋯ menu
+// offers rename, move, new subfolder and delete. Supports multi-selection.
+import { memo, useState } from 'react';
 import {
-  ChevronRight, FolderInput, FolderPlus, MoreVertical, Pencil, Trash2,
+  Check, ChevronRight, FolderInput, FolderPlus, MoreVertical, Pencil, Trash2,
 } from 'lucide-react';
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem,
@@ -13,24 +13,30 @@ import {
 import { useT } from '@/lib/nanote/store';
 import type { FolderRow } from '@/lib/nanote/types';
 import { cn } from '@/lib/utils';
+import { useSelectPress } from './useSelectPress';
 
 export interface FolderCardCounts {
   notebooks: number; // direct child notebooks
   folders: number;   // direct child folders
 }
 
-interface FolderCardProps {
+export interface FolderCardProps {
   folder: FolderRow;
   counts: FolderCardCounts;
-  variant: 'grid' | 'row';
+  variant: 'grid' | 'row' | 'compact';
   onOpen: (folder: FolderRow) => void;
   onRename: (folder: FolderRow) => void;
   onMove: (folder: FolderRow) => void;
   onNewChild: (folder: FolderRow) => void;
   onDelete: (folder: FolderRow) => void;
+  showDate?: boolean;
+  selectionMode?: boolean;
+  selected?: boolean;
+  onToggleSelect?: (id: string) => void;
+  onLongPressSelect?: (id: string) => void;
 }
 
-export function FolderCard({
+function FolderCardImpl({
   folder,
   counts,
   variant,
@@ -39,9 +45,27 @@ export function FolderCard({
   onMove,
   onNewChild,
   onDelete,
+  showDate = true,
+  selectionMode = false,
+  selected = false,
+  onToggleSelect,
+  onLongPressSelect,
 }: FolderCardProps) {
   const { t } = useT();
   const [menuOpen, setMenuOpen] = useState(false);
+  const press = useSelectPress(
+    () => onLongPressSelect?.(folder.id),
+    !selectionMode && !!onLongPressSelect,
+  );
+
+  const open = () => {
+    if (press.consumeLongPress()) return;
+    if (selectionMode) {
+      onToggleSelect?.(folder.id);
+      return;
+    }
+    onOpen(folder);
+  };
 
   const menu = (
     <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
@@ -88,40 +112,90 @@ export function FolderCard({
     </DropdownMenu>
   );
 
-  if (variant === 'row') {
+  const pressHandlers = selectionMode || onLongPressSelect
+    ? {
+        onPointerDown: press.onPointerDown,
+        onPointerMove: press.onPointerMove,
+        onPointerUp: press.onPointerUp,
+        onPointerCancel: press.onPointerCancel,
+        onPointerLeave: press.onPointerLeave,
+        onContextMenu: press.onContextMenu,
+      }
+    : null;
+
+  if (variant === 'row' || variant === 'compact') {
+    const compact = variant === 'compact';
     return (
-      <li className="flex items-center gap-3 rounded-xl border bg-card p-3 shadow-ink-1">
+      <li
+        className={cn(
+          'flex items-center rounded-xl border bg-card shadow-ink-1',
+          compact ? 'gap-2.5 px-2.5 py-1.5' : 'gap-3 p-3',
+          selected && 'border-primary ring-2 ring-primary',
+          '[contain:layout_paint]',
+        )}
+        style={{ contentVisibility: 'auto', containIntrinsicSize: compact ? '44px' : '76px' }}
+      >
+        {selectionMode ? (
+          <button
+            type="button"
+            aria-label={selected ? t('common.deselect', 'Deselect', 'إلغاء التحديد') : t('common.select', 'Select', 'تحديد')}
+            aria-pressed={selected}
+            onClick={() => onToggleSelect?.(folder.id)}
+            className={cn(
+              'flex h-7 w-7 shrink-0 items-center justify-center rounded-full border transition-colors press-scale focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring',
+              selected ? 'border-primary bg-primary text-primary-foreground' : 'border-border text-transparent',
+            )}
+          >
+            <Check className="h-4 w-4" aria-hidden />
+          </button>
+        ) : null}
         <button
           type="button"
-          onClick={() => onOpen(folder)}
+          onClick={open}
           aria-label={folder.name}
+          aria-pressed={selectionMode ? selected : undefined}
+          {...pressHandlers}
           className="flex min-w-0 flex-1 items-center gap-3 rounded-lg text-start focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring"
         >
           <span
             aria-hidden
-            className="flex aspect-[3/4] w-12 shrink-0 items-center justify-center rounded-md bg-surface-variant text-lg"
+            className={cn(
+              'flex shrink-0 items-center justify-center rounded-md text-lg',
+              compact ? 'h-9 w-9' : 'aspect-[3/4] w-12',
+            )}
+            style={{ background: `${folder.colorHex}1F` }}
           >
             {folder.emoji}
           </span>
           <span className="min-w-0 flex-1">
             <span className="block truncate text-sm font-semibold text-foreground">{folder.name}</span>
-            <span className="mt-0.5 block text-xs text-muted-foreground">
-              <FolderMeta counts={counts} t={t} />
-            </span>
+            {(showDate || !compact) && (
+              <span className="mt-0.5 block text-xs text-muted-foreground">
+                <FolderMeta counts={counts} t={t} />
+              </span>
+            )}
           </span>
         </button>
         <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground rtl:rotate-180" aria-hidden />
-        {menu}
+        {!selectionMode ? menu : null}
       </li>
     );
   }
 
   return (
-    <div className="group relative rounded-xl border bg-card shadow-ink-1 transition-colors hover:border-primary/40">
+    <div
+      className={cn(
+        'group relative rounded-xl border bg-card shadow-ink-1 transition-colors hover:border-primary/40',
+        selected && 'border-primary ring-2 ring-primary',
+        '[contain:layout_paint]',
+      )}
+    >
       <button
         type="button"
-        onClick={() => onOpen(folder)}
+        onClick={open}
         aria-label={folder.name}
+        aria-pressed={selectionMode ? selected : undefined}
+        {...pressHandlers}
         className="flex w-full flex-col gap-2 rounded-xl p-4 text-start transition-transform press-scale focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring"
       >
         <span
@@ -139,7 +213,22 @@ export function FolderCard({
           <FolderMeta counts={counts} t={t} />
         </span>
       </button>
-      {menu}
+      {selectionMode ? (
+        <button
+          type="button"
+          aria-label={selected ? t('common.deselect', 'Deselect', 'إلغاء التحديد') : t('common.select', 'Select', 'تحديد')}
+          aria-pressed={selected}
+          onClick={() => onToggleSelect?.(folder.id)}
+          className={cn(
+            'absolute top-2 end-2 z-10 flex h-8 w-8 items-center justify-center rounded-full shadow-ink-1 backdrop-blur transition-colors press-scale focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring',
+            selected ? 'bg-primary text-primary-foreground' : 'bg-background/85 text-foreground',
+          )}
+        >
+          <Check className="h-4 w-4" aria-hidden />
+        </button>
+      ) : (
+        menu
+      )}
     </div>
   );
 }
@@ -161,3 +250,5 @@ function FolderMeta({ counts, t }: { counts: FolderCardCounts; t: ReturnType<typ
   }
   return <>{parts.join(' · ')}</>;
 }
+
+export const FolderCard = memo(FolderCardImpl);

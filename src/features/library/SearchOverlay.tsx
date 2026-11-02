@@ -1,14 +1,33 @@
 'use client';
 // Full-screen instant search overlay — notebooks, folders, tags and indexed
 // page text (text boxes + outline labels). Debounced 120 ms, min 1 character.
+// Recent searches (localStorage, max 6) appear as one-tap suggestions while
+// the query is empty.
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { FileText, Folder, Info, Search, SearchX, X } from 'lucide-react';
+import { Clock3, FileText, Folder, Info, Search, SearchX, X } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { EmptyState } from '@/components/nanote/EmptyState';
 import { NotebookCover } from '@/components/nanote/NotebookCover';
 import { useApp, useT } from '@/lib/nanote/store';
 import type { FolderRow, NotebookRow, PageRow } from '@/lib/nanote/types';
 import { useImageURL } from './useImageURL';
+
+const RECENT_KEY = 'nanote.recentSearches';
+const RECENT_MAX = 6;
+
+function loadRecent(): string[] {
+  try {
+    const raw = localStorage.getItem(RECENT_KEY);
+    const arr = raw ? (JSON.parse(raw) as unknown) : [];
+    return Array.isArray(arr) ? arr.filter((v): v is string => typeof v === 'string' && !!v).slice(0, RECENT_MAX) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveRecent(list: string[]) {
+  try { localStorage.setItem(RECENT_KEY, JSON.stringify(list)) } catch { /* ignore */ }
+}
 
 interface SearchOverlayProps {
   onClose: () => void;
@@ -27,7 +46,19 @@ export function SearchOverlay({ onClose, onSelectFolder, onSelectTab, onSelectTa
 
   const [q, setQ] = useState('');
   const [debouncedQ, setDebouncedQ] = useState('');
+  const [recent, setRecent] = useState<string[]>(loadRecent);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // localStorage is the source of truth — the overlay often unmounts in the
+  // SAME batch as a result click (onClose), and a setRecent updater would be
+  // discarded before running; reading the stored list here keeps saves reliable.
+  const rememberSearch = (term: string) => {
+    const clean = term.trim();
+    if (clean.length < 2) return;
+    const next = [clean, ...loadRecent().filter((r) => r.toLowerCase() !== clean.toLowerCase())].slice(0, RECENT_MAX);
+    saveRecent(next);
+    setRecent(next);
+  };
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -82,8 +113,15 @@ export function SearchOverlay({ onClose, onSelectFolder, onSelectTab, onSelectTa
   }, [debouncedQ, notebooks, folders, tabs, tags, pages, liveIds]);
 
   const openNotebook = (id: string) => {
+    rememberSearch(debouncedQ);
     onClose();
     void useApp.getState().openEditor(id);
+  };
+
+  const jumpTo = (run: () => void) => {
+    rememberSearch(debouncedQ);
+    run();
+    onClose();
   };
 
   const isEmpty =
@@ -133,6 +171,37 @@ export function SearchOverlay({ onClose, onSelectFolder, onSelectTab, onSelectTa
       </div>
 
       <div className="mx-auto mt-4 w-full max-w-2xl flex-1 overflow-y-auto nanote-scroll px-4 pb-8">
+        {/* recent searches — one-tap suggestions while the query is empty */}
+        {results === null && recent.length > 0 ? (
+          <section aria-label={t('library.search.recent', 'Recent searches', 'بحث حديث')} className="mb-4">
+            <div className="mb-1 flex items-center justify-between px-3">
+              <h2 className="flex items-center gap-1.5 text-sm font-semibold text-muted-foreground">
+                <Clock3 className="h-3.5 w-3.5" aria-hidden />
+                {t('library.search.recent', 'Recent searches', 'بحث حديث')}
+              </h2>
+              <button
+                type="button"
+                onClick={() => { setRecent([]); saveRecent([]) }}
+                className="rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors press-scale hover:bg-accent/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                {t('library.search.clearRecent', 'Clear', 'مسح')}
+              </button>
+            </div>
+            <div className="flex flex-wrap gap-1.5 px-3">
+              {recent.map((term) => (
+                <button
+                  key={term}
+                  type="button"
+                  onClick={() => { setQ(term); setDebouncedQ(term.trim()) }}
+                  className="flex items-center gap-1.5 rounded-full border bg-card px-3 py-1.5 text-sm text-muted-foreground transition-colors press-scale hover:bg-accent/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <Search className="h-3 w-3 shrink-0" aria-hidden />
+                  <span className="max-w-48 truncate">{term}</span>
+                </button>
+              ))}
+            </div>
+          </section>
+        ) : null}
         {isEmpty ? (
           <EmptyState icon={SearchX} title={t('library.search.noResults')} className="py-12" />
         ) : (
@@ -156,10 +225,7 @@ export function SearchOverlay({ onClose, onSelectFolder, onSelectTab, onSelectTa
                   <button
                     key={tb.id}
                     type="button"
-                    onClick={() => {
-                      onSelectTab(tb.id);
-                      onClose();
-                    }}
+                    onClick={() => jumpTo(() => onSelectTab(tb.id))}
                     className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-start text-sm transition-colors press-scale hover:bg-accent/60"
                   >
                     <span
@@ -186,10 +252,7 @@ export function SearchOverlay({ onClose, onSelectFolder, onSelectTab, onSelectTa
                   <button
                     key={f.id}
                     type="button"
-                    onClick={() => {
-                      onSelectFolder(f.id);
-                      onClose();
-                    }}
+                    onClick={() => jumpTo(() => onSelectFolder(f.id))}
                     className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-start text-sm transition-colors press-scale hover:bg-accent/60"
                   >
                     <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-surface-variant text-base" aria-hidden>
@@ -213,10 +276,7 @@ export function SearchOverlay({ onClose, onSelectFolder, onSelectTab, onSelectTa
                   <button
                     key={tg.id}
                     type="button"
-                    onClick={() => {
-                      onSelectTag(tg.id);
-                      onClose();
-                    }}
+                    onClick={() => jumpTo(() => onSelectTag(tg.id))}
                     className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-start text-sm transition-colors press-scale hover:bg-accent/60"
                   >
                     <span

@@ -19,11 +19,16 @@ const DB_NAME = 'nanote';
 // NotFoundError forever. Bumping to v4 forces ONE upgrade pass on every
 // existing install, and the contains() guards heal whatever is missing
 // without touching existing data.
-const DB_VERSION = 4;
+// v5 — LIBRARY PREVIEWS: the 'nbPreviews' store caches a rendered first-page
+// preview per notebook (content thumbnails for the file browser's Grid /
+// Large-Thumbnail view modes). Pure cache — regenerable, never user data.
+const DB_VERSION = 5;
 
 export interface ImageBlob { id: string; blob: Blob; w: number; h: number; name: string; createdAt: number }
 export interface DocRec { pageId: string; data: ArrayBuffer }
 export interface ThumbRec { pageId: string; dataUrl: string; updatedAt: number }
+/** first-page content preview for the library file browser (pure cache) */
+export interface NbPreviewRec { notebookId: string; dataUrl: string; rev: string }
 export interface QuarantineRec { id: string; pageId: string; size: number; at: number; reason: string }
 
 let dbp: Promise<IDBPDatabase | null> | null = null;
@@ -40,6 +45,7 @@ const mem = {
   pagedocs: new Map<string, DocRec>(),
   pdftext: new Map<string, PdfTextRec>(),
   thumbs: new Map<string, ThumbRec>(),
+  nbPreviews: new Map<string, NbPreviewRec>(),
   images: new Map<string, ImageBlob>(),
   audio: new Map<string, { id: string; blob: Blob }>(),
   recordings: new Map<string, RecordingRow>(),
@@ -74,6 +80,8 @@ async function get(): Promise<IDBPDatabase | null> {
         }
         if (!db.objectStoreNames.contains('pagedocs')) db.createObjectStore('pagedocs', { keyPath: 'pageId' });
         if (!db.objectStoreNames.contains('thumbs')) db.createObjectStore('thumbs', { keyPath: 'pageId' });
+        // v5: library content previews (cache only — safe to drop/regenerate)
+        if (!db.objectStoreNames.contains('nbPreviews')) db.createObjectStore('nbPreviews', { keyPath: 'notebookId' });
         if (!db.objectStoreNames.contains('images')) db.createObjectStore('images', { keyPath: 'id' });
         if (!db.objectStoreNames.contains('audio')) db.createObjectStore('audio', { keyPath: 'id' });
         if (!db.objectStoreNames.contains('recordings')) {
@@ -98,7 +106,10 @@ async function get(): Promise<IDBPDatabase | null> {
 
 async function put<T>(store: keyof typeof mem, value: T & { id?: string }) {
   const d = await get();
-  const key = (value as { id?: string }).id ?? (value as { pageId?: string }).pageId;
+  const key =
+    (value as { id?: string }).id ??
+    (value as { pageId?: string }).pageId ??
+    (value as { notebookId?: string }).notebookId;
   if (d) {
     // 'meta' has no keyPath (out-of-line keys) — an explicit key is required;
     // every other store has a keyPath and must NOT receive one.
@@ -253,6 +264,16 @@ export async function clearThumbs() {
   else mem.thumbs.clear();
 }
 
+// ------------------------------------------------------------------ notebook content previews (library browse cache)
+export const getNbPreview = (notebookId: string) => getOne<NbPreviewRec>('nbPreviews', notebookId);
+export const putNbPreview = (rec: NbPreviewRec) => put('nbPreviews', rec);
+export const deleteNbPreview = (notebookId: string) => del('nbPreviews', notebookId);
+export async function clearNbPreviews() {
+  const d = await get();
+  if (d) { const tx = d.transaction('nbPreviews', 'readwrite'); await tx.objectStore('nbPreviews').clear(); }
+  else mem.nbPreviews.clear();
+}
+
 // ------------------------------------------------------------------ images (covers, template customs, inserted images, pdf backgrounds + originals)
 export const getImage = (id: string) => getOne<ImageBlob>('images', id);
 export const listImages = () => getAll<ImageBlob>('images');
@@ -379,7 +400,7 @@ export async function estimateAudioBytes(): Promise<number> {
 
 // ------------------------------------------------------------------ full wipe (backup restore)
 const STORE_NAMES: (keyof typeof mem)[] = [
-  'meta', 'folders', 'notebooks', 'pages', 'pagedocs', 'thumbs',
+  'meta', 'folders', 'notebooks', 'pages', 'pagedocs', 'thumbs', 'nbPreviews',
   'images', 'audio', 'recordings', 'tags', 'quarantined', 'tabs', 'pdftext', 'langpacks',
 ];
 

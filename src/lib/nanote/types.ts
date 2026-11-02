@@ -227,6 +227,80 @@ export function migratePenShortcuts(raw: unknown): PenShortcutPrefs {
   return out;
 }
 
+// ---------------------------------------------------------------- library browsing
+/** Library view modes.
+ *  grid    — classic cover cards
+ *  list    — detailed rows (thumbnail + title + meta + tags)
+ *  compact — dense single-line rows (many files on screen)
+ *  preview — large content previews (first-page render) */
+export type LibraryViewMode = 'grid' | 'list' | 'compact' | 'preview';
+/** sort keys for the file browser */
+export type LibrarySortKey = 'opened' | 'modified' | 'created' | 'title' | 'type' | 'pages';
+export type LibrarySortDir = 'asc' | 'desc';
+/** content filters (work in every view mode; combine with tab/folder context) */
+export type LibraryTypeFilter = 'all' | 'notes' | 'pdf' | 'favorites' | 'recent' | 'stale';
+
+/** Persisted library browsing preferences (localStorage — no DB schema impact,
+ *  restored on app relaunch). */
+export interface LibraryPrefs {
+  view: LibraryViewMode;
+  sortKey: LibrarySortKey;
+  sortDir: LibrarySortDir;
+  filter: LibraryTypeFilter;
+  /** target card width in px for grid/preview modes (clamped 140..360) */
+  cardSize: number;
+  /** auto column count from container width (tablet-friendly) vs manual */
+  autoColumns: boolean;
+  /** manual column override used when autoColumns === false (2..10) */
+  columns: number;
+  /** show last-modified dates on cards/rows */
+  showDates: boolean;
+  /** show meta info (page count, folder, type) */
+  showInfo: boolean;
+  /** grid mode: show the first-page CONTENT preview instead of the cover art */
+  showPreviewInGrid: boolean;
+  /** spacing between items */
+  density: 'compact' | 'cozy' | 'roomy';
+}
+
+export const LIBRARY_PREFS_DEFAULT: LibraryPrefs = {
+  view: 'grid',
+  sortKey: 'opened',
+  sortDir: 'desc',
+  filter: 'all',
+  cardSize: 200,
+  autoColumns: true,
+  columns: 5,
+  showDates: true,
+  showInfo: true,
+  showPreviewInGrid: false,
+  density: 'cozy',
+};
+
+/** Defensive parse of persisted prefs — unknown values fall back to defaults
+ *  (forward/backward compatible: new fields simply appear with defaults). */
+export function migrateLibraryPrefs(raw: unknown): LibraryPrefs {
+  const out = { ...LIBRARY_PREFS_DEFAULT };
+  if (!raw || typeof raw !== 'object') return out;
+  const r = raw as Record<string, unknown>;
+  const v = r.view;
+  if (v === 'grid' || v === 'list' || v === 'compact' || v === 'preview') out.view = v;
+  const sk = r.sortKey;
+  if (sk === 'opened' || sk === 'modified' || sk === 'created' || sk === 'title' || sk === 'type' || sk === 'pages') out.sortKey = sk;
+  if (r.sortDir === 'asc' || r.sortDir === 'desc') out.sortDir = r.sortDir;
+  const f = r.filter;
+  if (f === 'all' || f === 'notes' || f === 'pdf' || f === 'favorites' || f === 'recent' || f === 'stale') out.filter = f;
+  if (typeof r.cardSize === 'number' && Number.isFinite(r.cardSize)) out.cardSize = Math.min(360, Math.max(140, Math.round(r.cardSize)));
+  if (typeof r.autoColumns === 'boolean') out.autoColumns = r.autoColumns;
+  if (typeof r.columns === 'number' && Number.isFinite(r.columns)) out.columns = Math.min(10, Math.max(2, Math.round(r.columns)));
+  if (typeof r.showDates === 'boolean') out.showDates = r.showDates;
+  if (typeof r.showInfo === 'boolean') out.showInfo = r.showInfo;
+  if (typeof r.showPreviewInGrid === 'boolean') out.showPreviewInGrid = r.showPreviewInGrid;
+  const d = r.density;
+  if (d === 'compact' || d === 'cozy' || d === 'roomy') out.density = d;
+  return out;
+}
+
 export interface Settings {
   theme: ThemeMode;
   lang: Lang;

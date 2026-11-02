@@ -4,7 +4,7 @@
 import { create } from 'zustand';
 import * as db from './idb';
 import {
-  DEFAULT_SETTINGS, DEFAULT_SHAPE_STATE, DEFAULT_TOOL_STATES, EditorTool, EraserMode, FINGER_GESTURES_DEFAULT, FolderRow, ImageEl, INFINITE_GROW_MARGIN, INFINITE_GROW_STEP, migratePenShortcuts, NotebookRow,
+  DEFAULT_SETTINGS, DEFAULT_SHAPE_STATE, DEFAULT_TOOL_STATES, EditorTool, EraserMode, FINGER_GESTURES_DEFAULT, FolderRow, ImageEl, INFINITE_GROW_MARGIN, INFINITE_GROW_STEP, LIBRARY_PREFS_DEFAULT, LibraryPrefs, LibrarySortDir, LibrarySortKey, LibraryTypeFilter, LibraryViewMode, migrateLibraryPrefs, migratePenShortcuts, NotebookRow,
   PageDoc, PageElement, PageRow, PageSizeId, PdfTextRec, RecordingRow, Settings, ShapeEl, ShapeToolState, StrokeEl, TabRow, TagRow,
   TemplateId, ToolId, ToolState, UNDO_LIMIT, emptyDoc,
 } from './types';
@@ -75,8 +75,9 @@ interface AppState {
   tags: TagRow[];
   pages: PageRow[]; // all pages (rows only; docs live in IDB)
   pageCounts: Record<string, number>;
-  libraryView: 'grid' | 'list';
-  sort: 'recent' | 'title' | 'created';
+  /** persisted browsing prefs — view mode, sort key/dir, filter, sizing,
+   *  density, info toggles (localStorage-backed, survives restarts) */
+  libraryPrefs: LibraryPrefs;
   searchQuery: string;
 
   // ----- split workspace (session-scoped; layout prefs persist locally)
@@ -120,8 +121,12 @@ interface AppState {
   setSettings(patch: Partial<Settings>): Promise<void>;
 
   refreshLibrary(): Promise<void>;
-  setLibraryView(v: 'grid' | 'list'): void;
-  setSort(s: 'recent' | 'title' | 'created'): void;
+  /** patch browsing prefs (merged + persisted to localStorage immediately) */
+  setLibraryPrefs(patch: Partial<LibraryPrefs>): void;
+  /** convenience setters used across the library UI */
+  setLibraryViewMode(v: LibraryViewMode): void;
+  setLibrarySort(key: LibrarySortKey, dir?: LibrarySortDir): void;
+  setLibraryFilter(f: LibraryTypeFilter): void;
   setSearchQuery(q: string): void;
 
   createTab(name: string, emoji: string, colorHex: string): Promise<string>;
@@ -149,6 +154,12 @@ interface AppState {
   trashNotebook(id: string): Promise<void>;
   restoreNotebook(id: string): Promise<void>;
   purgeNotebook(id: string): Promise<void>;
+
+  // ----- batch operations (multi-selection) — one in-memory patch, no per-item refresh
+  trashNotebooks(ids: string[]): Promise<void>;
+  moveNotebooks(ids: string[], folderId: string | null, tabId: string | null): Promise<void>;
+  setNotebooksFavorite(ids: string[], fav: boolean): Promise<void>;
+  trashFolders(ids: string[]): Promise<void>;
 
   createTag(name: string, colorHex: string): Promise<TagRow>;
   deleteTag(id: string): Promise<void>;
@@ -290,6 +301,21 @@ function saveSplitPrefs(p: SplitPrefs) {
   try { localStorage.setItem(SPLIT_PREFS_KEY, JSON.stringify(p)) } catch { /* ignore */ }
 }
 
+// ---------------------------------------------------------------- library browsing prefs (localStorage)
+const LIB_PREFS_KEY = 'nanote.libraryPrefs';
+
+function loadLibraryPrefs(): LibraryPrefs {
+  try {
+    const raw = localStorage.getItem(LIB_PREFS_KEY);
+    if (raw) return migrateLibraryPrefs(JSON.parse(raw));
+  } catch { /* ignore */ }
+  return { ...LIBRARY_PREFS_DEFAULT };
+}
+
+function persistLibraryPrefs(p: LibraryPrefs) {
+  try { localStorage.setItem(LIB_PREFS_KEY, JSON.stringify(p)) } catch { /* ignore */ }
+}
+
 // ---------------------------------------------------------------- v2 migration (one-time)
 // Old model: flat top-level folders as the only grouping. New model: TABS are
 // the top-level edge chips; folders nest inside tabs (folder→folder→notebooks).
@@ -337,8 +363,7 @@ export const useApp = create<AppState>((set, get) => ({
   tags: [],
   pages: [],
   pageCounts: {},
-  libraryView: 'grid',
-  sort: 'recent',
+  libraryPrefs: loadLibraryPrefs(),
   searchQuery: '',
 
   split: { open: false, orientation: 'vertical', ratio: 0.5, notebookB: null },
@@ -404,7 +429,15 @@ export const useApp = create<AppState>((set, get) => ({
       tags,
       pages,
       pageCounts,
-      libraryView: migrated.defaultView,
+      // browsing prefs persist across sessions; the Settings "default view"
+      // only seeds a FRESH install (no stored prefs yet) — legacy 'list'
+      // default carries over, and the user's last-used mode always wins.
+      libraryPrefs: (() => {
+        const stored = loadLibraryPrefs();
+        const fresh = !localStorage.getItem(LIB_PREFS_KEY);
+        if (fresh && migrated.defaultView === 'list') return { ...stored, view: 'list' as LibraryViewMode };
+        return stored;
+      })(),
       view: migrated.onboarded ? { name: 'library' } : { name: 'onboarding' },
       history: [],
     });
@@ -456,8 +489,17 @@ export const useApp = create<AppState>((set, get) => ({
     });
   },
 
-  setLibraryView(v) { set({ libraryView: v }) },
-  setSort(s) { set({ sort: s }) },
+  setLibraryPrefs(patch) {
+    const next = { ...get().libraryPrefs, ...patch };
+    set({ libraryPrefs: next });
+    persistLibraryPrefs(next);
+  },
+  setLibraryViewMode(v) { get().setLibraryPrefs({ view: v }) },
+  setLibrarySort(key, dir) {
+    const cur = get().libraryPrefs;
+    get().setLibraryPrefs({ sortKey: key, sortDir: dir ?? cur.sortDir });
+  },
+  setLibraryFilter(f) { get().setLibraryPrefs({ filter: f }) },
   setSearchQuery(q) { set({ searchQuery: q }) },
 
   // ------------------------------------------------------------ tabs
@@ -472,8 +514,16 @@ export const useApp = create<AppState>((set, get) => ({
   async updateTab(id, patch) {
     const tb = get().tabs.find((x) => x.id === id);
     if (!tb) return;
-    await db.putTab({ ...tb, ...patch, updatedAt: Date.now() });
-    await get().refreshLibrary();
+    const next = { ...tb, ...patch, updatedAt: Date.now() };
+    await db.putTab(next);
+    // PERF: patch the in-memory row directly — a full refreshLibrary()
+    // re-reads EVERY table (incl. all page rows) per single rename/favorite;
+    // with thousands of notebooks that froze the library for ~100s of ms.
+    if (get().tabs.some((x) => x.id === id)) {
+      set({ tabs: get().tabs.map((x) => (x.id === id ? next : x)) });
+    } else {
+      await get().refreshLibrary();
+    }
   },
 
   async renameTab(id, name) { await get().updateTab(id, { name }) },
@@ -539,7 +589,12 @@ export const useApp = create<AppState>((set, get) => ({
     if (!f) return;
     const next = { ...f, ...patch, updatedAt: Date.now() };
     await db.putFolder(next);
-    await get().refreshLibrary();
+    // PERF: in-memory patch — no full-table re-read per rename (see updateTab)
+    if (get().folders.some((x) => x.id === id)) {
+      set({ folders: get().folders.map((x) => (x.id === id ? next : x)) });
+    } else {
+      await get().refreshLibrary();
+    }
   },
 
   async renameFolder(id, name) { await get().updateFolder(id, { name }) },
@@ -558,24 +613,8 @@ export const useApp = create<AppState>((set, get) => ({
   },
 
   async trashFolder(id) {
-    const now = Date.now();
-    const { folders, notebooks } = get();
-    const descend = (fid: string, acc: string[]) => {
-      acc.push(fid);
-      for (const f of folders) if (f.parentId === fid) descend(f.id, acc);
-      return acc;
-    };
-    const ids = descend(id, []);
-    for (const fid of ids) {
-      const f = folders.find((x) => x.id === fid);
-      if (f) await db.putFolder({ ...f, deletedAt: now, updatedAt: now });
-    }
-    for (const n of notebooks) {
-      if (n.folderId && ids.includes(n.folderId) && n.deletedAt == null) {
-        await db.putNotebook({ ...n, deletedAt: now, updatedAt: now });
-      }
-    }
-    await get().refreshLibrary();
+    // shared batch path — one in-memory patch, no full-table re-read
+    await get().trashFolders([id]);
   },
 
   async restoreFolder(id) {
@@ -666,7 +705,14 @@ export const useApp = create<AppState>((set, get) => ({
     if (!n) return;
     const next = { ...n, ...patch, updatedAt: Date.now() };
     await db.putNotebook(next);
-    await get().refreshLibrary();
+    // PERF: in-memory patch when the row is already loaded — rename / favorite
+    // / move / tag edits must not re-read every IDB table (see updateTab).
+    // Library sorts re-derive from state, so array order here is irrelevant.
+    if (get().notebooks.some((x) => x.id === id)) {
+      set({ notebooks: get().notebooks.map((x) => (x.id === id ? next : x)) });
+    } else {
+      await get().refreshLibrary();
+    }
   },
 
   async renameNotebook(id, title) { await get().updateNotebook(id, { title }) },
@@ -718,8 +764,10 @@ export const useApp = create<AppState>((set, get) => ({
   async trashNotebook(id) {
     const n = get().notebooks.find((x) => x.id === id);
     if (!n) return;
-    await db.putNotebook({ ...n, deletedAt: Date.now(), updatedAt: Date.now() });
-    await get().refreshLibrary();
+    const now = Date.now();
+    await db.putNotebook({ ...n, deletedAt: now, updatedAt: now });
+    // PERF: single-row trash — in-memory patch, no full refresh
+    set({ notebooks: get().notebooks.map((x) => (x.id === id ? { ...x, deletedAt: now, updatedAt: now } : x)) });
   },
 
   async restoreNotebook(id) {
@@ -767,8 +815,77 @@ export const useApp = create<AppState>((set, get) => ({
         await db.deleteRecording(r.id);
       }
     }
+    await db.deleteNbPreview(id); // cached library preview (regenerable)
     await db.deleteNotebookRow(id);
     await get().refreshLibrary();
+  },
+
+  // ------------------------------------------------------------ batch operations (multi-selection)
+  // PERF MODEL: every action writes the affected rows to IDB, then applies ONE
+  // in-memory patch — a batch of N items costs one render, not N full-table
+  // re-reads (refreshLibrary re-reads every notebook/folder/page row).
+  async trashNotebooks(ids) {
+    if (!ids.length) return;
+    const now = Date.now();
+    const set_ = new Set(ids);
+    const rows = get().notebooks.filter((n) => set_.has(n.id) && n.deletedAt == null);
+    if (!rows.length) return;
+    await Promise.all(rows.map((n) => db.putNotebook({ ...n, deletedAt: now, updatedAt: now })));
+    set({
+      notebooks: get().notebooks.map((n) =>
+        set_.has(n.id) && n.deletedAt == null ? { ...n, deletedAt: now, updatedAt: now } : n),
+    });
+  },
+
+  async moveNotebooks(ids, folderId, tabId) {
+    if (!ids.length) return;
+    const { folders } = get();
+    const target = folderId ? folders.find((f) => f.id === folderId) : undefined;
+    const effTabId = target ? target.tabId : tabId;
+    const now = Date.now();
+    const set_ = new Set(ids);
+    const rows = get().notebooks.filter((n) => set_.has(n.id));
+    if (!rows.length) return;
+    const updated = rows.map((n) => ({ ...n, folderId, tabId: effTabId, updatedAt: now }));
+    await Promise.all(updated.map((n) => db.putNotebook(n)));
+    const byId = new Map(updated.map((n) => [n.id, n]));
+    set({ notebooks: get().notebooks.map((n) => byId.get(n.id) ?? n) });
+  },
+
+  async setNotebooksFavorite(ids, fav) {
+    if (!ids.length) return;
+    const now = Date.now();
+    const set_ = new Set(ids);
+    const rows = get().notebooks.filter((n) => set_.has(n.id) && n.isFavorite !== fav);
+    if (!rows.length) return;
+    const updated = rows.map((n) => ({ ...n, isFavorite: fav, updatedAt: now }));
+    await Promise.all(updated.map((n) => db.putNotebook(n)));
+    const byId = new Map(updated.map((n) => [n.id, n]));
+    set({ notebooks: get().notebooks.map((n) => byId.get(n.id) ?? n) });
+  },
+
+  async trashFolders(ids) {
+    if (!ids.length) return;
+    const now = Date.now();
+    const { folders, notebooks } = get();
+    // collect every subtree rooted at the selected folders
+    const all = new Set<string>();
+    const descend = (fid: string) => {
+      if (all.has(fid)) return;
+      all.add(fid);
+      for (const f of folders) if (f.parentId === fid) descend(f.id);
+    };
+    for (const id of ids) descend(id);
+    const deadFolders = folders.filter((f) => all.has(f.id) && f.deletedAt == null).map((f) => ({ ...f, deletedAt: now, updatedAt: now }));
+    const deadNbs = notebooks.filter((n) => n.folderId != null && all.has(n.folderId) && n.deletedAt == null).map((n) => ({ ...n, deletedAt: now, updatedAt: now }));
+    await Promise.all(deadFolders.map((f) => db.putFolder(f)));
+    await Promise.all(deadNbs.map((n) => db.putNotebook(n)));
+    const fmap = new Map(deadFolders.map((f) => [f.id, f]));
+    const nmap = new Map(deadNbs.map((n) => [n.id, n]));
+    set({
+      folders: folders.map((f) => fmap.get(f.id) ?? f),
+      notebooks: notebooks.map((n) => nmap.get(n.id) ?? n),
+    });
   },
 
   // ------------------------------------------------------------ tags

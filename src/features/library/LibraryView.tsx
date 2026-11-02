@@ -1,22 +1,19 @@
 'use client';
 // Nanote Library — the app home. Header with view tabs (All / Favorites /
 // Trash), TAB chips on the screen edge (the top-level grouping), in-place
-// nested folder navigation with a breadcrumb, notebook grid/list with
-// sort/tag filters, trash, favorites, full-screen search and the create FAB.
+// nested folder navigation with a breadcrumb, 4 view modes (grid / list /
+// compact / large previews) with persisted sort + filter + layout prefs,
+// content previews, multi-selection with batch operations, progressive
+// rendering for huge libraries, trash, full-screen search and the create FAB.
 // 100% client-side against the Zustand/IndexedDB store.
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
-  ArrowUpDown, ChevronDown, FolderOpen, FolderPlus, LayoutGrid, List as ListIcon, Monitor,
-  Moon, NotebookPen, NotebookText, Plus, Search, Settings as SettingsIcon,
-  Star, Sun, Trash2, X,
+  FolderOpen, FolderPlus, Monitor, Moon, NotebookPen, NotebookText, Plus, Search,
+  Settings as SettingsIcon, SlidersHorizontal, Star, Sun, Trash2, X,
 } from 'lucide-react';
 import { AppIcon } from '@/components/nanote/AppIcon';
 import { EmptyState } from '@/components/nanote/EmptyState';
 import { Button } from '@/components/ui/button';
-import {
-  DropdownMenu, DropdownMenuContent, DropdownMenuRadioGroup,
-  DropdownMenuRadioItem, DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { recallNav, rememberNav } from '@/lib/nanote/pagemem';
 import { useApp, useT } from '@/lib/nanote/store';
@@ -25,6 +22,7 @@ import { cn } from '@/lib/utils';
 import { BreadcrumbBar } from './BreadcrumbBar';
 import { ConfirmDialog } from './ConfirmDialog';
 import { FabMenu } from './FabMenu';
+import { FilterChips, SortMenu, ViewModeSelector, ViewSettingsButton } from './LibraryToolbar';
 import { FolderCard } from './FolderCard';
 import { FolderDialog, type FolderDialogState } from './FolderDialogs';
 import { MoveDialog } from './MoveDialog';
@@ -34,6 +32,7 @@ import { NotebookListRow } from './NotebookListRow';
 import { type NotebookDialogKind } from './NotebookMenu';
 import { RenameNotebookDialog } from './NotebookDialogs';
 import { SearchOverlay } from './SearchOverlay';
+import { SelectionBar } from './SelectionBar';
 import { TabChipRow } from './TabChipRow';
 import { TabDialog, type TabDialogState } from './TabDialogs';
 import { TagDialog } from './TagDialog';
@@ -41,7 +40,12 @@ import { TrashList } from './TrashList';
 import { notebookCountsByFolder } from './folderUtils';
 
 type HeaderTabId = 'all' | 'favorites' | 'trash';
-type SortId = 'recent' | 'title' | 'created';
+
+/** progressive rendering: files mount in chunks so a library with thousands
+ *  of notebooks never lays out thousands of DOM nodes on open */
+const CHUNK = 60;
+const RECENT_MS = 7 * 24 * 60 * 60 * 1000;   // "recent" = edited within 7 days
+const STALE_MS = 30 * 24 * 60 * 60 * 1000;   // "older"  = untouched for 30 days
 
 // Module-scope memory of the last tab/folder context so returning from the
 // editor (or settings) drops the user back where they were browsing.
@@ -57,8 +61,9 @@ export default function LibraryView() {
   const folders = useApp((s) => s.folders);
   const tabs = useApp((s) => s.tabs);
   const tags = useApp((s) => s.tags);
-  const sort = useApp((s) => s.sort);
-  const libraryView = useApp((s) => s.libraryView);
+  const pages = useApp((s) => s.pages);
+  const pageCounts = useApp((s) => s.pageCounts);
+  const prefs = useApp((s) => s.libraryPrefs);
   const settings = useApp((s) => s.settings);
   const theme = settings.theme;
 
@@ -74,6 +79,20 @@ export default function LibraryView() {
   const [deleteFolderTarget, setDeleteFolderTarget] = useState<FolderRow | null>(null);
   const [deleteTabTarget, setDeleteTabTarget] = useState<TabRow | null>(null);
   const [moveFolderTarget, setMoveFolderTarget] = useState<FolderRow | null>(null);
+  const [batchDeleteOpen, setBatchDeleteOpen] = useState(false);
+
+  // ----- multi-selection state
+  const [selMode, setSelMode] = useState(false);
+  const [selNb, setSelNb] = useState<ReadonlySet<string>>(new Set());
+  const [selFolders, setSelFolders] = useState<ReadonlySet<string>>(new Set());
+
+  // ----- progressive rendering + responsive columns
+  const [renderCount, setRenderCount] = useState(CHUNK);
+  const [contentW, setContentW] = useState(0);
+  const mainRef = useRef<HTMLElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const sentinelRef = useRef<HTMLDivElement>(null);
+  const scrollRatioRef = useRef(0);
 
   // ----- derived data
   const liveNotebooks = useMemo(() => notebooks.filter((n) => n.deletedAt == null), [notebooks]);
@@ -85,6 +104,15 @@ export default function LibraryView() {
   const folderById = useMemo(() => new Map(liveFolders.map((f) => [f.id, f])), [liveFolders]);
   const tabById = useMemo(() => new Map(liveTabs.map((tb) => [tb.id, tb])), [liveTabs]);
   const tagById = useMemo(() => new Map(tags.map((tg) => [tg.id, tg])), [tags]);
+
+  /** notebooks that contain a PDF document (stored original or PDF page
+   *  backgrounds) — powers the PDF filter, badge and "type" sort */
+  const pdfNbIds = useMemo(() => {
+    const set = new Set<string>();
+    for (const n of notebooks) if (n.pdfOriginalId != null) set.add(n.id);
+    for (const p of pages) if (p.backgroundImageId) set.add(p.notebookId);
+    return set;
+  }, [notebooks, pages]);
 
   // NOTE: the selection self-heals during render — ids of trashed rows resolve
   // to null below, and a folder moved into another tab carries the active tab
@@ -102,6 +130,19 @@ export default function LibraryView() {
     rememberNav(lastNav.tabId, lastNav.folderId);
   }, [effTabId, activeFolder]);
 
+  // -------------------------------------------------------- filtering + sort
+  const coll = lang === 'ar' ? 'ar' : 'en';
+  const sortDir = prefs.sortDir === 'asc' ? 1 : -1;
+
+  const cmpFolders = useCallback((a: FolderRow, b: FolderRow): number => {
+    switch (prefs.sortKey) {
+      case 'created': return (a.createdAt - b.createdAt) * sortDir;
+      case 'modified': return (a.updatedAt - b.updatedAt) * sortDir;
+      case 'title': return a.name.localeCompare(b.name, coll) * sortDir;
+      default: return a.name.localeCompare(b.name, coll);
+    }
+  }, [prefs.sortKey, sortDir, coll]);
+
   const visibleFolders = useMemo(() => {
     if (!inTabView || !effTabId) return [];
     // inside a folder the parentId chain is the truth; at the tab root the
@@ -113,8 +154,8 @@ export default function LibraryView() {
           ? f.parentId === parentId
           : f.tabId === effTabId && f.parentId == null,
       )
-      .sort((a, b) => a.name.localeCompare(b.name, lang === 'ar' ? 'ar' : 'en'));
-  }, [inTabView, effTabId, liveFolders, activeFolder, lang]);
+      .sort(cmpFolders);
+  }, [inTabView, effTabId, liveFolders, activeFolder, cmpFolders]);
 
   const folderNbCounts = useMemo(() => notebookCountsByFolder(liveNotebooks), [liveNotebooks]);
   const childFolderCounts = useMemo(() => {
@@ -135,16 +176,36 @@ export default function LibraryView() {
         : // tab root: stored tabId + no folder
           list.filter((n) => n.tabId === effTabId && n.folderId == null);
     }
+    // content filter (works in every view mode + every context)
+    const now = Date.now();
+    switch (prefs.filter) {
+      case 'notes': list = list.filter((n) => !pdfNbIds.has(n.id)); break;
+      case 'pdf': list = list.filter((n) => pdfNbIds.has(n.id)); break;
+      case 'favorites': list = list.filter((n) => n.isFavorite); break;
+      case 'recent': list = list.filter((n) => now - n.updatedAt < RECENT_MS); break;
+      case 'stale': list = list.filter((n) => now - n.updatedAt > STALE_MS); break;
+      default: break;
+    }
     if (tagFilter) list = list.filter((n) => n.tagIds.includes(tagFilter));
     const sorted = [...list];
-    if (sort === 'recent') sorted.sort((a, b) => b.lastOpenedAt - a.lastOpenedAt);
-    else if (sort === 'title') sorted.sort((a, b) => a.title.localeCompare(b.title, lang === 'ar' ? 'ar' : 'en'));
-    else sorted.sort((a, b) => b.createdAt - a.createdAt);
+    sorted.sort((a, b) => {
+      switch (prefs.sortKey) {
+        case 'title': return a.title.localeCompare(b.title, coll) * sortDir;
+        case 'created': return (a.createdAt - b.createdAt) * sortDir;
+        case 'modified': return (a.updatedAt - b.updatedAt) * sortDir;
+        case 'type':
+          return ((pdfNbIds.has(a.id) ? 1 : 0) - (pdfNbIds.has(b.id) ? 1 : 0)) * sortDir
+            || (b.lastOpenedAt - a.lastOpenedAt);
+        case 'pages':
+          return ((pageCounts[a.id] ?? 0) - (pageCounts[b.id] ?? 0)) * sortDir
+            || (b.lastOpenedAt - a.lastOpenedAt);
+        default: return (a.lastOpenedAt - b.lastOpenedAt) * sortDir; // 'opened'
+      }
+    });
     return sorted;
-  }, [liveNotebooks, headerTab, inTabView, effTabId, activeFolder, tagFilter, sort, lang]);
+  }, [liveNotebooks, headerTab, inTabView, effTabId, activeFolder, prefs.filter, prefs.sortKey, sortDir, tagFilter, lang, pdfNbIds, pageCounts, coll]);
 
-  const sortLabel =
-    sort === 'recent' ? t('library.sort.recent') : sort === 'title' ? t('library.sort.title') : t('library.sort.created');
+  const filterActive = prefs.filter !== 'all' || !!tagFilter;
 
   const heading =
     headerTab === 'favorites'
@@ -158,6 +219,134 @@ export default function LibraryView() {
             : t('library.tab.all');
   const headingEmoji =
     headerTab === 'all' ? (activeFolder ? activeFolder.emoji : effTab && !activeFolder ? effTab.emoji : null) : null;
+
+  // -------------------------------------------------------- selection helpers
+  const exitSelection = useCallback(() => {
+    setSelMode(false);
+    setSelNb(new Set());
+    setSelFolders(new Set());
+  }, []);
+
+  const toggleSelectNb = useCallback((id: string) => {
+    setSelNb((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
+  const toggleSelectFolder = useCallback((id: string) => {
+    setSelFolders((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
+  const startSelection = useCallback((kind: 'nb' | 'folder', id: string) => {
+    setSelMode(true);
+    if (kind === 'nb') setSelNb(new Set([id]));
+    else setSelFolders(new Set([id]));
+  }, []);
+
+  // leave selection mode when the browsing context changes
+  useEffect(() => {
+    exitSelection();
+  }, [activeFolderId, effTabId, headerTab, exitSelection]);
+
+  // Escape leaves selection mode
+  useEffect(() => {
+    if (!selMode) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') exitSelection(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [selMode, exitSelection]);
+
+  const selCount = selNb.size + selFolders.size;
+  const totalSelectable = visibleFolders.length + visible.length;
+
+  const selectAll = () => {
+    setSelFolders(new Set(visibleFolders.map((f) => f.id)));
+    setSelNb(new Set(visible.map((n) => n.id)));
+  };
+
+  const batchDelete = async () => {
+    try {
+      await useApp.getState().trashFolders([...selFolders]);
+      await useApp.getState().trashNotebooks([...selNb]);
+      // items trashed from the current view drop out of `visible` naturally
+      exitSelection();
+    } catch {
+      // deletion failures keep the selection so nothing is silently lost
+    }
+  };
+
+  // -------------------------------------------------------- progressive mount
+  // reset the chunk window when the RESULT SET identity changes (context,
+  // filter, sort, view mode) — fresh contexts start from the top
+  useEffect(() => {
+    setRenderCount(CHUNK);
+  }, [activeFolderId, effTabId, headerTab, prefs.filter, prefs.sortKey, prefs.sortDir, prefs.view, tagFilter]);
+
+  useEffect(() => {
+    const el = sentinelRef.current;
+    if (!el) return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setRenderCount((c) => (c < visible.length ? Math.min(c + CHUNK, visible.length) : c));
+        }
+      },
+      { root: mainRef.current, rootMargin: '900px 0px' },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [visible.length, renderCount]);
+
+  // -------------------------------------------------------- responsive columns
+  useLayoutEffect(() => {
+    const el = contentRef.current;
+    if (!el) return;
+    let raf = 0;
+    const measure = () => {
+      raf = 0;
+      const w = el.clientWidth;
+      setContentW((s) => (Math.abs(s - w) < 1 ? s : w));
+    };
+    const schedule = () => { if (!raf) raf = requestAnimationFrame(measure); };
+    const ro = new ResizeObserver(schedule);
+    ro.observe(el);
+    measure();
+    return () => {
+      ro.disconnect();
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, []);
+
+  const gridish = prefs.view === 'grid' || prefs.view === 'preview';
+  const gridGap = prefs.density === 'compact' ? 8 : prefs.density === 'roomy' ? 20 : 14;
+  const rowGap = prefs.density === 'compact' ? 6 : prefs.density === 'roomy' ? 14 : 10;
+  const columns = useMemo(() => {
+    if (!gridish) return 0;
+    if (!prefs.autoColumns) return prefs.columns;
+    if (contentW < 2) return 4; // pre-measure placeholder
+    return Math.max(2, Math.min(10, Math.floor((contentW + gridGap) / (prefs.cardSize + gridGap))));
+  }, [gridish, prefs.autoColumns, prefs.columns, prefs.cardSize, contentW, gridGap]);
+
+  // keep the scroll POSITION across view-mode switches: track the scroll
+  // ratio continuously, restore it after the new layout settles (one paint)
+  const onMainScroll = useCallback(() => {
+    const el = mainRef.current;
+    if (!el) return;
+    const max = el.scrollHeight - el.clientHeight;
+    scrollRatioRef.current = max > 0 ? el.scrollTop / max : 0;
+  }, []);
+  const prevViewRef = useRef(prefs.view);
+  useLayoutEffect(() => {
+    const el = mainRef.current;
+    if (!el || prevViewRef.current === prefs.view) return;
+    prevViewRef.current = prefs.view;
+    const max = el.scrollHeight - el.clientHeight;
+    el.scrollTop = scrollRatioRef.current * max;
+  }, [prefs.view]);
 
   // ----- header actions
   const cycleTheme = () => {
@@ -197,8 +386,29 @@ export default function LibraryView() {
 
   // ----- empty states
   const renderEmpty = () => {
-    if (headerTab === 'favorites') {
+    if (headerTab === 'favorites' && !filterActive) {
       return <EmptyState icon={Star} title={t('library.empty.title')} hint={t('library.empty.favorites')} />;
+    }
+    if (filterActive) {
+      return (
+        <EmptyState
+          icon={SlidersHorizontal}
+          title={t('library.empty.title')}
+          hint={t('library.empty.filter', 'No items match the current filters.', 'لا عناصر تطابق التصفية الحالية.')}
+          action={
+            <Button
+              variant="outline"
+              onClick={() => {
+                useApp.getState().setLibraryFilter('all');
+                setTagFilter(null);
+              }}
+              className="press-scale rounded-full"
+            >
+              <X className="h-4 w-4" aria-hidden /> {t('library.clearFilter', 'Clear filter', 'مسح التصفية')}
+            </Button>
+          }
+        />
+      );
     }
     if (inTabView) {
       return (
@@ -287,10 +497,17 @@ export default function LibraryView() {
   );
 
   const showFoldersSection = inTabView;
+  const listish = prefs.view === 'list' || prefs.view === 'compact';
 
   const countBadge = inTabView
     ? `${fmt(t('library.folderCount'), { count: visibleFolders.length })} · ${fmt(t('library.notebookCount'), { count: visible.length })}`
     : String(visible.length);
+
+  const gridStyle = {
+    display: 'grid',
+    gridTemplateColumns: `repeat(${Math.max(2, columns)}, minmax(0, 1fr))`,
+    gap: `${gridGap}px`,
+  } as React.CSSProperties;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-background">
@@ -390,12 +607,28 @@ export default function LibraryView() {
         />
       ) : null}
 
+      {/* --------------------------------------------- multi-selection action bar */}
+      {selMode && headerTab !== 'trash' ? (
+        <SelectionBar
+          nbIds={[...selNb]}
+          folderIds={[...selFolders]}
+          onExit={exitSelection}
+          onSelectAll={selectAll}
+          onDelete={() => setBatchDeleteOpen(true)}
+          totalSelectable={totalSelectable}
+        />
+      ) : null}
+
       {/* -------------------------------------------------------- main area */}
-      <main className="nanote-scroll min-h-0 min-w-0 flex-1 overflow-y-auto p-4 pb-24 sm:p-6 sm:pb-24 lg:pb-8">
+      <main
+        ref={mainRef}
+        onScroll={onMainScroll}
+        className="nanote-scroll min-h-0 min-w-0 flex-1 overflow-y-auto p-4 pb-24 sm:p-6 sm:pb-24 lg:pb-8"
+      >
         {headerTab === 'trash' ? (
           <TrashList />
         ) : (
-          <>
+          <div ref={contentRef} className="min-w-0">
             <div className="mb-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-1">
               <h1 className="flex items-center gap-2 text-lg font-bold">
                 {headingEmoji ? <span aria-hidden>{headingEmoji}</span> : null}
@@ -406,100 +639,53 @@ export default function LibraryView() {
               </span>
             </div>
 
-            {/* toolbar */}
-            <div className="mb-4 flex flex-wrap items-center gap-2" role="toolbar" aria-label={t('library.sort')}>
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button variant="outline" size="sm" aria-label={t('library.sort')} className="press-scale gap-1.5">
-                    <ArrowUpDown className="h-4 w-4" aria-hidden />
-                    {sortLabel}
-                    <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" aria-hidden />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="start">
-                  <DropdownMenuRadioGroup
-                    value={sort}
-                    onValueChange={(v) => useApp.getState().setSort(v as SortId)}
-                  >
-                    <DropdownMenuRadioItem value="recent">{t('library.sort.recent')}</DropdownMenuRadioItem>
-                    <DropdownMenuRadioItem value="title">{t('library.sort.title')}</DropdownMenuRadioItem>
-                    <DropdownMenuRadioItem value="created">{t('library.sort.created')}</DropdownMenuRadioItem>
-                  </DropdownMenuRadioGroup>
-                </DropdownMenuContent>
-              </DropdownMenu>
-
-              <div
-                className="flex items-center rounded-lg border bg-card p-0.5"
-                role="group"
-                aria-label={t('settings.defaultView')}
-              >
-                <button
-                  type="button"
-                  aria-label={t('library.view.grid')}
-                  aria-pressed={libraryView === 'grid'}
-                  onClick={() => useApp.getState().setLibraryView('grid')}
-                  className={cn(
-                    'flex h-8 w-8 items-center justify-center rounded-md transition-colors press-scale',
-                    libraryView === 'grid'
-                      ? 'bg-accent text-accent-foreground'
-                      : 'text-muted-foreground hover:bg-accent/60',
-                  )}
-                >
-                  <LayoutGrid className="h-4 w-4" aria-hidden />
-                </button>
-                <button
-                  type="button"
-                  aria-label={t('library.view.list')}
-                  aria-pressed={libraryView === 'list'}
-                  onClick={() => useApp.getState().setLibraryView('list')}
-                  className={cn(
-                    'flex h-8 w-8 items-center justify-center rounded-md transition-colors press-scale',
-                    libraryView === 'list'
-                      ? 'bg-accent text-accent-foreground'
-                      : 'text-muted-foreground hover:bg-accent/60',
-                  )}
-                >
-                  <ListIcon className="h-4 w-4" aria-hidden />
-                </button>
+            {/* toolbar (hidden while selecting) */}
+            {!selMode ? (
+              <div className="mb-4 flex flex-wrap items-center gap-2" role="toolbar" aria-label={t('library.sort')}>
+                <SortMenu />
+                <ViewModeSelector />
+                <ViewSettingsButton />
+                <FilterChips />
               </div>
+            ) : null}
 
-              {tags.length > 0 ? (
-                <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5" role="group" aria-label={t('library.tags')}>
-                  {tags.map((tag) => {
-                    const active = tagFilter === tag.id;
-                    return (
-                      <button
-                        key={tag.id}
-                        type="button"
-                        aria-pressed={active}
-                        onClick={() => setTagFilter(active ? null : tag.id)}
-                        className={cn(
-                          'flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors press-scale',
-                          active
-                            ? 'border-primary/60 bg-primary/10 text-primary'
-                            : 'bg-card text-muted-foreground hover:bg-accent/60 hover:text-foreground',
-                        )}
-                      >
-                        <span
-                          className="h-2.5 w-2.5 shrink-0 rounded-full"
-                          style={{ background: tag.colorHex }}
-                          aria-hidden
-                        />
-                        {tag.name}
-                        {active ? <X className="h-3 w-3 shrink-0" aria-hidden /> : null}
-                      </button>
-                    );
-                  })}
-                </div>
-              ) : null}
-            </div>
+            {/* tags */}
+            {tags.length > 0 && !selMode ? (
+              <div className="mb-4 flex min-w-0 flex-wrap items-center gap-1.5" role="group" aria-label={t('library.tags')}>
+                {tags.map((tag) => {
+                  const active = tagFilter === tag.id;
+                  return (
+                    <button
+                      key={tag.id}
+                      type="button"
+                      aria-pressed={active}
+                      onClick={() => setTagFilter(active ? null : tag.id)}
+                      className={cn(
+                        'flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors press-scale',
+                        active
+                          ? 'border-primary/60 bg-primary/10 text-primary'
+                          : 'bg-card text-muted-foreground hover:bg-accent/60 hover:text-foreground',
+                      )}
+                    >
+                      <span
+                        className="h-2.5 w-2.5 shrink-0 rounded-full"
+                        style={{ background: tag.colorHex }}
+                        aria-hidden
+                      />
+                      {tag.name}
+                      {active ? <X className="h-3 w-3 shrink-0" aria-hidden /> : null}
+                    </button>
+                  );
+                })}
+              </div>
+            ) : null}
 
             {/* folders (inside a tab) */}
             {showFoldersSection ? (
               <section aria-label={t('library.folders')} className="mb-6">
                 <h2 className="mb-2 text-sm font-semibold text-muted-foreground">{t('library.folders')}</h2>
-                {libraryView === 'grid' ? (
-                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 sm:gap-4 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6">
+                {gridish ? (
+                  <div style={gridStyle}>
                     {visibleFolders.map((f) => (
                       <FolderCard
                         key={f.id}
@@ -516,17 +702,22 @@ export default function LibraryView() {
                           setFolderDialog({ mode: 'create', parentId: folder.id, tabId: folder.tabId })
                         }
                         onDelete={(folder) => setDeleteFolderTarget(folder)}
+                        showDate={prefs.showDates}
+                        selectionMode={selMode}
+                        selected={selFolders.has(f.id)}
+                        onToggleSelect={toggleSelectFolder}
+                        onLongPressSelect={(id) => startSelection('folder', id)}
                       />
                     ))}
-                    {newFolderTileGrid}
+                    {!selMode ? newFolderTileGrid : null}
                   </div>
                 ) : (
-                  <ul className="flex flex-col gap-2">
+                  <ul className="flex flex-col" style={{ gap: `${rowGap}px` }}>
                     {visibleFolders.map((f) => (
                       <FolderCard
                         key={f.id}
                         folder={f}
-                        variant="row"
+                        variant={prefs.view === 'compact' ? 'compact' : 'row'}
                         counts={{
                           notebooks: folderNbCounts[f.id] ?? 0,
                           folders: childFolderCounts[f.id] ?? 0,
@@ -538,46 +729,75 @@ export default function LibraryView() {
                           setFolderDialog({ mode: 'create', parentId: folder.id, tabId: folder.tabId })
                         }
                         onDelete={(folder) => setDeleteFolderTarget(folder)}
+                        showDate={prefs.showDates}
+                        selectionMode={selMode}
+                        selected={selFolders.has(f.id)}
+                        onToggleSelect={toggleSelectFolder}
+                        onLongPressSelect={(id) => startSelection('folder', id)}
                       />
                     ))}
-                    {newFolderTileRow}
+                    {!selMode ? newFolderTileRow : null}
                   </ul>
                 )}
               </section>
             ) : null}
 
-            {/* grid / list */}
+            {/* grid / list / compact / preview */}
             {visible.length === 0 ? (
               renderEmpty()
             ) : (
-              <section aria-label={heading} className={cn(libraryView === 'list' && 'mx-auto w-full max-w-3xl')}>
-                {libraryView === 'grid' ? (
-                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 sm:gap-4 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6">
-                    {visible.map((nb) => (
+              <section
+                aria-label={heading}
+                className={cn(listish && 'mx-auto w-full max-w-3xl')}
+              >
+                {gridish ? (
+                  <div style={gridStyle}>
+                    {visible.slice(0, renderCount).map((nb) => (
                       <NotebookCard
                         key={nb.id}
                         notebook={nb}
                         folder={nb.folderId ? folderById.get(nb.folderId) ?? null : null}
                         onDialog={onNbDialog}
+                        variant={prefs.view === 'preview' ? 'preview' : 'grid'}
+                        preferPreview={prefs.showPreviewInGrid}
+                        isPdf={pdfNbIds.has(nb.id)}
+                        showDate={prefs.showDates}
+                        showInfo={prefs.showInfo}
+                        selectionMode={selMode}
+                        selected={selNb.has(nb.id)}
+                        onToggleSelect={toggleSelectNb}
+                        onLongPressSelect={(id) => startSelection('nb', id)}
                       />
                     ))}
                   </div>
                 ) : (
-                  <ul className="flex flex-col gap-2">
-                    {visible.map((nb) => (
+                  <ul className="flex flex-col" style={{ gap: `${rowGap}px` }}>
+                    {visible.slice(0, renderCount).map((nb) => (
                       <NotebookListRow
                         key={nb.id}
                         notebook={nb}
                         folder={nb.folderId ? folderById.get(nb.folderId) ?? null : null}
                         tagsById={tagById}
                         onDialog={onNbDialog}
+                        variant={prefs.view === 'compact' ? 'compact' : 'list'}
+                        isPdf={pdfNbIds.has(nb.id)}
+                        showDate={prefs.showDates}
+                        showInfo={prefs.showInfo}
+                        selectionMode={selMode}
+                        selected={selNb.has(nb.id)}
+                        onToggleSelect={toggleSelectNb}
+                        onLongPressSelect={(id) => startSelection('nb', id)}
                       />
                     ))}
                   </ul>
                 )}
+                {/* progressive-mount sentinel: more chunks load as it approaches */}
+                {renderCount < visible.length ? (
+                  <div ref={sentinelRef} aria-hidden className="h-px w-full" />
+                ) : null}
               </section>
             )}
-          </>
+          </div>
         )}
       </main>
 
@@ -673,6 +893,22 @@ export default function LibraryView() {
           if (!target) return;
           await useApp.getState().trashTab(target.id);
         }}
+      />
+      <ConfirmDialog
+        open={batchDeleteOpen}
+        onOpenChange={setBatchDeleteOpen}
+        title={t('common.delete')}
+        description={fmt(
+          t(
+            'library.deleteMany.confirm',
+            '{count} item(s) and their contents will be moved to trash.',
+            'سيتم نقل {count} عنصرًا ومحتوياته إلى المحذوفات.',
+          ),
+          { count: selCount },
+        )}
+        confirmLabel={t('common.delete')}
+        destructive
+        onConfirm={batchDelete}
       />
 
       {/* ------------------------------------------------------ search overlay */}
