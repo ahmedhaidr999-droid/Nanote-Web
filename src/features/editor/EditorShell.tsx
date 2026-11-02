@@ -37,7 +37,7 @@ import { recallPage } from '@/lib/nanote/pagemem';
 import {
   fitWidth, getVp, layoutPages, pageAtWorldY, scrollToPage, subscribeVp, useVp, type Vp,
   animateZoomTo, animatedFit, clampVpToWorld, setViewportSize, setVp, type PageLayout,
-  setZoomRangeFor, worldBoundsOf, fitToBounds, onVpIdle,
+  setZoomRangeFor, worldBoundsOf, fitToBounds, onVpIdle, isInteracting,
 } from './viewport';
 
 const CULL_MARGIN = 1;
@@ -201,13 +201,22 @@ export default function EditorShell({ notebookId }: { notebookId: string }) {
     if (!pagesKey) return;
     let alive = true;
     void (async () => {
+      const nap = (ms: number) => new Promise((r) => setTimeout(r, ms));
       for (const p of useApp.getState().editor.pages) {
         if (!alive) return;
+        // PERFORMANCE: never fight the user — a hidden app (home button) or an
+        // active gesture (pinch/scroll/pan) pauses the backfill entirely; the
+        // old loop fired one full-page render after another and hogged the
+        // main thread for seconds on large imported PDFs ("opening files is
+        // slow").
+        if (document.hidden) { await nap(500); continue }
         const rec = await db.getThumb(p.id);
         if (rec) continue;
         const url = await ensureThumb(p, pageW);
         if (!alive) return;
         if (url) setThumbVersion((v) => v + 1);
+        // yield the thread — keep rendering only once the user is idle again
+        do { await nap(150) } while (alive && isInteracting());
       }
     })();
     return () => { alive = false };

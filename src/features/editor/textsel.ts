@@ -260,6 +260,13 @@ function tightFragments(range: Range, scale: number): { pageId: string; rects: S
     let n: Node | null;
     while ((n = walker.nextNode())) {
       const t = n as Text;
+      // ONLY the text nodes the range actually covers. Without this guard a
+      // multi-span selection (two words from different PDF text items, or two
+      // lines) made commonAncestorContainer the page DIV — and the walker
+      // then emitted EVERY text node on the page with s=0/e=full, tinting
+      // the WHOLE page's text blue while range.toString() stayed correct
+      // ("everything looks selected but only my selection copies").
+      if (!range.intersectsNode(t)) continue;
       let s = 0, e = (t.data ?? '').length;
       if (t === range.startContainer) s = range.startOffset;
       if (t === range.endContainer) e = range.endOffset;

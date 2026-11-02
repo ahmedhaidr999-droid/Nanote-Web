@@ -246,6 +246,12 @@ export default function PageCanvas({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rasterRef = useRef(1);
   const tokenRef = useRef(0);
+  // true once THIS component instance has painted at least once. Mount paints
+  // (blank canvas) may go through the global raster queue; every later paint
+  // must stay synchronous-in-commit — a windowed recenter swaps the canvas box
+  // and its bitmap in one commit, and queueing that reintroduced the visible
+  // "strokes jump after zoom" glitch.
+  const hasPaintedRef = useRef(false);
   const idleScheduledRef = useRef(0);
   // vector background state: null = use the stored PNG snapshot
   const [vectorTick, setVectorTick] = useState(0);
@@ -259,11 +265,21 @@ export default function PageCanvas({
   const [win, setWin] = useState<Win>(() =>
     infinite ? viewportWin(layout) : fixedWin(layout, false),
   );
+  // CRITICAL: winRef must be current BEFORE any layout effect runs. It used
+  // to sync in a passive useEffect — which fires AFTER the paint layout
+  // effect — so a windowed recenter painted the OLD window's bitmap into the
+  // NEW css box: the sheet visibly stretched/shifted after every zoom settle
+  // (the "zooming moves my writing" drift). Syncing during render closes the
+  // gap: the layout effect (and anything the raster queue runs later) always
+  // sees the latest window.
   const winRef = useRef(win);
-  useEffect(() => { winRef.current = win }, [win]);
+  winRef.current = win;
   const windowed = infinite || !winIsFull(win, layout);
+  // page box for renderPage's w/h (background fit) — full padded dims.
+  // Synced during render (see winRef above) so paintFromDoc never reads a
+  // stale page box after the sheet grows.
   const layoutRef = useRef(layout);
-  useEffect(() => { layoutRef.current = layout }, [layout]);
+  layoutRef.current = layout;
 
   const audioMode: 'off' | 'highlight' | 'replay' =
     !audio.playing || !audio.recId ? 'off' : audio.replay ? 'replay' : audio.sync ? 'highlight' : 'off';
@@ -332,19 +348,32 @@ export default function PageCanvas({
     // are active (selection/move previews): that render is incomplete.
     // Windowed renders move with the viewport — caching them is pointless
     // (culling makes fresh renders cheap) — so only full fixed pages cache.
-    if (!infinite && winIsFull(w, l) && (!hidden || hidden.size === 0)) {
+    //
+    // IMAGES-COMPLETE GATE: while any referenced image (PDF background,
+    // custom template, photo/sticker elements) is still decoding,
+    // resolveImage() returns null and the render is MISSING those bitmaps.
+    // Caching such an incomplete raster poisoned the cache key forever after
+    // — every later lookup hit the blank bitmap and the page showed empty
+    // ("opened my PDF and page 1 is white"). Incomplete renders stay
+    // uncached; the image-load repaint caches the complete one under the
+    // same key, replacing nothing (it was never stored).
+    const imagesComplete =
+      (!page.backgroundImageId || !!resolveImage(page.backgroundImageId)) &&
+      (!page.customTemplateImageId || !!resolveImage(page.customTemplateImageId)) &&
+      (!doc || doc.elements.every((e) => e.kind !== 'image' || !!resolveImage(e.imageId)));
+    if (!infinite && winIsFull(w, l) && (!hidden || hidden.size === 0) && imagesComplete) {
       void putCachedRaster(
         { pageId: page.id, docVersion, raster, pageW, pageH, gamma, hiOpacity },
         canvas,
       );
     }
+    hasPaintedRef.current = true;
   }, [page, doc, docVersion, gamma, hiOpacity, pageW, pageH, infinite]);
 
   /** draw a cached bitmap (instant path — full-page renders only) */
-  const paintFromBitmap = useCallback((bmp: ImageBitmap) => {
+  const paintFromBitmap = useCallback((bmp: ImageBitmap, raster = rasterRef.current) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const raster = rasterRef.current;
     const w = Math.max(2, Math.round(pageW * raster));
     const h = Math.max(2, Math.round(pageH * raster));
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h }
@@ -354,29 +383,63 @@ export default function PageCanvas({
     ctx.imageSmoothingEnabled = true;
     ctx.clearRect(0, 0, w, h);
     ctx.drawImage(bmp, 0, 0);
+    hasPaintedRef.current = true;
   }, [pageW, pageH]);
 
-  const requestPaint = useCallback(async (tryCache = true) => {
+  const requestPaint = useCallback(async (tryCache = true, viaQueue = false) => {
     const token = ++tokenRef.current;
     const hidden = getHiddenIds(page.id);
     const cacheable = tryCache && !infinite && !windowed && (!hidden || hidden.size === 0);
     if (cacheable) {
-      const bmp = await getCachedRaster(
-        { pageId: page.id, docVersion, raster: rasterRef.current, pageW, pageH, gamma, hiOpacity },
+      // Look up the bucket the CURRENT zoom actually wants. The old key used
+      // rasterRef.current — which is 1 on a fresh mount — so a page rendered
+      // at 1.3× last session, then culled and remounted while flipping,
+      // MISSED the cache and re-rendered the full page synchronously on
+      // every single flip. Try the desired bucket first, then the base
+      // bucket as a soft fallback, and only render fresh on a double miss.
+      const want = Math.min(
+        bucketFor(getVp().scale, pageW, pageH),
+        MAX_BITMAP_DIM / Math.max(2, pageW),
+        Math.sqrt(MAX_BITMAP_AREA / Math.max(4, pageW * pageH)),
       );
-      if (token === tokenRef.current && bmp && canvasRef.current) {
-        paintFromBitmap(bmp);
-        return;
+      const base = { pageId: page.id, docVersion, pageW, pageH, gamma, hiOpacity };
+      let got: { bmp: ImageBitmap; raster: number } | null = null;
+      const first = await getCachedRaster({ ...base, raster: want });
+      if (first) got = { bmp: first, raster: want };
+      else {
+        const baseBucket = bucketFor(1, pageW, pageH);
+        if (Math.abs(want - baseBucket) > 0.01) {
+          const second = await getCachedRaster({ ...base, raster: baseBucket });
+          if (second) got = { bmp: second, raster: baseBucket };
+        }
       }
       if (token !== tokenRef.current) return; // superseded
+      if (got && canvasRef.current) {
+        rasterRef.current = got.raster;
+        paintFromBitmap(got.bmp, got.raster);
+        return;
+      }
     }
     if (token !== tokenRef.current) return;
+    // First paint of a freshly mounted page (canvas still blank): render
+    // through the GLOBAL queue (one page per animation frame). Opening a
+    // notebook mounts 2–3 pages at once; rendering them synchronously in the
+    // same commit froze the first 100–300ms of the session. Pages that
+    // already show content paint immediately — a windowed recenter must swap
+    // box+bitmap atomically in one commit.
+    if (viaQueue && !hasPaintedRef.current) {
+      rasterQueue.push(() => {
+        if (token === tokenRef.current) paintFromDoc();
+      });
+      pumpQueue();
+      return;
+    }
     paintFromDoc();
   }, [page.id, docVersion, gamma, hiOpacity, pageW, pageH, infinite, windowed, paintFromBitmap, paintFromDoc]);
 
   // referenced images load async → repaint when they arrive
   useEffect(() => {
-    void preloadPageImages(page, doc ?? null).then(() => { void requestPaint() });
+    void preloadPageImages(page, doc ?? null).then(() => { void requestPaint(true, true) });
   }, [page, doc, requestPaint]);
 
   // content changes → full paint (doc/image load, undo/redo, bucket change,
@@ -388,7 +451,7 @@ export default function PageCanvas({
   // bitmap stretched into the NEW box = the ink visibly JUMPED positions right
   // after each zoom (the "zooming moves my writing" bug).
   useLayoutEffect(() => {
-    void requestPaint(true);
+    void requestPaint(true, true);
   }, [requestPaint, rasterTick, vectorTick, win]);
 
   // transient repaints (eraser preview, selection drags hiding originals)

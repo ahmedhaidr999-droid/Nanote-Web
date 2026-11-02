@@ -46,10 +46,16 @@ function seamlessPatternFill(
   drawCell(tctx);
   const pat = ctx.createPattern(tile, 'repeat');
   if (!pat) return;
-  // map tile-bitmap px back to exact local units: tile covers cellLocal local
-  // units, so scale = cellLocal·raster / px per tile pixel — sharp at every
-  // zoom, no accumulated drift (the pattern transform composes with the CTM).
-  const s = (cellLocal * raster) / px;
+  // Map tile-bitmap px back to exact LOCAL units. The pattern transform maps
+  // PATTERN space → USER space (page-local), and the CTM then maps user →
+  // device. The tile bitmap (px pattern px) must cover exactly cellLocal
+  // local units, so s = cellLocal / px. (The previous formula multiplied by
+  // `raster` too — double-applying it: the tile covered cellLocal·raster
+  // local units, so every re-raster at a different zoom RESIZED the whole
+  // dot/grid/ruled pattern — the "dots jump to random places when zooming"
+  // bug on infinity paper. The phase also stays anchored to the absolute
+  // local grid because the pattern origin is the user-space origin.)
+  const s = cellLocal / px;
   try {
     pat.setTransform(new DOMMatrix([s, 0, 0, s, 0, 0]));
   } catch { /* very old engines: repeat unscaled — still seamless */ }

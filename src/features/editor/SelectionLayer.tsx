@@ -241,13 +241,21 @@ export function SelectionLayer({
     const rect = host.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
     const world = { x: (sx - vp.tx) / vp.scale, y: (sy - vp.ty) / vp.scale };
+    // PAGE-LOCAL pointer: element x/y are page-local, but the pointer arrives
+    // in WORLD coords (page stacking offset included). On page 2+ the raw
+    // world point is a full page-height BELOW the element — resizeImageCorner
+    // measured a huge pointer offset and the sticker exploded to its 4096 max
+    // in one frame ("suddenly grows fast and disappears"). Subtract the page
+    // origin so resize/rotate geometry happens in the element's own space.
+    const layoutY = activePageLayout.y;
+    const local = { x: world.x, y: world.y - layoutY };
     const startEl = kind === 'resize' && singleImage && imgEl ? imgEl : null;
     if (kind === 'move') dragRef.current = { kind: 'move', startWorld: world, dx: 0, dy: 0 };
     if (kind === 'resize' && corner) dragRef.current = { kind: 'resize', corner, startWorld: world, startBBox: bbox, sx: 1, sy: 1, startEl, previewEl: startEl };
     if (kind === 'rotate') {
       const img = selectedEls[0] as Extract<PageElement, { kind: 'image' }>;
       const cx = img.x + img.w / 2, cy = img.y + img.h / 2;
-      dragRef.current = { kind: 'rotate', startAngle: Math.atan2(world.y - cy, world.x - cx) - img.rotation, rotation: img.rotation };
+      dragRef.current = { kind: 'rotate', startAngle: Math.atan2(local.y - cy, local.x - cx) - img.rotation, rotation: img.rotation };
     }
     setHiddenIds(selection.pageId, new Set(selection.ids));
 
@@ -257,6 +265,8 @@ export function SelectionLayer({
       const v = getVp(); // live viewport — never a stale snapshot mid-gesture
       const px = ev.clientX - rect.left, py = ev.clientY - rect.top;
       const w = { x: (px - v.tx) / v.scale, y: (py - v.ty) / v.scale };
+      // page-local pointer (see startDrag) — resize/rotate element geometry
+      const lp = { x: w.x, y: w.y - layoutY };
       if (drag.kind === 'move') {
         drag.dx = w.x - drag.startWorld.x;
         drag.dy = w.y - drag.startWorld.y;
@@ -266,7 +276,7 @@ export function SelectionLayer({
           // by default (Shift = free), clamped to min/max side bounds — the
           // opposite corner stays GLUED to the screen (the old AABB scaling
           // visibly swam rotated images around)
-          drag.previewEl = resizeImageCorner(drag.startEl, drag.corner, w, { free: ev.shiftKey });
+          drag.previewEl = resizeImageCorner(drag.startEl, drag.corner, lp, { free: ev.shiftKey });
         }
         const b = drag.startBBox;
         const wSpan = Math.max(8, b.x1 - b.x0);
@@ -283,7 +293,7 @@ export function SelectionLayer({
       } else if (drag.kind === 'rotate') {
         const img = selectedEls[0] as Extract<PageElement, { kind: 'image' }>;
         const cx = img.x + img.w / 2, cy = img.y + img.h / 2;
-        let rot = Math.atan2(w.y - cy, w.x - cx) - drag.startAngle;
+        let rot = Math.atan2(lp.y - cy, lp.x - cx) - drag.startAngle;
         if (ev.shiftKey) rot = Math.round(rot / (Math.PI / 12)) * (Math.PI / 12); // 15° snapping
         drag.rotation = rot;
       }

@@ -204,11 +204,21 @@ export function resizeImageCorner(
   const vx = p.x - ax, vy = p.y - ay;
   const lx = vx * cos + vy * sin;
   const ly = -vx * sin + vy * cos;
-  let w1 = Math.abs(lx), h1 = Math.abs(ly);
+  // The dragged corner sits at local (sx·w'/2, sy·h'/2) from the anchor.
+  // Project the pointer onto the drag DIRECTION and clamp at 0: once the
+  // pointer crosses the anchored corner, |lx| would start GROWING again on
+  // the far side — the image flipped over and exploded to its max size in a
+  // couple of frames ("suddenly grows fast and disappears"). Clamping the
+  // directional projection means the shrink bottoms out smoothly at `min`
+  // and can never flip or run away.
+  const dxDir = Math.max(0, lx * sx);
+  const dyDir = Math.max(0, ly * sy);
+  let w1 = dxDir, h1 = dyDir;
   if (!opts.free) {
+    // aspect lock: follow the dominant axis, clamped to the bounds
     const sw = Math.min(max / w0, Math.max(min / w0, w1 / w0));
     const sh = Math.min(max / h0, Math.max(min / h0, h1 / h0));
-    const s = Math.abs(lx) / w0 > Math.abs(ly) / h0 ? sw : sh;
+    const s = dxDir / w0 > dyDir / h0 ? sw : sh;
     w1 = w0 * s; h1 = h0 * s;
   } else {
     w1 = Math.min(max, Math.max(min, w1));

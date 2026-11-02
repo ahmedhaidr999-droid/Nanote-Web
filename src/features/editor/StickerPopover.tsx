@@ -72,7 +72,9 @@ export function StickerPopover({ pageW, onClose }: { pageW: number; onClose: () 
     try {
       const prepared = await prepareSticker(source);
       if (!prepared) { toast.error(t('sticker.failed')); return }
-      const elId = await placeImageElement({ ...prepared, pageW, targetScale: 0.35 });
+      // small-to-medium on insert (~22% of the page width) — stickers land
+      // at a handy size instead of covering a third of the page
+      const elId = await placeImageElement({ ...prepared, pageW, targetScale: 0.22 });
       if (!elId) { toast.error(t('sticker.failed')); return }
       toast.success(t('sticker.inserted'), { duration: 2000 });
       onClose();
