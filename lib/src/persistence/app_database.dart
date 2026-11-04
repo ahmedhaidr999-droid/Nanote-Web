@@ -1,6 +1,8 @@
 import 'package:isar/isar.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'document_entity.dart';
+import 'settings_entity.dart';
 import 'stroke_entity.dart';
 
 /// مثيل Isar واحد مشترك لكل التطبيق.
@@ -16,6 +18,8 @@ class AppDatabase {
   /// كل مخططات التطبيق — المكان الوحيد الذي تُسجَّل فيه.
   static List<CollectionSchema<dynamic>> get schemas => [
         StrokeEntitySchema,
+        DocumentEntitySchema,
+        SettingsEntitySchema,
       ];
 
   /// الفتح مرة واحدة فقط حتى مع استدعاءات متزامنة (شاشات متعددة) —
