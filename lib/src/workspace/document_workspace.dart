@@ -8,7 +8,7 @@ import '../controllers/pdf_document_controller.dart';
 import '../controllers/stroke_engine.dart';
 import '../controllers/tool_controller.dart';
 import '../controllers/viewport_controller.dart';
-import '../persistence/stroke_repository.dart';
+import '../persistence/auto_saver.dart';
 import 'doc_geometry.dart';
 import 'gesture_router.dart';
 import 'pdf_page_tile.dart';
@@ -24,7 +24,11 @@ import 'workspace_toolbar.dart';
 ///   DocumentWorkspace(pdfPath: file.path)              // من مسار ملف
 ///   DocumentWorkspace(pdfBytes: bytes)                 // من بايتات
 ///   DocumentWorkspace(blankPages: 3)                   // دفتر فارغ
-///   DocumentWorkspace(pdfPath: p, docId: 'note-42')    // + حفظ Isar
+///   DocumentWorkspace(pdfPath: p, docId: 'note-42')    // + حفظ تلقائي
+///
+/// الحفظ التلقائي (عند تمرير [docId]): كل خط يُرسم أو يُمسح يُكتب إلى
+/// Isar لحظة حدوثه وفي الخلفية (InkAutoSaver) — دون أي تأثير على
+/// الانسيابية، ودون فقدان أي شيء عند إغلاق الشاشة.
 class DocumentWorkspace extends StatefulWidget {
   const DocumentWorkspace({
     super.key,
@@ -49,7 +53,7 @@ class DocumentWorkspace extends StatefulWidget {
   /// احقن متحكم أدوات خارجياً إذا أردت التحكم من واجهتك الخاصة.
   final ToolController? tools;
 
-  /// عند تمريره يُفعَّل الحفظ/التحميل التلقائي للحبر عبر Isar.
+  /// عند تمريره يُفعَّل الحفظ التلقائي التزايدي للحبر عبر Isar.
   final String? docId;
 
   @override
@@ -73,8 +77,7 @@ class _DocumentWorkspaceState extends State<DocumentWorkspace> {
     geometry: () => _geometry ?? DocGeometry(docWidth: 1, pdf: pdf),
   );
 
-  StrokeRepository? _repo;
-  Timer? _saveDebounce;
+  InkAutoSaver? _autoSaver;
 
   // مزامنة المتحكمات بعد اكتمال الإطار (لا notify خلال البناء)
   bool _syncScheduled = false;
@@ -105,39 +108,21 @@ class _DocumentWorkspaceState extends State<DocumentWorkspace> {
     if (mounted) setState(() {});
   }
 
+  /// فتح قاعدة الحبر وتفعيل الحفظ التلقائي التزايدي: الحبر المحفوظ
+  /// يُحمَّل أولاً ثم يُفعَّل الخطاف — بهذا الترتيب لا تُعاد كتابة ما
+  /// حُمِّل للتو عند بدء التشغيل.
   Future<void> _initPersistence() async {
-    try {
-      final repo = await StrokeRepository.open(widget.docId!);
-      _repo = repo;
-      engine.importStrokes(await repo.loadAll());
-      engine.addListener(_scheduleSave);
-    } catch (e) {
-      debugPrint('Nanote: Isar persistence disabled ($e)');
-      _repo = null;
-    }
-  }
-
-  /// حفظ تلقائي مؤجَّل — لا يكتب شيئاً أثناء الكتابة السريعة.
-  void _scheduleSave() {
-    _saveDebounce?.cancel();
-    _saveDebounce = Timer(const Duration(milliseconds: 700), () {
-      _repo?.saveAll(engine.snapshot());
-    });
+    _autoSaver = await InkAutoSaver.attach(engine, widget.docId!);
   }
 
   @override
   void dispose() {
-    _saveDebounce?.cancel();
-    final repo = _repo;
-    if (repo != null) {
-      engine.removeListener(_scheduleSave);
-      final snapshot = engine.snapshot();
-      unawaited(
-        repo.saveAll(snapshot).then((_) => repo.close()).catchError((Object e) {
-          debugPrint('Nanote: final save failed ($e)');
-        }),
-      );
-      _repo = null;
+    // تصريف كل الكتابات المعلقة ثم إسقاط الحفظ — الانتظار يجري في
+    // الخلفية فلا يجمّد إغلاق الشاشة، لكنه يضمن ألا يضيع شيء.
+    final saver = _autoSaver;
+    _autoSaver = null;
+    if (saver != null) {
+      unawaited(saver.dispose());
     }
     pdf.dispose();
     viewport.dispose();

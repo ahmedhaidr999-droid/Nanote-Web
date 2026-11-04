@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/painting.dart';
 import 'package:perfect_freehand/perfect_freehand.dart';
 
+import '../models/ink_change.dart';
 import '../models/stroke.dart';
 
 /// عملية حبر قابلة للتراجع (Dart 3 sealed → switch استنفادي آمن).
@@ -48,6 +49,12 @@ class StrokeEngine extends ChangeNotifier {
 
   int _idSeq = 0;
 
+  /// خطاف الحفظ التلقائي: يُستدعى بعد كل تعديل مُلزِم (التزام خط /
+  /// إغلاق مجموعة مسح / تراجع / إعادة / استيراد) مع وصف تفاضلي دقيق
+  /// لما تغيّر — تكتبه InkAutoSaver في الخلفية صفاً بصف.
+  /// ⚠️ يجب أن يعود فوراً؛ أي عمل I/O يبقى على عاتق المستدعي.
+  void Function(List<InkChange> changes)? onCommit;
+
   bool get canUndo => _undo.isNotEmpty;
   bool get canRedo => _redo.isNotEmpty;
 
@@ -88,6 +95,7 @@ class StrokeEngine extends ChangeNotifier {
     strokesOn(p).add(s);
     _push(AddInk(p, s));
     _notifyPage(p);
+    _emit([InkAdded(p, s)]);
   }
 
   void cancelStroke() {
@@ -134,6 +142,7 @@ class StrokeEngine extends ChangeNotifier {
     _eraseRemoved = null;
     if (page != null && removed != null && removed.isNotEmpty) {
       _push(RemoveInk(page, removed));
+      _emit([for (final s in removed) InkRemoved(s)]);
     }
   }
 
@@ -182,6 +191,7 @@ class StrokeEngine extends ChangeNotifier {
     _apply(op, forward: false);
     _redo.add(op);
     notifyListeners();
+    _emit(_persistEffect(op, forward: false));
   }
 
   void redo() {
@@ -190,6 +200,7 @@ class StrokeEngine extends ChangeNotifier {
     _apply(op, forward: true);
     _undo.add(op);
     notifyListeners();
+    _emit(_persistEffect(op, forward: true));
   }
 
   void _apply(InkOp op, {required bool forward}) {
@@ -211,6 +222,20 @@ class StrokeEngine extends ChangeNotifier {
     }
   }
 
+  /// الأثر الدائم للعملية على القاعدة عند تطبيقها أو عكسها —
+  /// هذا ما يغذّي الحفظ التزايدي (تراجع عن رسم = حذف صف، إعادة لمسح
+  /// = حذف صف، وهكذا).
+  List<InkChange> _persistEffect(InkOp op, {required bool forward}) {
+    switch (op) {
+      case AddInk(:final page, :final stroke):
+        return forward ? [InkAdded(page, stroke)] : [InkRemoved(stroke)];
+      case RemoveInk(:final page, :final strokes):
+        return forward
+            ? [for (final s in strokes) InkRemoved(s)]
+            : [for (final s in strokes) InkAdded(page, s)];
+    }
+  }
+
   void _push(InkOp op) {
     _undo.add(op);
     _redo.clear();
@@ -218,6 +243,8 @@ class StrokeEngine extends ChangeNotifier {
   }
 
   void _notifyPage(int page) => _pageNotifiers[page]?.notifyListeners();
+
+  void _emit(List<InkChange> changes) => onCommit?.call(changes);
 
   // ─────────────── الاستيراد/التصدير (للحفظ في Isar) ───────────────
 
@@ -234,10 +261,12 @@ class StrokeEngine extends ChangeNotifier {
       _notifyPage(k);
     }
     notifyListeners();
+    _emit([InkReplacedAll(pages)]);
   }
 
   @override
   void dispose() {
+    onCommit = null;
     for (final n in _pageNotifiers.values) {
       n.dispose();
     }

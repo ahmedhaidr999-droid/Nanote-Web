@@ -1,6 +1,6 @@
 // GENERATED CODE - DO NOT MODIFY BY HAND
 
-part of 'stroke_repository.dart';
+part of 'stroke_entity.dart';
 
 // **************************************************************************
 // IsarCollectionGenerator
@@ -57,8 +57,13 @@ const StrokeEntitySchema = CollectionSchema(
       name: r'streamline',
       type: IsarType.double,
     ),
-    r'thinning': PropertySchema(
+    r'strokeId': PropertySchema(
       id: 8,
+      name: r'strokeId',
+      type: IsarType.string,
+    ),
+    r'thinning': PropertySchema(
+      id: 9,
       name: r'thinning',
       type: IsarType.double,
     )
@@ -99,6 +104,7 @@ int _strokeEntityEstimateSize(
   var bytesCount = offsets.last;
   bytesCount += 3 + object.docId.length * 3;
   bytesCount += 3 + object.points.length * 8;
+  bytesCount += 3 + object.strokeId.length * 3;
   return bytesCount;
 }
 
@@ -116,7 +122,8 @@ void _strokeEntitySerialize(
   writer.writeDouble(offsets[5], object.size);
   writer.writeDouble(offsets[6], object.smoothing);
   writer.writeDouble(offsets[7], object.streamline);
-  writer.writeDouble(offsets[8], object.thinning);
+  writer.writeString(offsets[8], object.strokeId);
+  writer.writeDouble(offsets[9], object.thinning);
 }
 
 StrokeEntity _strokeEntityDeserialize(
@@ -135,7 +142,8 @@ StrokeEntity _strokeEntityDeserialize(
   object.size = reader.readDouble(offsets[5]);
   object.smoothing = reader.readDouble(offsets[6]);
   object.streamline = reader.readDouble(offsets[7]);
-  object.thinning = reader.readDouble(offsets[8]);
+  object.strokeId = reader.readString(offsets[8]);
+  object.thinning = reader.readDouble(offsets[9]);
   return object;
 }
 
@@ -163,6 +171,8 @@ P _strokeEntityDeserializeProp<P>(
     case 7:
       return (reader.readDouble(offset)) as P;
     case 8:
+      return (reader.readString(offset)) as P;
+    case 9:
       return (reader.readDouble(offset)) as P;
     default:
       throw IsarError('Unknown property with id $propertyId');
@@ -966,6 +976,142 @@ extension StrokeEntityQueryFilter
   }
 
   QueryBuilder<StrokeEntity, StrokeEntity, QAfterFilterCondition>
+      strokeIdEqualTo(
+    String value, {
+    bool caseSensitive = true,
+  }) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(FilterCondition.equalTo(
+        property: r'strokeId',
+        value: value,
+        caseSensitive: caseSensitive,
+      ));
+    });
+  }
+
+  QueryBuilder<StrokeEntity, StrokeEntity, QAfterFilterCondition>
+      strokeIdGreaterThan(
+    String value, {
+    bool include = false,
+    bool caseSensitive = true,
+  }) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(FilterCondition.greaterThan(
+        include: include,
+        property: r'strokeId',
+        value: value,
+        caseSensitive: caseSensitive,
+      ));
+    });
+  }
+
+  QueryBuilder<StrokeEntity, StrokeEntity, QAfterFilterCondition>
+      strokeIdLessThan(
+    String value, {
+    bool include = false,
+    bool caseSensitive = true,
+  }) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(FilterCondition.lessThan(
+        include: include,
+        property: r'strokeId',
+        value: value,
+        caseSensitive: caseSensitive,
+      ));
+    });
+  }
+
+  QueryBuilder<StrokeEntity, StrokeEntity, QAfterFilterCondition>
+      strokeIdBetween(
+    String lower,
+    String upper, {
+    bool includeLower = true,
+    bool includeUpper = true,
+    bool caseSensitive = true,
+  }) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(FilterCondition.between(
+        property: r'strokeId',
+        lower: lower,
+        includeLower: includeLower,
+        upper: upper,
+        includeUpper: includeUpper,
+        caseSensitive: caseSensitive,
+      ));
+    });
+  }
+
+  QueryBuilder<StrokeEntity, StrokeEntity, QAfterFilterCondition>
+      strokeIdStartsWith(
+    String value, {
+    bool caseSensitive = true,
+  }) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(FilterCondition.startsWith(
+        property: r'strokeId',
+        value: value,
+        caseSensitive: caseSensitive,
+      ));
+    });
+  }
+
+  QueryBuilder<StrokeEntity, StrokeEntity, QAfterFilterCondition>
+      strokeIdEndsWith(
+    String value, {
+    bool caseSensitive = true,
+  }) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(FilterCondition.endsWith(
+        property: r'strokeId',
+        value: value,
+        caseSensitive: caseSensitive,
+      ));
+    });
+  }
+
+  QueryBuilder<StrokeEntity, StrokeEntity, QAfterFilterCondition>
+      strokeIdContains(String value, {bool caseSensitive = true}) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(FilterCondition.contains(
+        property: r'strokeId',
+        value: value,
+        caseSensitive: caseSensitive,
+      ));
+    });
+  }
+
+  QueryBuilder<StrokeEntity, StrokeEntity, QAfterFilterCondition>
+      strokeIdMatches(String pattern, {bool caseSensitive = true}) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(FilterCondition.matches(
+        property: r'strokeId',
+        wildcard: pattern,
+        caseSensitive: caseSensitive,
+      ));
+    });
+  }
+
+  QueryBuilder<StrokeEntity, StrokeEntity, QAfterFilterCondition>
+      strokeIdIsEmpty() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(FilterCondition.equalTo(
+        property: r'strokeId',
+        value: '',
+      ));
+    });
+  }
+
+  QueryBuilder<StrokeEntity, StrokeEntity, QAfterFilterCondition>
+      strokeIdIsNotEmpty() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(FilterCondition.greaterThan(
+        property: r'strokeId',
+        value: '',
+      ));
+    });
+  }
+
+  QueryBuilder<StrokeEntity, StrokeEntity, QAfterFilterCondition>
       thinningEqualTo(
     double value, {
     double epsilon = Query.epsilon,
@@ -1128,6 +1274,18 @@ extension StrokeEntityQuerySortBy
     });
   }
 
+  QueryBuilder<StrokeEntity, StrokeEntity, QAfterSortBy> sortByStrokeId() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addSortBy(r'strokeId', Sort.asc);
+    });
+  }
+
+  QueryBuilder<StrokeEntity, StrokeEntity, QAfterSortBy> sortByStrokeIdDesc() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addSortBy(r'strokeId', Sort.desc);
+    });
+  }
+
   QueryBuilder<StrokeEntity, StrokeEntity, QAfterSortBy> sortByThinning() {
     return QueryBuilder.apply(this, (query) {
       return query.addSortBy(r'thinning', Sort.asc);
@@ -1243,6 +1401,18 @@ extension StrokeEntityQuerySortThenBy
     });
   }
 
+  QueryBuilder<StrokeEntity, StrokeEntity, QAfterSortBy> thenByStrokeId() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addSortBy(r'strokeId', Sort.asc);
+    });
+  }
+
+  QueryBuilder<StrokeEntity, StrokeEntity, QAfterSortBy> thenByStrokeIdDesc() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addSortBy(r'strokeId', Sort.desc);
+    });
+  }
+
   QueryBuilder<StrokeEntity, StrokeEntity, QAfterSortBy> thenByThinning() {
     return QueryBuilder.apply(this, (query) {
       return query.addSortBy(r'thinning', Sort.asc);
@@ -1308,6 +1478,13 @@ extension StrokeEntityQueryWhereDistinct
     });
   }
 
+  QueryBuilder<StrokeEntity, StrokeEntity, QDistinct> distinctByStrokeId(
+      {bool caseSensitive = true}) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addDistinctBy(r'strokeId', caseSensitive: caseSensitive);
+    });
+  }
+
   QueryBuilder<StrokeEntity, StrokeEntity, QDistinct> distinctByThinning() {
     return QueryBuilder.apply(this, (query) {
       return query.addDistinctBy(r'thinning');
@@ -1369,6 +1546,12 @@ extension StrokeEntityQueryProperty
   QueryBuilder<StrokeEntity, double, QQueryOperations> streamlineProperty() {
     return QueryBuilder.apply(this, (query) {
       return query.addPropertyName(r'streamline');
+    });
+  }
+
+  QueryBuilder<StrokeEntity, String, QQueryOperations> strokeIdProperty() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addPropertyName(r'strokeId');
     });
   }
 
