@@ -41,3 +41,9 @@ android/keystores/
 
 # e2e smoke-test screenshots (local only)
 .smoke/
+
+# Flutter (native engine) — build artifacts only; lib/ and pubspec are tracked
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+build/
