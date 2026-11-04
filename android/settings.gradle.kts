@@ -23,7 +23,10 @@ pluginManagement {
 }
 
 plugins {
-    id("dev.flutter.flutter-plugin-loader") version "1.0.0" apply false
+    // NOTE: no `apply false` here — the loader MUST be applied at settings
+    // evaluation time so the Flutter plugin subprojects (isar_flutter_libs,
+    // pdfx, path_provider, file_picker, ...) get included in the build.
+    id("dev.flutter.flutter-plugin-loader") version "1.0.0"
     id("com.android.application") version "9.1.0" apply false
     id("org.jetbrains.kotlin.android") version "2.4.0" apply false
 }
