@@ -1,0 +1,38 @@
+name: nanote
+description: Nanote — native notes & PDF annotation app (Flutter library + workspace).
+publish_to: 'none'
+version: 2.0.0+20001
+
+environment:
+  sdk: '>=3.6.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # ── محرك PDF (PDFium على الجوال/الديسكتوب، pdf.js داخلياً على الويب) ──
+  pdfx: ^2.6.0
+  # ── محرك الحبر المتجهي (تنعيم + سمك ديناميكي حسب سرعة القلم) ──
+  perfect_freehand: ^2.0.0
+  # ── قاعدة البيانات (حفظ الحبر) ──
+  isar: ^3.1.0+1
+  isar_flutter_libs: ^3.1.0+1
+  path_provider: ^2.1.0
+  # path_provider_android 2.3+ switched to a JNI bridge (jni / jni_flutter)
+  # that compiles C++ through CMake and drags in the full Android NDK. The
+  # 2.2.x line is the plain MethodChannel implementation — all we need.
+  path_provider_android: 2.2.23
+  # ── اختيار ملفات PDF من الجهاز لاستيرادها إلى المكتبة ──
+  file_picker: ^8.3.7
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  build_runner: ^2.4.8
+  isar_generator: 3.1.0+1
+
+flutter:
+  uses-material-design: true
+  # لتجربة ملف PDF حقيقي: ضع ملفاً باسم sample.pdf داخل مجلد assets/ ثم أزل التعليق:
+  # assets:
+  #   - assets/sample.pdf

@@ -1,0 +1,104 @@
+name: Native APK (Flutter)
+
+# Builds the NATIVE Flutter app (lib/ + android/) as a debug-signed release
+# APK and publishes it as a pre-release (2.0.0-native-beta.x — no leading
+# "v", so the legacy Capacitor workflow in apk.yml never triggers).
+# The old web pipeline lives in apk.yml and only runs on main / v-tags.
+
+on:
+  push:
+    branches: [feature/native-pdf-ink-engine]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: native-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BETA_TAG: 2.0.0-native-beta.1
+  APK_NAME: Nanote-Native-2.0.0-beta.1.apk
+
+jobs:
+  apk:
+    name: Flutter release APK (debug-signed)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.9
+          channel: stable
+          cache: true
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Build release APK
+        run: flutter build apk --release --target-platform android-arm,android-arm64
+
+      - name: Collect artifact
+        run: |
+          set -euo pipefail
+          APK="build/app/outputs/flutter-apk/app-release.apk"
+          ls -lh "$APK"
+          cp "$APK" "$APK_NAME"
+          ls -lh "$APK_NAME"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanote-native-apk
+          path: ${{ env.APK_NAME }}
+          if-no-files-found: error
+
+      - name: Publish / update pre-release with the APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<'NOTES'
+          # Nanote Native 2.0.0 — Beta 1
+
+          **العربية** — أول نسخة APK من محرك Nanote الأصلي (Flutter Native). حمّل
+          `Nanote-Native-2.0.0-beta.1.apk` بالأسفل وثبّته (فعّل "التثبيت من مصادر
+          غير معروفة" إن طُلب). التطبيق يُثبَّت **بجانب** تطبيقك الحالي — معرّفه
+          مختلف (`com.nanote.web.native`) فلا يمسّ بياناتك القديمة إطلاقاً.
+
+          - محرك PDF أصلي (PDFium) — فتح أسرع وتصفح سلس بدون WebView
+          - محرك حبر متجهي بضغط القلم الحقيقي + كفّ اليد + زر البرميل للمسح
+          - حفظ تلقائي فوري لكل خط في قاعدة Isar — استئناف فوري بعد الإغلاق
+          - تراجع/إعادة، ممحاة بالخط، تكبير بالقرص، وأدوات متعددة
+          - واجهة المكتبة والإعدادات الكلاسيكية مدمجة
+
+          **English** — first native-engine beta APK. Installs side-by-side with the
+          existing app (separate id `com.nanote.web.native`); debug-signed for
+          testing only. Native PDF engine, pressure-sensitive vector ink, instant
+          Isar auto-save, undo/redo, stroke eraser, pinch zoom, classic library +
+          settings UI.
+          NOTES
+          if gh release view "$BETA_TAG" >/dev/null 2>&1; then
+            echo "release exists — uploading (clobber)"
+            gh release upload "$BETA_TAG" "$APK_NAME" --clobber
+          else
+            gh release create "$BETA_TAG" "$APK_NAME" \
+              --target "$GITHUB_SHA" --prerelease \
+              --title "Nanote Native 2.0.0 — Beta 1" \
+              --notes-file notes.md
+          fi
+          gh release view "$BETA_TAG" --json assets --jq '.assets[].name'
