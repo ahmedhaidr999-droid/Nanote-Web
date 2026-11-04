@@ -12,7 +12,10 @@ import * as pdfjs from 'pdfjs-dist';
 import * as db from './idb';
 import { NotebookRow, PAGE_SIZES, PageRow, PdfTextItem } from './types';
 
-pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
+// version-busted worker URL: the worker version MUST match the API version —
+// an APK/WebView serving a cached old worker against a new API throws at
+// load. Busting with pdfjs.version guarantees a fresh fetch after upgrades.
+pdfjs.GlobalWorkerOptions.workerSrc = `/pdf.worker.min.mjs?v=${pdfjs.version}`;
 
 const memCache = new Map<string, PdfTextItem[]>();
 const inflight = new Map<string, Promise<PdfTextItem[] | null>>();

@@ -11,7 +11,8 @@ import * as db from './idb';
 import { NotebookRow, PAGE_SIZES, PageRow } from './types';
 import { uid } from './util';
 
-pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
+// version-busted worker URL — see pdftext.ts (worker/API versions must match)
+pdfjs.GlobalWorkerOptions.workerSrc = `/pdf.worker.min.mjs?v=${pdfjs.version}`;
 
 const MAX_PAGES = 200;
 const MAX_RENDER_WIDTH = 1600;

@@ -5,7 +5,9 @@
 //     Samsung S Pen (Wacom EMR, 360 Hz, pressure, tilt), Surface/Slim Pen,
 //     generic active pens — all surface as pointerType 'pen' with coalesced
 //     events. Pressure drives width; tilt widens fountain/brush like a real
-//     angled nib; hover shows a tracked cursor ring.
+//     angled nib. Hover events feed palm-rejection ONLY — no on-screen cursor
+//     ring is drawn (it cluttered the writing experience and forced an overlay
+//     repaint on every hover move).
 //   • mouse           → writes (space / middle button / pan tool = pan).
 //   • touch           → navigates by default (one finger pan, two finger pinch,
 //     double-tap → configurable gesture). Draws ONLY when "finger drawing" is
@@ -119,8 +121,6 @@ type Mode =
 type PanMode = Extract<Mode, { type: 'pan' }>;
 
 interface LingerItem { pageY: number; path: Path2D; color: string; hi: boolean; darkPaper: boolean; elId: string }
-
-const HOVER_TOOLS: Set<string> = new Set(['fountain', 'ballpoint', 'brush', 'fineliner', 'highlighter', 'shape', 'laser']);
 
 // -------------------------------------------------- laser pointer trail
 // Finished laser polylines live here (module-level) and fade out on the
@@ -371,7 +371,6 @@ export default memo(function InkSurface({ layouts, pageW, onTextTap }: InkSurfac
   const twoTapRef = useRef<{ t0: number; moved: boolean; fired: boolean } | null>(null);
   const touchCountRef = useRef(0);       // tracked touches currently down
   const activeTypeRef = useRef<string | null>(null); // device class of the active gesture
-  const hoverRef = useRef<{ x: number; y: number } | null>(null);
   const lingerRef = useRef<LingerItem[]>([]);
   const spaceRef = useRef(false);
   const lastTapRef = useRef<{ t: number; x: number; y: number } | null>(null);
@@ -684,20 +683,11 @@ export default memo(function InkSurface({ layouts, pageW, onTextTap }: InkSurfac
           });
           ctx.restore();
         }
-      } else if (m.type === 'none') {
-        // pen hover cursor ring (Apple Pencil hover / stylus tracking)
-        const hover = hoverRef.current;
-        if (hover && HOVER_TOOLS.has(useApp.getState().editor.tool)) {
-          const st = useApp.getState();
-          const ts = st.editor.toolStates[st.editor.tool === 'laser' ? 'laser' : st.editor.lastPen];
-          const r = ts ? clamp(ts.width * vp.scale / 2, 2.5, 18) : 3;
-          ctx.beginPath();
-          ctx.arc(hover.x, hover.y, r, 0, Math.PI * 2);
-          ctx.strokeStyle = 'rgba(30,111,242,0.55)';
-          ctx.lineWidth = 1.2;
-          ctx.stroke();
-        }
       }
+      // NOTE: pen hover no longer draws a cursor ring — hover events only feed
+      // palm rejection (penSeenRef/penHoverCapableRef). The ring forced an
+      // overlay repaint on EVERY hover move (~120–240 Hz) and cluttered the
+      // writing experience.
       ctx.restore();
     };
     return addPainter(painter);
@@ -1320,7 +1310,6 @@ export default memo(function InkSurface({ layouts, pageW, onTextTap }: InkSurfac
 
       cancelZoomAnim();
       cancelLocalScroll();   // any new pointer input ends an in-flight glide/settle
-      hoverRef.current = null;
       markInteraction();
       const st = useApp.getState();
       const tool = st.editor.tool;
@@ -1547,11 +1536,7 @@ export default memo(function InkSurface({ layouts, pageW, onTextTap }: InkSurfac
         clearTextHold();
       }
 
-      // pen hover cursor when idle
-      if (m.type === 'none' && e.pointerType === 'pen') {
-        hoverRef.current = { x: l.x, y: l.y };
-        requestOverlayRepaint();
-      }
+      // pen hover cursor tracking removed — see the painter note above
 
       if (m.type === 'pinch') {
         const a = pointers.get(m.ids[0]);
@@ -2123,13 +2108,6 @@ export default memo(function InkSurface({ layouts, pageW, onTextTap }: InkSurfac
       pointers.delete(e.pointerId);
     };
 
-    const onPointerLeave = (e: PointerEvent) => {
-      if (e.pointerType === 'pen' && hoverRef.current) {
-        hoverRef.current = null;
-        requestOverlayRepaint();
-      }
-    };
-
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       cancelLocalScroll();   // wheel takes over from any touch glide
@@ -2162,7 +2140,6 @@ export default memo(function InkSurface({ layouts, pageW, onTextTap }: InkSurfac
     host.addEventListener('pointermove', onPointerMove);
     host.addEventListener('pointerup', onPointerUp);
     host.addEventListener('pointercancel', onPointerCancel);
-    host.addEventListener('pointerleave', onPointerLeave);
     host.addEventListener('wheel', onWheel, { passive: false });
     host.addEventListener('contextmenu', onContext);
     window.addEventListener('keydown', onKey);
@@ -2182,7 +2159,6 @@ export default memo(function InkSurface({ layouts, pageW, onTextTap }: InkSurfac
       host.removeEventListener('pointermove', onPointerMove);
       host.removeEventListener('pointerup', onPointerUp);
       host.removeEventListener('pointercancel', onPointerCancel);
-      host.removeEventListener('pointerleave', onPointerLeave);
       host.removeEventListener('wheel', onWheel);
       host.removeEventListener('contextmenu', onContext);
       window.removeEventListener('keydown', onKey);

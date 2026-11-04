@@ -43,9 +43,9 @@ import { preloadPageImages, resolveImage, imageNatural } from '@/lib/nanote/imag
 import { renderPdfPageVector } from '@/lib/nanote/pdftext';
 import { getCachedRaster, putCachedRaster } from '@/lib/nanote/rastercache';
 import { bitmapAreaBudget, bitmapSideCap, degradeBitmapBudget } from '@/lib/nanote/canvasbudget';
-import { PageRow } from '@/lib/nanote/types';
+import { NotebookRow, PageRow } from '@/lib/nanote/types';
 import { clamp } from '@/lib/nanote/util';
-import { getHiddenIds, onRepaint, onVpIdle, getVp, getViewportSize, visibleWorldRect } from './viewport';
+import { getHiddenIds, onRepaint, onVpIdle, getVp, getViewportSize, isInteracting, visibleWorldRect } from './viewport';
 import type { PageLayout } from './viewport';
 
 /** per-side bitmap cap (Chromium handles 16k; keep headroom for tiling) */
@@ -233,7 +233,6 @@ interface VectorEntry {
 }
 const vectorLru: VectorEntry[] = [];
 const VECTOR_LRU_MAX = 2;
-const vectorInflight = new Set<string>();
 
 function sameWin(a: Win, b: Win): boolean {
   return Math.abs(a.x0 - b.x0) < 1.5 && Math.abs(a.y0 - b.y0) < 1.5 && Math.abs(a.x1 - b.x1) < 1.5 && Math.abs(a.y1 - b.y1) < 1.5;
@@ -250,8 +249,52 @@ function getVectorCanvas(pageId: string, raster: number, win: Win): VectorEntry 
 
 function putVectorCanvas(pageId: string, raster: number, win: Win, canvas: HTMLCanvasElement): void {
   vectorLru.push({ pageId, raster, win, canvas });
+  // same page+window at a different raster? keep only the newest
+  for (let i = vectorLru.length - 2; i >= 0; i--) {
+    const v = vectorLru[i];
+    if (v.pageId === pageId && sameWin(v.win, win)) vectorLru.splice(i, 1);
+  }
   while (vectorLru.length > VECTOR_LRU_MAX) vectorLru.shift();
 }
+
+// in-flight vector renders, deduped by key — the async background effect and
+// the deferred zoom-settle swap share one render per (page, raster, window)
+const vectorRenders = new Map<string, Promise<boolean>>();
+
+/**
+ * Render one vector slice (or the full page) into a fresh canvas and put it
+ * in the LRU on success. `raster` is rounded to a stable 0.1 bucket — the
+ * same key paintFromDoc looks up. Concurrent callers for the same key share
+ * a single pdf.js render.
+ */
+function renderVectorSlice(
+  page: PageRow,
+  nb: NotebookRow,
+  raster: number,
+  pageW: number,
+  win: Win,
+  windowed: boolean,
+): Promise<boolean> {
+  const bucketRaster = Math.round(raster * 10) / 10;
+  const key = `${page.id}@${bucketRaster}@${Math.round(win.x0)},${Math.round(win.y0)},${Math.round(win.x1)},${Math.round(win.y1)}`;
+  const running = vectorRenders.get(key);
+  if (running) return running;
+  const canvas = document.createElement('canvas');
+  const p = renderPdfPageVector(page, nb, canvas, bucketRaster, pageW, windowed ? win : undefined)
+    .then((ok) => {
+      if (ok) putVectorCanvas(page.id, bucketRaster, win, canvas);
+      return ok;
+    })
+    .finally(() => { vectorRenders.delete(key) });
+  vectorRenders.set(key, p);
+  return p;
+}
+
+// Self-heal budget probe ran and PASSED at least once this session — the
+// getImageData read-back flushes the raster pipeline (a real cost on >2048²
+// canvases); running it after EVERY window paint added a hitch to every zoom
+// settle. Once a device proves it rasterizes at-budget canvases, stop asking.
+let budgetProbeVerified = false;
 
 export function PageCanvas({
   page,
@@ -270,6 +313,11 @@ export function PageCanvas({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rasterRef = useRef(1);
   const tokenRef = useRef(0);
+  // latest page row for the deferred-settle helpers (stable identity, no re-sub)
+  const pageRef = useRef(page);
+  pageRef.current = page;
+  // deferred zoom-settle generation — bumping supersedes a pending swap
+  const pendingGenRef = useRef(0);
   // true once THIS component instance has painted at least once. Mount paints
   // (blank canvas) may go through the global raster queue; every later paint
   // must stay synchronous-in-commit — a windowed recenter swaps the canvas box
@@ -362,9 +410,12 @@ export function PageCanvas({
       });
       // SELF-HEAL CHECK: on over-constrained devices a canvas at the budget
       // can allocate but rasterize nothing (blank backing store) — verify a
-      // pixel actually changed; if not, degrade the budget and retry this
-      // paint once at the smaller size (the "max zoom black screen" guard).
-      if (bw > 2048 && bh > 2048) {
+      // pixel actually changed ONCE PER SESSION; if not, degrade the budget
+      // and retry this paint once at the smaller size (the "max zoom black
+      // screen" guard). The getImageData read-back flushes the raster
+      // pipeline — running it after every big window paint was a measurable
+      // hitch at every zoom settle.
+      if (!budgetProbeVerified && bw > 2048 && bh > 2048) {
         const probe = ctx.getImageData(Math.min(4, bw - 1), Math.min(4, bh - 1), 1, 1).data;
         const paperHex = (page.backgroundHex || '#FFFFFF').replace('#', '');
         const expect0 = probe.length ? probe[0] : 0;
@@ -396,6 +447,8 @@ export function PageCanvas({
               });
             }
           }
+        } else {
+          budgetProbeVerified = true; // device rasterizes at-budget canvases — stop probing
         }
       }
     } catch {
@@ -541,6 +594,59 @@ export function PageCanvas({
     });
   }, [page.id, paintFromDoc]);
 
+  // ------------------------------------------------------------- deferred settle swap
+  /** Fixed page backed by a stored PDF original? (the vector zoom path) */
+  const vectorZoomCapable = useCallback((): boolean => {
+    const p = pageRef.current;
+    if (infinite || p.backgroundImageId == null) return false;
+    const nb = useApp.getState().notebooks.find((n) => n.id === p.notebookId);
+    return !!nb?.pdfOriginalId;
+  }, [infinite]);
+
+  /**
+   * DEFERRED SETTLE SWAP (the zoom-freeze + pixelated-text fix): while the
+   * current bitmap still covers the viewport, a zoom-settle does NOT swap the
+   * window immediately. The vector slice for the TARGET window renders first
+   * (pdf.js, off the commit path); box + bitmap then swap in ONE commit with
+   * the crisp vector already in the LRU — a single paint instead of the old
+   * snapshot-paint → vector-render → second-paint chain (two full
+   * device-raster paints plus a blurry snapshot flash between them, the
+   * "freezes horribly and text looks pixelated" report).
+   *   • superseded by any newer settle (generation counter)
+   *   • commits wait for gesture calm so a paint never lands mid-pinch
+   *   • a 1.6s timeout falls back to the snapshot path if pdf.js stalls
+   */
+  const deferWindowSwap = useCallback((desired: Win, full: boolean, raster: number) => {
+    const gen = ++pendingGenRef.current;
+    const p = pageRef.current;
+    const nb = useApp.getState().notebooks.find((n) => n.id === p.notebookId);
+    const commit = () => {
+      if (gen !== pendingGenRef.current) return; // superseded by a newer settle
+      pendingGenRef.current++;                    // consume — late duplicates no-op
+      if (full) {
+        rasterRef.current = raster;
+        setRasterTick((v) => v + 1);
+      } else {
+        setWin(desired);
+      }
+    };
+    const commitWhenCalm = () => {
+      if (gen !== pendingGenRef.current) return;
+      if (isInteracting()) {
+        // a gesture is in flight — never paint mid-pinch; retry at the next
+        // idle point (or get superseded by the settle that idle computes)
+        const off = onVpIdle(() => { off(); commitWhenCalm() });
+        return;
+      }
+      commit();
+    };
+    if (!nb?.pdfOriginalId) { commitWhenCalm(); return } // no original → snapshot path
+    void renderVectorSlice(p, nb, raster, pageW, desired, !full)
+      .then(() => commitWhenCalm())
+      .catch(() => commitWhenCalm());
+    setTimeout(() => { if (gen === pendingGenRef.current) commitWhenCalm() }, 1600);
+  }, [pageW]);
+
   // ------------------------------------------------------------- zoom-aware raster
   // Only after the viewport has been idle for ~280ms do we consider
   // re-rasterizing. Never during the gesture itself.
@@ -549,15 +655,30 @@ export function PageCanvas({
   //     ≥6% (culling makes these cheap — crispness wins). The window is also
   //     re-centered whenever the CURRENT bitmap no longer comfortably covers
   //     the viewport (edge-coverage check — the max-zoom black-strip guard);
-  //   • full-page renders: coarse ≥1.3× bucket changes only (expensive).
+  //   • full-page renders: coarse ≥1.3× bucket changes only (expensive);
+  //   • vector-backed fixed pages whose bitmap still covers the viewport
+  //     DEFER the swap through the vector render (one crisp paint, no blur).
   useEffect(() => {
-    /** does the current window still cover the visible rect with headroom? */
+    /** does the current window still cover the desired window with headroom? */
     const winStillCovers = (cur: Win, desired: Win): boolean => {
       const hx = (desired.x1 - desired.x0) * 0.04;
       const hy = (desired.y1 - desired.y0) * 0.04;
       return (
         cur.x0 <= desired.x0 + hx && cur.x1 >= desired.x1 - hx &&
         cur.y0 <= desired.y0 + hy && cur.y1 >= desired.y1 - hy
+      );
+    };
+    /** does the current bitmap window still cover the VISIBLE viewport? While
+     *  it does, a settle can wait for the vector render — the user keeps a
+     *  complete view at all times (no blank strips, no snapshot flash). */
+    const winCoversViewport = (cur: Win): boolean => {
+      const vis = visibleWorldRect();
+      const l = layoutRef.current;
+      const hx = Math.max(4, (vis.x1 - vis.x0) * 0.04);
+      const hy = Math.max(4, (vis.y1 - vis.y0) * 0.04);
+      return (
+        cur.x0 <= vis.x0 + hx && cur.x1 >= vis.x1 - hx &&
+        cur.y0 <= vis.y0 - l.y + hy && cur.y1 >= vis.y1 - l.y - hy
       );
     };
     const maybeReRaster = () => {
@@ -573,25 +694,44 @@ export function PageCanvas({
       }
       const desired = fixedWin(layout, !winIsFull(winRef.current, layout));
       if (!winIsFull(desired, layout)) {
-        // windowed fixed page — same cheap device-exact re-render policy
+        // windowed fixed page — same cheap device-exact re-render policy, but
+        // vector-backed pages whose bitmap covers the viewport swap through
+        // the vector render (one crisp paint, no blurry snapshot flash)
         const raster = windowRaster(getVp().scale, desired.x1 - desired.x0, desired.y1 - desired.y0);
         const ratio = raster / rasterRef.current;
         if (winChanged(desired, winRef.current) || ratio > 1.06 || ratio < 1 / 1.06 || !winStillCovers(winRef.current, desired)) {
-          setWin(desired);
+          if (vectorZoomCapable() && winCoversViewport(winRef.current)) {
+            deferWindowSwap(desired, false, raster);
+          } else {
+            setWin(desired); // pan recenter / coverage emergency / no vector
+          }
         }
         return;
       }
       if (!winIsFull(winRef.current, layout)) {
-        setWin(desired); // zoomed back out → return to the full-page render
+        // windowed → full (zoomed back out). Swap immediately when the old
+        // windowed bitmap no longer covers the expanded viewport (blank-strip
+        // guard); otherwise wait for the full-page vector render.
+        if (vectorZoomCapable() && winCoversViewport(winRef.current)) {
+          deferWindowSwap(desired, true, bucketFor(getVp().scale, pageW, pageH));
+        } else {
+          setWin(desired);
+        }
         return;
       }
       const desiredBucket = bucketFor(getVp().scale, pageW, pageH);
       const current = rasterRef.current;
       const ratio = desiredBucket / current;
       if (ratio > 1.3 || ratio < 1 / 1.3) {
-        rasterRef.current = desiredBucket;
-        rasterQueue.push(() => setRasterTick((v) => v + 1));
-        pumpQueue();
+        if (vectorZoomCapable()) {
+          // full → full bucket change: the old bitmap already covers the whole
+          // page — wait for the vector at the new bucket, then ONE crisp paint
+          deferWindowSwap(desired, true, desiredBucket);
+        } else {
+          rasterRef.current = desiredBucket;
+          rasterQueue.push(() => setRasterTick((v) => v + 1));
+          pumpQueue();
+        }
       }
     };
     const offIdle = onVpIdle(() => {
@@ -600,13 +740,14 @@ export function PageCanvas({
       maybeReRaster();
     });
     return offIdle;
-  }, [pageW, pageH, layout, infinite]);
+  }, [pageW, pageH, layout, infinite, deferWindowSwap, vectorZoomCapable]);
 
   // ---- vector background render (async; re-renders when the raster bucket
   // or the window changes and lands on the next paint — the PNG snapshot
   // shows meanwhile). Windowed renders are SLICES of the page (pdf.js render
   // transform), so vector text is razor-sharp at any zoom without a giant
-  // full-page bitmap.
+  // full-page bitmap. Shares one deduped render per key with the deferred
+  // settle swap (renderVectorSlice).
   useEffect(() => {
     if (infinite || page.backgroundImageId == null) return;
     const st = useApp.getState();
@@ -616,20 +757,14 @@ export function PageCanvas({
     const windowedNow = !winIsFull(w, layout);
     const vectorRaster = Math.round(rasterRef.current * 10) / 10; // stable bucket key
     if (getVectorCanvas(page.id, vectorRaster, w)) return; // already rendered
-    const key = `${page.id}@${vectorRaster}@${Math.round(w.x0)},${Math.round(w.y0)},${Math.round(w.x1)},${Math.round(w.y1)}`;
-    if (vectorInflight.has(key)) return;
-    vectorInflight.add(key);
-    const canvas = document.createElement('canvas');
-    void renderPdfPageVector(page, notebook, canvas, vectorRaster, pageW, windowedNow ? w : undefined)
+    void renderVectorSlice(page, notebook, rasterRef.current, pageW, w, windowedNow)
       .then((ok) => {
-        vectorInflight.delete(key);
         if (!ok) return;
         // discard a stale render (raster/window moved on while we worked)
         if (Math.abs(vectorRaster - rasterRef.current) > 0.34 || !sameWin(w, winRef.current)) return;
-        putVectorCanvas(page.id, vectorRaster, w, canvas);
         setVectorTick((v) => v + 1);
       })
-      .catch(() => { vectorInflight.delete(key) });
+      .catch(() => { /* snapshot stays */ });
   }, [page, pageW, layout, win, rasterTick, infinite]);
 
   // canvas placement in world space: local (win.x0, win.y0) sits at world
