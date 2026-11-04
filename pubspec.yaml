@@ -1,7 +1,7 @@
 name: nanote
 description: Nanote — native notes & PDF annotation app (Flutter library + workspace).
 publish_to: 'none'
-version: 2.0.0+1
+version: 2.0.0+20001
 
 environment:
   sdk: '>=3.6.0 <4.0.0'
