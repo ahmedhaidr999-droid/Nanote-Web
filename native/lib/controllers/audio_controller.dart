@@ -65,7 +65,9 @@ class AudioController extends ChangeNotifier {
     waveBars.clear();
     engine.beginRecordingSync();
     _ampSub?.cancel();
-    _ampSub = _recorder.onAmplitudeChanged().listen((amp) {
+    _ampSub = _recorder
+        .onAmplitudeChanged(const Duration(milliseconds: 100))
+        .listen((amp) {
       // amp.current is dBFS (−60..0) → normalize to 0..1
       final v = ((amp.current + 50) / 50).clamp(0.0, 1.0);
       level = v;

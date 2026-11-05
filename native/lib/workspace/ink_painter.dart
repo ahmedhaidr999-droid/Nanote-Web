@@ -3,6 +3,7 @@ import 'package:perfect_freehand/perfect_freehand.dart';
 
 import '../controllers/stroke_engine.dart';
 import '../models/stroke.dart';
+import '../persistence/page_store.dart';
 
 /// Paints ink strokes of one page in PAGE-POINT space.
 ///  • perfect_freehand outlines (cached per stroke, invalidated on transforms)
