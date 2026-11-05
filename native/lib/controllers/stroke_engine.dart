@@ -436,6 +436,53 @@ class StrokeEngine extends ChangeNotifier {
     notifyPageChanged();
   }
 
+  /// Live "restore-then-apply" transform during two-finger selection
+  /// gestures: rewrites current objects from the gesture-start snapshots
+  /// then applies the full combined transform (no incremental drift).
+  void applyGestureTransform({
+    required Offset translate,
+    required double scale,
+    required double rotation,
+    required Offset anchor,
+  }) {
+    final d = doc;
+    for (final before in _gestureBefore.strokes) {
+      Stroke? cur;
+      for (final s in d.strokes) {
+        if (s.id == before.id) {
+          cur = s;
+          break;
+        }
+      }
+      if (cur == null) continue;
+      cur.points
+        ..clear()
+        ..addAll([for (final p in before.points) StrokePoint(p.x, p.y, p.p)]);
+      if (scale != 1) cur.scaleBy(scale, anchor);
+      if (rotation != 0) cur.rotateBy(rotation, anchor);
+      cur.translateBy(translate);
+    }
+    for (final before in _gestureBefore.elements) {
+      PageElement? cur;
+      for (final e in d.elements) {
+        if (e.id == before.id) {
+          cur = e;
+          break;
+        }
+      }
+      if (cur == null) continue;
+      cur.x = before.x;
+      cur.y = before.y;
+      cur.w = before.w;
+      cur.h = before.h;
+      cur.rotation = before.rotation;
+      if (scale != 1) cur.scaleBy(scale, anchor);
+      if (rotation != 0) cur.rotateBy(rotation, anchor);
+      cur.translateBy(translate);
+    }
+    notifyListeners();
+  }
+
   // ───────────────────────── clipboard / z-order / groups ─────────────────
 
   void copySelection() {

@@ -41,7 +41,7 @@ class Stroke {
   List<StrokePoint> points;
 
   // transient caches (not persisted)
-  List<List<Offset>>? outlineCache;
+  List<Offset>? outlineCache;
   Rect? _bboxCache;
 
   Stroke({
