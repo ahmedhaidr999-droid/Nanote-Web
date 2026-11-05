@@ -114,7 +114,11 @@ class Stroke {
     return Rect.fromLTRB(l, t, r, b);
   }
 
-  static bool _pointInPoly(Offset pt, List<Offset> poly) {
+  static bool _pointInPoly(Offset pt, List<Offset> poly) =>
+      pointInPoly(pt, poly);
+
+  /// Ray-casting point-in-polygon (public — used by selection + elements).
+  static bool pointInPoly(Offset pt, List<Offset> poly) {
     var inside = false;
     var j = poly.length - 1;
     for (var i = 0; i < poly.length; i++) {

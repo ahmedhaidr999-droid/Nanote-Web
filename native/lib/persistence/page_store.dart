@@ -76,6 +76,19 @@ class PageStore {
 
   bool isCached(String pageId) => _cache.containsKey(pageId);
 
+  /// All strokes/elements currently resident (used to clear selection flags).
+  Iterable<Stroke> allCachedStrokes() sync* {
+    for (final d in _cache.values) {
+      yield* d.strokes;
+    }
+  }
+
+  Iterable<PageElement> allCachedElements() sync* {
+    for (final d in _cache.values) {
+      yield* d.elements;
+    }
+  }
+
   /// Copy a page doc under a new id (duplicate page).
   Future<void> copyDoc(String fromId, String toId) async {
     await flush();
