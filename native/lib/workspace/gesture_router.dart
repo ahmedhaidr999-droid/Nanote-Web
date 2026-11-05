@@ -35,7 +35,7 @@ class _Pointer {
   _Pointer({
     required this.id, required this.kind, required this.start,
     required this.startPos, required this.buttons, required this.downAt,
-    required this.stylus, required this.last,
+    required this.stylus, required this.last, this.pressure = 0.5,
   });
 }
 
@@ -383,6 +383,7 @@ class _GestureRouterState extends State<GestureRouter> {
       case Tool.sticker:
       case Tool.audio:
       case Tool.translate:
+      case Tool.ruler:
         _mode = _Mode.idle; // panel tools handled by the rail
         break;
     }

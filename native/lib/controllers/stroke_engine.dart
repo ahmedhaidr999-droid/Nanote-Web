@@ -136,7 +136,7 @@ class StrokeEngine extends ChangeNotifier {
     if (s.points.length < 2) {
       final a = s.points.first;
       // dot → keep as micro stroke (2 points)
-      s.points.add(StrokePoint(a.dx + 0.5, a.dy + 0.5, a.p));
+      s.points.add(StrokePoint(a.x + 0.5, a.y + 0.5, a.p));
     }
     if (recordingActive && _recStart != null) {
       s.tEnd = DateTime.now().difference(_recStart!).inMilliseconds;

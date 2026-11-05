@@ -27,7 +27,8 @@ class ShapeRecognizer {
     var p = _thin(pts);
     if (p.length < minPoints) return null;
 
-    final diag = _bboxOf(p).size.diagonal;
+    final bb0 = _bboxOf(p);
+    final diag = math.sqrt(bb0.width * bb0.width + bb0.height * bb0.height);
     if (diag < 24) return null; // too tiny to judge
 
     final simplified = _rdp(p, 2.4);

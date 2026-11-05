@@ -6,10 +6,10 @@ import '../persistence/file_store.dart';
 
 /// Decoded image LRU (24 entries) for user images & PNG stickers.
 /// Widgets listen to [ready] and repaint when their decode lands.
-class ImageCache extends ChangeNotifier {
+class AppImageCache extends ChangeNotifier {
   static const maxEntries = 24;
   final FileStore fs;
-  ImageCache(this.fs);
+  AppImageCache(this.fs);
 
   final Map<String, ui.Image> _map = {};
   final List<String> _lru = [];

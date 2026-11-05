@@ -1,4 +1,6 @@
-import 'package:flutter/widgets.dart' show BuildContext, Locale, Localizations, TextDirection;
+import 'package:flutter/widgets.dart'
+    show BuildContext, Locale, Localizations, LocalizationsDelegate,
+        TextDirection;
 
 /// Tiny hand-rolled i18n — Arabic-first (default), English secondary.
 /// Mirrors the web langpack: keys are stable identifiers.

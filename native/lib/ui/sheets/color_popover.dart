@@ -72,7 +72,7 @@ void showColorPopover(BuildContext context, ToolController tools) {
       return SafeArea(
         top: false,
         child: Padding(
-          padding: const EdgeInsetsDirectional.fromSTLB(20, 0, 20, 20),
+          padding: const EdgeInsetsDirectional.fromSTEB(20, 0, 20, 20),
           child: ListenableBuilder(
             listenable: tools,
             builder: (context, _) {
@@ -117,7 +117,7 @@ void showSizePopover(BuildContext context, ToolController tools) {
       return SafeArea(
         top: false,
         child: Padding(
-          padding: const EdgeInsetsDirectional.fromSTLB(20, 0, 20, 24),
+          padding: const EdgeInsetsDirectional.fromSTEB(20, 0, 20, 24),
           child: ListenableBuilder(
             listenable: tools,
             builder: (context, _) {
@@ -180,7 +180,7 @@ void showPenPopover(BuildContext context, ToolController tools) {
       return SafeArea(
         top: false,
         child: SingleChildScrollView(
-          padding: const EdgeInsetsDirectional.fromSTLB(20, 0, 20, 24),
+          padding: const EdgeInsetsDirectional.fromSTEB(20, 0, 20, 24),
           child: ListenableBuilder(
             listenable: tools,
             builder: (context, _) => Column(
@@ -262,7 +262,7 @@ void showShapePopover(BuildContext context, ToolController tools) {
       return SafeArea(
         top: false,
         child: SingleChildScrollView(
-          padding: const EdgeInsetsDirectional.fromSTLB(20, 0, 20, 24),
+          padding: const EdgeInsetsDirectional.fromSTEB(20, 0, 20, 24),
           child: ListenableBuilder(
             listenable: tools,
             builder: (context, _) => Column(
@@ -278,7 +278,7 @@ void showShapePopover(BuildContext context, ToolController tools) {
                       _ShapeTile(
                         type: type,
                         selected: tools.shape == type,
-                        onTap: () => tools.setShape(type),
+                        onTap: (_) => tools.setShape(type),
                       ),
                   ],
                 ),
@@ -360,7 +360,7 @@ void showEraserPopover(BuildContext context, ToolController tools) {
       return SafeArea(
         top: false,
         child: Padding(
-          padding: const EdgeInsetsDirectional.fromSTLB(20, 0, 20, 16),
+          padding: const EdgeInsetsDirectional.fromSTEB(20, 0, 20, 16),
           child: ListenableBuilder(
             listenable: tools,
             builder: (context, _) => Column(
@@ -425,7 +425,7 @@ void showLaserPopover(BuildContext context, ToolController tools) {
       return SafeArea(
         top: false,
         child: Padding(
-          padding: const EdgeInsetsDirectional.fromSTLB(20, 0, 20, 16),
+          padding: const EdgeInsetsDirectional.fromSTEB(20, 0, 20, 16),
           child: ListenableBuilder(
             listenable: tools,
             builder: (context, _) => Column(

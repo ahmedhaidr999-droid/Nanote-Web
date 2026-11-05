@@ -106,7 +106,7 @@ ThemeData nanoteTheme(Brightness brightness) {
         color: c.text,
       ),
     ),
-    cardTheme: CardTheme(
+    cardTheme: CardThemeData(
       color: c.surface,
       elevation: 0,
       margin: EdgeInsets.zero,
@@ -168,7 +168,7 @@ ThemeData nanoteTheme(Brightness brightness) {
       ),
       showDragHandle: true,
     ),
-    dialogTheme: DialogTheme(
+    dialogTheme: DialogThemeData(
       backgroundColor: c.surface,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(kNanoteRadius + 4),

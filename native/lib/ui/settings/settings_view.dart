@@ -97,7 +97,7 @@ class SettingsView extends StatelessWidget {
           title: Text(i18n.t('left_handed')),
           onChanged: (v) => _set((x) => x.leftHanded = v),
         ),
-        _sectionDivider(c),
+        _sectionDivider(c.border),
 
         // ── stylus ───────────────────────────────────────────────────
         _sectionHeader(context, i18n.t('sec_pen')),
@@ -166,13 +166,13 @@ class SettingsView extends StatelessWidget {
             settings.update(settings.s..pen = p.copyWith(hoverButton: v));
           },
         ),
-        _sectionDivider(c),
+        _sectionDivider(c.border),
 
         // ── backup ───────────────────────────────────────────────────
         _sectionHeader(context, i18n.t('sec_backup')),
         _backupCreateTile(context),
         _backupRestoreTile(context),
-        _sectionDivider(c),
+        _sectionDivider(c.border),
 
         // ── about ────────────────────────────────────────────────────
         _sectionHeader(context, i18n.t('sec_about')),

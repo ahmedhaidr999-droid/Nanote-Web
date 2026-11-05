@@ -36,16 +36,15 @@ class InkPainter extends CustomPainter {
     ];
     final out = getStroke(
       pts,
-      StrokeOptions(
+      options: StrokeOptions(
         size: s.size,
         thinning: prof.thinning,
         smoothing: prof.smoothing,
         streamline: prof.streamline,
         simulatePressure: false,
-        last: true,
       ),
     );
-    return s.outlineCache = [for (final v in out) Offset(v.x, v.y)];
+    return s.outlineCache = out;
   }
 
   static Path pathFor(List<Offset> outline) {
@@ -136,19 +135,18 @@ class InkPainter extends CustomPainter {
       ];
       final out = getStroke(
         pts,
-        StrokeOptions(
+        options: StrokeOptions(
           size: ls.size,
           thinning: ls.profile.thinning,
           smoothing: ls.profile.smoothing,
           streamline: ls.profile.streamline,
           simulatePressure: false,
-          last: false,
         ),
       );
       final p = Paint()
         ..color = ls.color.withValues(alpha: ls.profile.opacity)
         ..style = PaintingStyle.fill;
-      canvas.drawPath(pathFor([for (final v in out) Offset(v.x, v.y)]), p);
+      canvas.drawPath(pathFor(out), p);
     }
 
     canvas.restore();

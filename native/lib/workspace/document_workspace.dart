@@ -42,7 +42,7 @@ class WorkspaceScreen extends StatefulWidget {
   final NotebookRow notebook;
   final LibraryRepository repo;
   final FileStore fs;
-  final ImageCache images;
+  final AppImageCache images;
   final SettingsController settings;
 
   const WorkspaceScreen({
@@ -621,7 +621,7 @@ class _DocCanvas extends StatelessWidget {
   final PdfLibrary pdfs;
   final ViewportController viewport;
   final StrokeEngine engine;
-  final ImageCache images;
+  final AppImageCache images;
   final bool dark;
   final LaserController laser;
   final Color laserColor;

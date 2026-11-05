@@ -138,7 +138,7 @@ class _PagesSheetState extends State<PagesSheet> {
       height: MediaQuery.of(context).size.height * 0.7,
       child: Column(children: [
         Padding(
-          padding: const EdgeInsetsDirectional.fromSTLB(20, 0, 8, 4),
+          padding: const EdgeInsetsDirectional.fromSTEB(20, 0, 8, 4),
           child: Row(children: [
             Expanded(
               child: Text(
@@ -172,7 +172,7 @@ class _PagesSheetState extends State<PagesSheet> {
                   ),
                 )
               : ListView.builder(
-                  padding: const EdgeInsetsDirectional.fromSTLB(12, 8, 12, 16),
+                  padding: const EdgeInsetsDirectional.fromSTEB(12, 8, 12, 16),
                   itemCount: pages.length,
                   itemBuilder: (context, i) =>
                       _pageRow(context, colors, i18n, pages, i),
@@ -206,7 +206,7 @@ class _PagesSheetState extends State<PagesSheet> {
         borderRadius: BorderRadius.circular(kNanoteRadius),
         onTap: () => widget.onGoTo(i),
         child: Padding(
-          padding: const EdgeInsetsDirectional.fromSTLB(8, 4, 4, 4),
+          padding: const EdgeInsetsDirectional.fromSTEB(8, 4, 4, 4),
           child: Row(children: [
             // leading: page number chip / PDF badge
             if (page.isPdf)

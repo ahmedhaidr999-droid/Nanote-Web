@@ -43,6 +43,7 @@ jobs:
         working-directory: native
         run: |
           flutter create --platforms=android --org com.nanote --project-name nanote .
+          rm -rf test  # generated widget_test references a removed MyApp
           # application id → com.nanote.native (independent app; same signing
           # key as the webview build so future store updates stay in-family)
           if [ -f android/app/build.gradle.kts ]; then

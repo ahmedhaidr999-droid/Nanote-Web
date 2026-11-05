@@ -117,7 +117,7 @@ class _AudioPanelSheetState extends State<AudioPanelSheet> {
     return SafeArea(
       top: false,
       child: SingleChildScrollView(
-        padding: const EdgeInsetsDirectional.fromSTLB(20, 0, 20, 20),
+        padding: const EdgeInsetsDirectional.fromSTEB(20, 0, 20, 20),
         child: ListenableBuilder(
           listenable: audio,
           builder: (context, _) {

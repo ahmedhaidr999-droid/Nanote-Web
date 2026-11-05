@@ -99,7 +99,7 @@ class PaperPainter extends CustomPainter {
       canvas.drawLine(Offset(x, 0), Offset(x + size.height * 0.577, size.height), line);
       canvas.drawLine(Offset(x, 0), Offset(x - size.height * 0.577, size.height), line);
     }
-    for (var y = 0; y < size.height; y += h) {
+    for (var y = 0.0; y < size.height; y += h) {
       canvas.drawLine(Offset(0, y), Offset(size.width, y), line);
     }
   }
@@ -109,7 +109,7 @@ class PaperPainter extends CustomPainter {
     final hStep = r * 1.5;
     final vStep = r * math.sqrt(3);
     var row = 0;
-    for (var y = 0; y < size.height + vStep; y += vStep, row++) {
+    for (var y = 0.0; y < size.height + vStep; y += vStep, row++) {
       final xOff = row.isEven ? 0.0 : hStep;
       for (var x = -r * 2 + xOff; x < size.width + r * 2; x += hStep * 2) {
         final cy = y + vStep / 2;

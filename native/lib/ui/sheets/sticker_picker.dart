@@ -107,7 +107,7 @@ class _StickerPickerSheetState extends State<StickerPickerSheet> {
             ],
           ),
           Padding(
-            padding: const EdgeInsetsDirectional.fromSTLB(20, 10, 20, 6),
+            padding: const EdgeInsetsDirectional.fromSTEB(20, 10, 20, 6),
             child: Row(children: [
               Expanded(
                 child: Align(
@@ -126,7 +126,7 @@ class _StickerPickerSheetState extends State<StickerPickerSheet> {
             child: TabBarView(children: [
               // ── emoji tab ──
               GridView.builder(
-                padding: const EdgeInsetsDirectional.fromSTLB(12, 4, 12, 16),
+                padding: const EdgeInsetsDirectional.fromSTEB(12, 4, 12, 16),
                 gridDelegate:
                     const SliverGridDelegateWithFixedCrossAxisCount(
                   crossAxisCount: 8,
@@ -155,7 +155,7 @@ class _StickerPickerSheetState extends State<StickerPickerSheet> {
                     )
                   : GridView.builder(
                       padding:
-                          const EdgeInsetsDirectional.fromSTLB(12, 4, 12, 16),
+                          const EdgeInsetsDirectional.fromSTEB(12, 4, 12, 16),
                       gridDelegate:
                           const SliverGridDelegateWithFixedCrossAxisCount(
                         crossAxisCount: 4,

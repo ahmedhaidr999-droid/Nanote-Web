@@ -65,8 +65,8 @@ class ExportService {
     final pages = repo.visiblePages(notebookId);
     final scale = settings().exportScale.clamp(1.0, 3.0);
     final doc = pw.Document(theme: pw.ThemeData.withFont(
-      base: pw.Font.helvetica,
-      bold: pw.Font.helveticaBold,
+      base: pw.Font.helvetica(),
+      bold: pw.Font.helveticaBold(),
     ));
 
     for (final page in pages) {

@@ -25,7 +25,7 @@ Future<void> main() async {
   final library = LibraryController(repo);
   await library.boot();
 
-  final images = ImageCache(fs);
+  final images = AppImageCache(fs);
   final backup = BackupService(fs, repo, settings.store);
 
   runApp(NanoteApp(
@@ -43,7 +43,7 @@ class NanoteApp extends StatelessWidget {
   final LibraryRepository repo;
   final SettingsController settings;
   final FileStore fs;
-  final ImageCache images;
+  final AppImageCache images;
   final BackupService backup;
 
   const NanoteApp({
@@ -68,7 +68,7 @@ class NanoteApp extends StatelessWidget {
         themeMode: settings.themeMode,
         locale: settings.locale,
         supportedLocales: const [Locale('ar'), Locale('en')],
-        localizationsDelegates: const [
+        localizationsDelegates: const <LocalizationsDelegate<dynamic>>[
           NanoteLocalizationsDelegate(),
           GlobalMaterialLocalizations.delegate,
           GlobalWidgetsLocalizations.delegate,

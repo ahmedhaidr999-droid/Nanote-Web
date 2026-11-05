@@ -10,7 +10,7 @@ import 'shape_path.dart';
 /// space, plus selection chrome (rotated dashed box + handles + rotate knob).
 class ElementsPainter extends CustomPainter {
   final List<PageElement> elements;
-  final ImageCache images;
+  final AppImageCache images;
   final double pointScale;
   final double screenScale; // viewport.scale — for constant-size handles
   final Color selectionColor;

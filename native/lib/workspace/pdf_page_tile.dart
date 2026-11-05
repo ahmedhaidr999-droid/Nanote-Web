@@ -20,7 +20,7 @@ class PageTile extends StatelessWidget {
   final PdfLibrary pdfs;
   final ViewportController viewport;
   final StrokeEngine engine;
-  final ImageCache images;
+  final AppImageCache images;
   final bool dark;
 
   const PageTile({

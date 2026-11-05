@@ -63,7 +63,7 @@ class _TextEditSheetState extends State<TextEditSheet> {
       padding:
           EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
       child: SingleChildScrollView(
-        padding: const EdgeInsetsDirectional.fromSTLB(20, 0, 20, 20),
+        padding: const EdgeInsetsDirectional.fromSTEB(20, 0, 20, 20),
         child: SafeArea(
           top: false,
           child: Column(

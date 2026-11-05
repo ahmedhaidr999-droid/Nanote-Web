@@ -22,7 +22,7 @@ class HomeShell extends StatelessWidget {
   final LibraryRepository repo;
   final SettingsController settings;
   final FileStore fs;
-  final ImageCache images;
+  final AppImageCache images;
   final BackupService backup;
 
   const HomeShell({
@@ -53,7 +53,7 @@ class _HomeShellBody extends StatefulWidget {
   final LibraryRepository repo;
   final SettingsController settings;
   final FileStore fs;
-  final ImageCache images;
+  final AppImageCache images;
   final BackupService backup;
 
   const _HomeShellBody({

@@ -158,7 +158,6 @@ class ToolRail extends StatelessWidget {
     final btnStyle = IconButton.styleFrom(
       visualDensity: VisualDensity.compact,
       foregroundColor: colors.text,
-      tooltip: '',
     );
     return Container(
       margin: const EdgeInsets.only(bottom: 6),
@@ -273,9 +272,8 @@ class _ToolBtn extends StatelessWidget {
                     size: 22,
                     color: selected ? colors.primary : colors.textMuted),
                 if (colorDot != null)
-                  Positioned(
-                    direction: Directionality.of(context),
-                    right: -2, top: -2,
+                  PositionedDirectional(
+                    end: -2, top: -2,
                     child: Container(
                       width: 11, height: 11,
                       decoration: BoxDecoration(

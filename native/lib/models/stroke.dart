@@ -35,8 +35,8 @@ class Stroke {
   final PenKind kind;
   final int colorValue;
   final double size;
-  final String? groupId; // selection group
-  double? tStart, tEnd; // ms offsets when recorded with synced audio
+  String? groupId; // selection group
+  int? tStart, tEnd; // ms offsets when recorded with synced audio
   bool selected; // transient selection state
   List<StrokePoint> points;
 
@@ -183,7 +183,7 @@ class Stroke {
       for (final p in (j['pts'] as List)) StrokePoint.fromJson(p as Map<String, dynamic>)
     ],
     groupId: j['g'] as String?,
-    tStart: (j['ts'] as num?)?.toDouble(),
-    tEnd: (j['te'] as num?)?.toDouble(),
+    tStart: (j['ts'] as num?)?.toInt(),
+    tEnd: (j['te'] as num?)?.toInt(),
   );
 }

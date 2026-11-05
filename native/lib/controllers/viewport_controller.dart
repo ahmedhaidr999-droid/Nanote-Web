@@ -48,7 +48,7 @@ class ViewportController extends ChangeNotifier {
   /// Zoom keeping [focalScreen] anchored.
   void zoomAt(Offset focalScreen, double factor) {
     final before = screenToDoc(focalScreen);
-    var next = (_scale * factor).clamp(minScale, maxScale);
+    var next = (_scale * factor).clamp(minScale, maxScale).toDouble();
     final applied = next / _scale;
     if ((applied - 1).abs() < 1e-6) return;
     _scale = next;
@@ -69,7 +69,7 @@ class ViewportController extends ChangeNotifier {
 
   void fitWidth(double docWidth) {
     if (_viewportSize.width <= 0) return;
-    _scale = (_viewportSize.width / docWidth).clamp(minScale, maxScale);
+    _scale = (_viewportSize.width / docWidth).clamp(minScale, maxScale).toDouble();
     notifyListeners();
     settleChanges.notifyListeners();
   }
@@ -77,7 +77,7 @@ class ViewportController extends ChangeNotifier {
   void centerOn(Offset docPos, [double? newScale]) {
     _focalDoc = docPos;
     if (newScale != null) {
-      _scale = newScale.clamp(minScale, maxScale);
+      _scale = newScale.clamp(minScale, maxScale).toDouble();
     }
     _clamp();
     notifyListeners();

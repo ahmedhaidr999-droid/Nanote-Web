@@ -88,9 +88,14 @@ class TranslateService {
       }
       final body = await utf8.decoder.bind(res).join();
       final data = jsonDecode(body);
-      final out = data is Map<String, dynamic>
-          ? data['responseData']?['translatedText']
-          : null;
+      String? out;
+      if (data is Map<String, dynamic>) {
+        final rd = data['responseData'];
+        if (rd is Map<String, dynamic>) {
+          final t = rd['translatedText'];
+          if (t is String) out = t;
+        }
+      }
       if (out is String && out.trim().isNotEmpty &&
           !_looksLikeError(out)) {
         return TranslateResult(out, true, 'MyMemory');

@@ -190,7 +190,7 @@ class LibraryRepository {
 
   List<PageRow> visiblePages(String notebookId) {
     final list = pageRows
-        .where((p) => p.notebookId == notebookId && p.trashedAt == null)
+        .where((p) => p.notebookId == notebookId)
         .toList()
       ..sort((a, b) => a.sortIndex.compareTo(b.sortIndex));
     return list;

@@ -125,7 +125,7 @@ class _TranslateSheetState extends State<TranslateSheet> {
     return SafeArea(
       top: false,
       child: Padding(
-        padding: const EdgeInsetsDirectional.fromSTLB(20, 0, 20, 20),
+        padding: const EdgeInsetsDirectional.fromSTEB(20, 0, 20, 20),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
