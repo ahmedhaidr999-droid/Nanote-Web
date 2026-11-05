@@ -69,7 +69,7 @@ class ToolRail extends StatelessWidget {
                         onTap: () => tools.setTool(Tool.highlighter),
                       ),
                       _ToolBtn(
-                        icon: Icons.ink_eraser_rounded,
+                        icon: Icons.auto_fix_normal_rounded,
                         label: i18n.t('tool_eraser'),
                         selected: tools.tool == Tool.eraser,
                         onTap: () => tools.setTool(Tool.eraser),
@@ -89,13 +89,13 @@ class ToolRail extends StatelessWidget {
                         onTap: () => tools.setTool(Tool.text),
                       ),
                       _ToolBtn(
-                        icon: Icons.selector_rounded,
+                        icon: Icons.crop_square_rounded,
                         label: i18n.t('tool_selector'),
                         selected: tools.tool == Tool.selector,
                         onTap: () => tools.setTool(Tool.selector),
                       ),
                       _ToolBtn(
-                        icon: Icons.laser_rounded,
+                        icon: Icons.flashlight_on_rounded,
                         label: i18n.t('tool_laser'),
                         selected: tools.tool == Tool.laser,
                         onTap: () => tools.setTool(Tool.laser),

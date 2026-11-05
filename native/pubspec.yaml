@@ -9,6 +9,8 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  flutter_localizations:
+    sdk: flutter
   # PDF engine (PDFium on Android — page render + real page sizes).
   pdfx: '>=2.6.0 <3.0.0'
   # Vector ink outlines (pressure + velocity aware).

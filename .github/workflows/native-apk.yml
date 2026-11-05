@@ -1,0 +1,125 @@
+name: Native APK (Flutter)
+
+on:
+  push:
+    branches: [native-v2]
+    paths: ['native/**', '.github/workflows/native-apk.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: native-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    name: Flutter build → signed APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.35.4'
+          cache: true
+
+      - name: Accept Android SDK licenses
+        run: |
+          SDKM=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+
+      - name: Generate the Android platform (CI-only, never committed)
+        working-directory: native
+        run: |
+          flutter create --platforms=android --org com.nanote --project-name nanote .
+          # application id → com.nanote.native (independent app; same signing
+          # key as the webview build so future store updates stay in-family)
+          if [ -f android/app/build.gradle.kts ]; then
+            sed -i 's/applicationId = "com.example.nanote"/applicationId = "com.nanote.native"/' android/app/build.gradle.kts
+            sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 24/' android/app/build.gradle.kts
+          fi
+          if [ -f android/app/build.gradle ]; then
+            sed -i 's/applicationId "com.example.nanote"/applicationId "com.nanote.native"/' android/app/build.gradle
+            sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 24/' android/app/build.gradle
+          fi
+          # label + permissions (INTERNET for translate/Ask-AI, RECORD_AUDIO for notes)
+          sed -i 's/android:label="nanote"/android:label="Nanote Native"/' android/app/src/main/AndroidManifest.xml
+          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <application#' android/app/src/main/AndroidManifest.xml
+          grep -n "applicationId\|minSdk" android/app/build.gradle* || true
+          grep -n "uses-permission" android/app/src/main/AndroidManifest.xml || true
+
+      - name: Analyze (errors only — infos/warnings don't block)
+        working-directory: native
+        run: flutter analyze --no-pub --no-fatal-infos --no-fatal-warnings
+
+      - name: Resolve packages
+        working-directory: native
+        run: flutter pub get
+
+      - name: Build release APK
+        working-directory: native
+        env:
+          RUN_NO: ${{ github.run_number }}
+        run: flutter build apk --release --build-name=2.0.0 --build-number=$RUN_NO
+
+      - name: Sign with the Nanote release keystore
+        id: sign
+        env:
+          NANOTE_KEYSTORE_BASE64: ${{ secrets.NANOTE_KEYSTORE_BASE64 }}
+          NANOTE_KEYSTORE_PASSWORD: ${{ secrets.NANOTE_KEYSTORE_PASSWORD }}
+          NANOTE_KEY_ALIAS: ${{ secrets.NANOTE_KEY_ALIAS }}
+          NANOTE_KEY_PASSWORD: ${{ secrets.NANOTE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          UNSIGNED="native/build/app/outputs/flutter-apk/app-release-unsigned.apk"
+          if [ ! -f "$UNSIGNED" ]; then
+            UNSIGNED="native/build/app/outputs/flutter-apk/app-release.apk"
+          fi
+          mkdir -p dist
+          if [ -n "${NANOTE_KEYSTORE_BASE64:-}" ] && [ -n "${NANOTE_KEYSTORE_PASSWORD:-}" ]; then
+            echo "${NANOTE_KEYSTORE_BASE64}" | base64 -d > dist/nanote-release.keystore
+            BT=$(ls "$ANDROID_HOME"/build-tools | sort -V | tail -1)
+            "$ANDROID_HOME/build-tools/$BT/zipalign" -f -p 4 "$UNSIGNED" dist/aligned.apk
+            "$ANDROID_HOME/build-tools/$BT/apksigner" sign \
+              --ks dist/nanote-release.keystore \
+              --ks-pass "pass:${NANOTE_KEYSTORE_PASSWORD}" \
+              --ks-key-alias "${NANOTE_KEY_ALIAS}" \
+              --key-pass "pass:${NANOTE_KEY_PASSWORD}" \
+              --out "dist/Nanote-Native.apk" dist/aligned.apk
+            "$ANDROID_HOME/build-tools/$BT/apksigner" verify "dist/Nanote-Native.apk"
+            rm -f dist/nanote-release.keystore dist/aligned.apk
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            cp "$UNSIGNED" dist/Nanote-Native-unsigned.apk
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
+          ls -la dist/
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nanote-Native-${{ github.run_number }}
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Publish to the native-latest prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete native-latest --yes --cleanup-tag 2>/dev/null || true
+          NOTES="Automatic build of \`native-v2\` (run #$GITHUB_RUN_NUMBER).
+          Signed: ${{ steps.sign.outputs.signed }}."
+          gh release create native-latest dist/*.apk \
+            --title "Nanote Native — latest CI build" \
+            --notes "$NOTES" --prerelease
