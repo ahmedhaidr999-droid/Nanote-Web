@@ -189,7 +189,7 @@ class ShapeRecognizer {
     var sum = 0.0;
     for (var i = 0; i < 4; i++) {
       sum += 1 - (sorted[i] - expect[i]).distance /
-          math.max(1, bb.size.diagonal / 2);
+          math.max(1.0, math.sqrt(bb.width * bb.width + bb.height * bb.height) / 2);
     }
     final compactness = bb.width > 0 && bb.height > 0
         ? math.min(1, (2 * (bb.width + bb.height) / _perimeterOf(sorted)))

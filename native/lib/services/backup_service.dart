@@ -75,7 +75,7 @@ class BackupService {
       type: FileType.custom, allowedExtensions: ['nanote', 'json'],
       withData: true,
     );
-    final file = res.files.firstOrNull;
+    final file = res?.files.firstOrNull;
     final bytes = file?.bytes;
     if (bytes == null) return false;
     try {

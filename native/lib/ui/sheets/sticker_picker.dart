@@ -58,7 +58,7 @@ class _StickerPickerSheetState extends State<StickerPickerSheet> {
       withData: true,
       allowMultiple: true,
     );
-    for (final f in res.files) {
+    for (final f in res?.files ?? const <PlatformFile>[]) {
       final bytes = f.bytes;
       if (bytes != null) await widget.repo.addPngSticker(bytes);
     }

@@ -253,7 +253,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen>
     final res = await FilePicker.platform.pickFiles(
       type: FileType.image, withData: true,
     );
-    final f = res.files.firstOrNull;
+    final f = res?.files.firstOrNull;
     final bytes = f?.bytes;
     if (bytes == null) return;
     final key = await widget.fs.saveBytesAs('images', '.png', bytes);

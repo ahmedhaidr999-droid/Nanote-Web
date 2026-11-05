@@ -19,7 +19,7 @@ class LibraryController extends ChangeNotifier {
   LibrarySort sort = LibrarySort.updated;
   bool sortAsc = false;
   LibraryViewMode viewMode = LibraryViewMode.grid;
-  LibrarySnapshot snapshot = const LibrarySnapshot.empty();
+  LibrarySnapshot snapshot = LibrarySnapshot.empty;
 
   StreamSubscription? _sub;
   bool _booted = false;
@@ -92,7 +92,7 @@ class LibraryController extends ChangeNotifier {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom, allowedExtensions: ['pdf'], withData: true,
     );
-    final file = res.files.firstOrNull;
+    final file = res?.files.firstOrNull;
     if (file == null) return null;
     final bytes = file.bytes;
     if (bytes == null) return null;
@@ -110,7 +110,7 @@ class LibraryController extends ChangeNotifier {
       type: FileType.custom, allowedExtensions: ['png'], withData: true,
       allowMultiple: true,
     );
-    for (final f in res.files) {
+    for (final f in res?.files ?? const <PlatformFile>[]) {
       final b = f.bytes;
       if (b != null) await repo.addPngSticker(b);
     }

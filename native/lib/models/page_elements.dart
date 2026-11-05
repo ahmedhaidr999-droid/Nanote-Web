@@ -34,7 +34,8 @@ abstract class PageElement {
   /// Axis-aligned bbox of the rotated rect.
   Rect bbox() {
     if (rotation == 0) return localRect();
-    final c = center, q = Quad(corners: corners);
+    final c = center;
+    final q = Quad(corners: corners());
     return q.bbox;
   }
 
