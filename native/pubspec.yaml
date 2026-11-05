@@ -16,7 +16,7 @@ dependencies:
   path_provider: ^2.1.0
   # Library: import PDFs / images / stickers, share exports.
   file_picker: '>=8.0.0 <12.0.0'
-  share_plus: '>=7.0.0 <12.0.0'
+  share_plus: '>=10.0.0 <12.0.0'
   # Audio notes (record aac, playback with position stream).
   record: '>=5.0.0 <7.0.0'
   audioplayers: '>=6.0.0 <7.0.0'
