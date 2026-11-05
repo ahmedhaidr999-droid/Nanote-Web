@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
@@ -169,6 +170,42 @@ class PdfDocController extends ChangeNotifier {
       final oldest = _lru.removeAt(0);
       _cache.remove(oldest)?.dispose();
     }
+  }
+
+  /// One-off high-res render for export (not cached — caller disposes).
+  Future<ui.Image?> renderOnce(int page, double pixelWidth) async {
+    final doc = _doc;
+    if (doc == null || page < 0 || page >= pageCount) return null;
+    final completer = Completer<ui.Image?>();
+    _enqueue(() async {
+      try {
+        if (_disposed) {
+          completer.complete(null);
+          return;
+        }
+        final p = await doc.getPage(page + 1);
+        ui.Image? image;
+        try {
+          final h = pixelWidth * p.height / p.width;
+          final rendered = await p.render(
+              width: pixelWidth, height: h, backgroundColor: '#FFFFFF');
+          if (rendered == null || _disposed) {
+            completer.complete(null);
+            return;
+          }
+          final codec = await ui.instantiateImageCodec(rendered.bytes);
+          final frame = await codec.getNextFrame();
+          image = frame.image;
+        } finally {
+          await p.close();
+        }
+        completer.complete(image);
+      } catch (e) {
+        debugPrint('Nanote renderOnce failed: $e');
+        if (!completer.isCompleted) completer.complete(null);
+      }
+    });
+    return completer.future;
   }
 
   @override
