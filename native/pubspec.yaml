@@ -20,10 +20,10 @@ dependencies:
   file_picker: 8.3.7
   share_plus: '>=10.0.0 <12.0.0'
   # Audio notes (record aac, playback with position stream).
-  record: 5.1.2
+  record: 6.2.1
   audioplayers: '>=6.0.0 <7.0.0'
   # Export to PDF.
-  pdf: '>=3.10.0 <4.0.0'
+  pdf: 3.11.3
   url_launcher: ^6.3.0
   intl: '>=0.19.0 <0.21.0'
 
